@@ -10,7 +10,7 @@ permissions:
 
 env:
   # Pinned so a runner-image refresh cannot silently change the headers the
-  # driver is checked against (same pin as woa-rk3576's ci.yml).
+  # driver is checked against (same pin and runner as woa-rk3576's ci.yml).
   WDK_VERSION: '10.0.26100.0'
 
 jobs:
@@ -41,7 +41,9 @@ jobs:
 
   windows:
     name: WDK build, test-signed (ARM64)
-    runs-on: windows-latest
+    # windows-2022, as woa-rk3576: windows-latest ships the 26100 SDK but no
+    # WDK (no km\wdm.h, no kmdf headers, no inf2cat; run 44956621977).
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
 
@@ -65,7 +67,7 @@ jobs:
             "$kits\Include\wdf\kmdf\1.33\wdf.h",
             "$kits\Lib\$ver\km\arm64\ntoskrnl.lib",
             "$kits\bin\$ver\x86\inf2cat.exe",
-            "$kits\bin\$ver\x64\signtool.exe"
+            "$kits\bin\$ver\x86\signtool.exe"
           )
           $missing = $need | Where-Object { -not (Test-Path $_) }
           if ($missing) {
@@ -94,7 +96,7 @@ jobs:
           # certificate is made here and thrown away with the runner: trust
           # the signer.cer of the same run, and only that run's package.
           $kits = 'C:\Program Files (x86)\Windows Kits\10'
-          $st   = Join-Path $kits "bin\$env:WDK_VERSION\x64\signtool.exe"
+          $st   = Join-Path $kits "bin\$env:WDK_VERSION\x86\signtool.exe"
           $i2c  = Join-Path $kits "bin\$env:WDK_VERSION\x86\inf2cat.exe"
           $out  = Join-Path $env:RUNNER_TEMP 'rknpu-m2'
           $drv  = Join-Path $out 'rknpu'
