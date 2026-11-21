@@ -7,7 +7,8 @@ The Rockchip RK3576 NPU on Windows on Arm: a KMDF driver and a port of the
 that run on the NPU under Linux run on it under Windows too.
 
 Status: planning. Nothing here has run on hardware yet. The feasibility study
-is [docs/FEASIBILITY.md](docs/FEASIBILITY.md).
+is [docs/FEASIBILITY.md](docs/FEASIBILITY.md). The M0 measurement kit, to run
+under Linux on a board, is in [tools/m0](tools/m0/README.md).
 
 ## The approach
 

@@ -7,7 +7,8 @@
 Linux 上能用 NPU 跑的模型，在 Windows 上也能跑。
 
 现状：规划阶段，还没有任何东西在硬件上跑过。可行性研究见
-[docs/FEASIBILITY.md](docs/FEASIBILITY.md)（英文）。
+[docs/FEASIBILITY.md](docs/FEASIBILITY.md)（英文）。在板子上的 Linux 下运行的 M0 测量工具在
+[tools/m0](tools/m0/README.md)（英文）。
 
 ## 做法
 
