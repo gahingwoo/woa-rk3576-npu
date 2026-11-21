@@ -1,0 +1,65 @@
+;
+; rknpu.inf - RK3576 NPU (RKNN, two cores), M2 driver skeleton
+;
+; Target: Windows on ARM64. Binds ACPI\RKCP3576, which edk2-rk3576 publishes
+; in an SSDT (OEM table ID RKNPU) only when "NPU (experimental)" is enabled
+; in the firmware's ACPI / Device Tree setup page. The firmware powers and
+; clocks the NPU; this driver maps its registers, connects its two
+; interrupts and gives tools\rknputest read-only access (\\.\RKNPU,
+; administrators only). It runs no NPU jobs.
+;
+; Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
+; SPDX-License-Identifier: GPL-2.0-only
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = ; set by stampinf during build
+CatalogFile = rknpu.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+rknpu.sys = 1
+
+[Manufacturer]
+%ProviderName% = Standard,NTARM64.10.0...16299
+
+[Standard.NTARM64.10.0...16299]
+%RKNPU.DeviceDesc% = RKNPU_Inst,ACPI\RKCP3576
+
+[RKNPU_Inst.NT]
+CopyFiles = RKNPU_CopyFiles
+
+[RKNPU_CopyFiles]
+rknpu.sys
+
+[RKNPU_Inst.NT.Services]
+AddService = rknpu,0x00000002,RKNPU_Service
+
+[RKNPU_Service]
+DisplayName   = %RKNPU.SvcDesc%
+ServiceType   = 1 ; SERVICE_KERNEL_DRIVER
+StartType     = 3 ; SERVICE_DEMAND_START
+ErrorControl  = 1 ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\rknpu.sys
+
+[RKNPU_Inst.NT.Wdf]
+KmdfService = rknpu, RKNPU_wdfsect
+
+[RKNPU_wdfsect]
+KmdfLibraryVersion = 1.33
+
+[Strings]
+ProviderName     = "woa-rk3576-npu"
+DiskName         = "RK3576 NPU Installation Disk"
+RKNPU.DeviceDesc = "Rockchip RK3576 NPU (RKNN, bring-up)"
+RKNPU.SvcDesc    = "Rockchip RK3576 NPU bring-up driver"

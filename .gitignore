@@ -1,0 +1,4 @@
+# Windows build output (msbuild)
+ARM64/
+*.user
+.vs/

@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned so a runner-image refresh cannot silently change the headers the
+  # driver is checked against (same pin as woa-rk3576's ci.yml).
+  WDK_VERSION: '10.0.26100.0'
+
+jobs:
+  host:
+    name: Interface and tool (Linux, gcc)
+    # The IOCTL header and rknputest are plain C. The selftest checks the
+    # structure sizes and the READ_REGS range rule without a device.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and self-test
+        run: |
+          set -eux
+          gcc -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -Wall -Wextra -Werror -pedantic \
+              -Iinclude -o rknputest tools/rknputest/main.c
+          ./rknputest selftest
+          # the header alone, freestanding, as charsiu's device_win.c will see it
+          printf '#include "rknpu_ioctl.h"\n' > hdr.c
+          gcc -std=c99 -ffreestanding -nostdinc -Wall -Wextra -Werror -Iinclude -c hdr.c -o /dev/null
+      - name: Wording
+        run: |
+          # No en or em dashes, and the project's wording rule for public files.
+          set -u
+          bad=0
+          if git grep -nP '\x{2013}|\x{2014}' -- . ':!LICENSE'; then bad=1; fi
+          if git grep -niE 'reverse[- ]?engineer' -- . ':!.github/workflows/ci.yml'; then bad=1; fi
+          exit $bad
+
+  windows:
+    name: WDK build, test-signed (ARM64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Check the WDK
+        shell: pwsh
+        run: |
+          # A missing toolchain is a build failure, not something to skip:
+          # if the pin is absent, the runner image changed and WDK_VERSION
+          # needs a deliberate bump.
+          $kits = 'C:\Program Files (x86)\Windows Kits\10'
+          $ver = $env:WDK_VERSION
+          Write-Host "--- Include ---"
+          Get-ChildItem "$kits\Include" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          $need = @(
+            "$kits\Include\$ver\km\wdm.h",
+            "$kits\Include\wdf\kmdf\1.33\wdf.h",
+            "$kits\Lib\$ver\km\arm64\ntoskrnl.lib",
+            "$kits\bin\$ver\x86\inf2cat.exe",
+            "$kits\bin\$ver\x64\signtool.exe"
+          )
+          $missing = $need | Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            $missing | ForEach-Object { Write-Host "::error::missing $_" }
+            throw "WDK $ver is not fully present on this runner"
+          }
+          Write-Host "Using WDK $ver."
+
+      - name: Build rknpu.sys and rknputest.exe
+        shell: pwsh
+        run: |
+          foreach ($proj in 'drivers/rknpu/rknpu.vcxproj', 'tools/rknputest/rknputest.vcxproj') {
+            Write-Host "== $proj"
+            msbuild $proj /p:Configuration=Release /p:Platform=ARM64 `
+                    /p:WindowsTargetPlatformVersion=$env:WDK_VERSION `
+                    /p:SignMode=Off /m /nologo /v:minimal
+            if ($LASTEXITCODE -ne 0) { throw "msbuild failed for $proj" }
+          }
+
+      - name: Stage and test-sign
+        shell: pwsh
+        run: |
+          # testsigning on the target accepts a signature that does not chain
+          # to a trusted root; it does not accept no signature at all
+          # (CM_PROB_UNSIGNED_DRIVER, seen on hardware with woa-rk3576). The
+          # certificate is made here and thrown away with the runner: trust
+          # the signer.cer of the same run, and only that run's package.
+          $kits = 'C:\Program Files (x86)\Windows Kits\10'
+          $st   = Join-Path $kits "bin\$env:WDK_VERSION\x64\signtool.exe"
+          $i2c  = Join-Path $kits "bin\$env:WDK_VERSION\x86\inf2cat.exe"
+          $out  = Join-Path $env:RUNNER_TEMP 'rknpu-m2'
+          $drv  = Join-Path $out 'rknpu'
+          New-Item -ItemType Directory -Force -Path $drv | Out-Null
+
+          # the stamped INF and the .sys from the package directory
+          $pkg = 'drivers\rknpu\ARM64\Release\rknpu'
+          foreach ($f in 'rknpu.sys', 'rknpu.inf') {
+            $p = Join-Path $pkg $f
+            if (-not (Test-Path $p)) { throw "missing $p" }
+            Copy-Item $p $drv -Force
+          }
+          Copy-Item drivers\rknpu\ARM64\Release\rknpu.pdb $drv -ErrorAction SilentlyContinue
+          $exe = 'tools\rknputest\ARM64\Release\rknputest.exe'
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          Copy-Item $exe $out -Force
+
+          $pfxPw = 'rknpu-test'
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+                    -Subject 'CN=woa-rk3576-npu test signing' `
+                    -CertStoreLocation Cert:\CurrentUser\My `
+                    -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(5)
+          $pfx = Join-Path $env:RUNNER_TEMP 'rknpu-test.pfx'
+          Export-PfxCertificate -Cert $cert -FilePath $pfx `
+            -Password (ConvertTo-SecureString $pfxPw -Force -AsPlainText) | Out-Null
+
+          & $st sign /fd sha256 /f $pfx /p $pfxPw (Join-Path $drv 'rknpu.sys')
+          if ($LASTEXITCODE) { throw "signtool failed for rknpu.sys" }
+          # 10_RS3_ARM64 is build 16299, the floor of the INF's decoration.
+          & $i2c /driver:"$drv" /os:10_RS3_ARM64 /verbose
+          if ($LASTEXITCODE) { throw "inf2cat failed: $LASTEXITCODE" }
+          $files = @((Join-Path $drv 'rknpu.cat'), (Join-Path $out 'rknputest.exe'))
+          & $st sign /fd sha256 /f $pfx /p $pfxPw $files
+          if ($LASTEXITCODE) { throw "signtool failed: $LASTEXITCODE" }
+          Remove-Item $pfx -Force
+
+          # A signature is present; whether it chains to a root is the
+          # question a self-signed certificate fails by design.
+          $all = @((Join-Path $drv 'rknpu.sys')) + $files
+          foreach ($sig in Get-AuthenticodeSignature -FilePath $all) {
+            $who = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '<none>' }
+            Write-Host ("   {0,-14} {1}  {2}" -f $sig.Status, (Split-Path $sig.Path -Leaf), $who)
+            if ($sig.Status -eq 'NotSigned') { throw "$($sig.Path) came out unsigned" }
+          }
+          Export-Certificate -Cert $cert -FilePath (Join-Path $out 'signer.cer') | Out-Null
+          Copy-Item docs\M2.md $out -Force
+          Get-ChildItem $out -Recurse -File | Select-Object FullName, Length |
+            Format-Table -AutoSize | Out-String | Write-Host
+          "STAGE=$out" >> $env:GITHUB_ENV
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rknpu-m2-arm64
+          path: ${{ env.STAGE }}
+          if-no-files-found: error
