@@ -6,9 +6,13 @@ The Rockchip RK3576 NPU on Windows on Arm: a KMDF driver and a port of the
 [charsiu](https://github.com/gahingwoo/charsiu) LLM runtime, so that models
 that run on the NPU under Linux run on it under Windows too.
 
-Status: planning. Nothing here has run on hardware yet. The feasibility study
-is [docs/FEASIBILITY.md](docs/FEASIBILITY.md). The M0 measurement kit, to run
-under Linux on a board, is in [tools/m0](tools/m0/README.md).
+Status: nothing here has run on hardware yet. The feasibility study is
+[docs/FEASIBILITY.md](docs/FEASIBILITY.md). The M0 measurement kit, to run
+under Linux on a board, is in [tools/m0](tools/m0/README.md). The M2 driver
+skeleton ([drivers/rknpu](drivers/rknpu)), its test tool
+([tools/rknputest](tools/rknputest)) and the IOCTL header
+([include/rknpu_ioctl.h](include/rknpu_ioctl.h)) build in CI; the board test
+is [docs/M2.md](docs/M2.md).
 
 ## The approach
 
@@ -33,16 +37,16 @@ under Linux on a board, is in [tools/m0](tools/m0/README.md).
 
 ## Milestones
 
-| # | What | Exit criterion |
-|---|---|---|
-| M0 | Linux-side measurement | one NPU job with IOMMU paging off gives the CPU-exact result |
-| M1 | Firmware power, clocks, ACPI | the device appears in ACPI with its version register readable |
-| M2 | Driver skeleton and test tool | the device starts with no problem code |
-| M3 | Buffers, submission, interrupts | GEMM results exact against the CPU |
-| M4 | charsiu port | Llama-3.2-1B gives the same text as on Linux |
-| M5 | Performance | tokens per second within a stated margin of Linux |
-| M6 | Driver-managed NPU IOMMU | M4 again with scattered and high memory |
-| M7 | Install script, `charsiu serve` | answers from a second machine |
+| # | What | Exit criterion | Status |
+|---|---|---|---|
+| M0 | Linux-side measurement | one NPU job with IOMMU paging off gives the CPU-exact result | kit written ([tools/m0](tools/m0/README.md)), not run |
+| M1 | Firmware power, clocks, ACPI | the device appears in ACPI with its version register readable | written (edk2-rk3576 branch `npu-acpi`), builds, not run |
+| M2 | Driver skeleton and test tool | the device starts with no problem code | written, CI builds and test-signs it, not run ([docs/M2.md](docs/M2.md)) |
+| M3 | Buffers, submission, interrupts | GEMM results exact against the CPU | not started |
+| M4 | charsiu port | Llama-3.2-1B gives the same text as on Linux | not started |
+| M5 | Performance | tokens per second within a stated margin of Linux | not started |
+| M6 | Driver-managed NPU IOMMU | M4 again with scattered and high memory | not started |
+| M7 | Install script, `charsiu serve` | answers from a second machine | not started |
 
 Estimates and risks are in the study.
 
