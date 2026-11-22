@@ -64,6 +64,9 @@
 
   <ItemGroup>
     <ClInclude Include="..\..\include\rknpu_ioctl.h" />
+    <ClInclude Include="..\..\include\rknpu_regcmd.h" />
+    <ClInclude Include="m3_gemm.h" />
+    <ClInclude Include="m3_streams.h" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

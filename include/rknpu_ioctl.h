@@ -6,16 +6,17 @@
  * on any other host it defines what it needs itself, so the tool and the
  * layout checks also build with gcc on Linux.
  *
- * M2 implements GET_INFO and READ_REGS, both read only. The function codes
- * from 0x810 on are reserved for M3 (buffers, submission, completion); the
- * driver answers them with STATUS_INVALID_DEVICE_REQUEST until then. Their
- * structures will copy include/uapi/drm/rocket_accel.h (MIT) field for
- * field, as docs/FEASIBILITY.md section 2.1 says; nothing for them is
- * defined here yet, so nothing can come to depend on a guess.
+ * M2: GET_INFO and READ_REGS, both read only. M3 (function codes 0x810 on):
+ * buffers, submission, completion and a core reset; see the M3 section. The
+ * job structures follow include/uapi/drm/rocket_accel.h (MIT): a task is
+ * the NPU address of a register command stream and its entry count, as in
+ * struct drm_rocket_task.
  *
  * Every structure is fixed size, uses 32- and 64-bit fields only, and is
  * checked by the size assertions at the end of this file. A change to any
- * of them bumps RKNPU_INTERFACE_VERSION.
+ * of them bumps RKNPU_INTERFACE_VERSION. M3 only gave names to fields that
+ * were reserved (and read 0 from an M2 driver) and added structures, so the
+ * version is still 1; RKNPU_M3_VERSION in rknpu_info says M3 is there.
  *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
@@ -49,20 +50,63 @@
 #define IOCTL_RKNPU_GET_INFO    CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_GET_INFO, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_RKNPU_READ_REGS   CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_READ_REGS, METHOD_BUFFERED, FILE_READ_ACCESS)
 
-/* ---- M3: RESERVED, not implemented -------------------------------------- */
+/* ---- M3: buffers, submission, completion -------------------------------- */
 /*
- * Function codes only, so that nothing else takes them. No IOCTL_ code and
- * no structure exists for these yet; M3 defines both. The rocket call each
- * one follows is named beside it.
+ * Everything below is new in M3 and is reached only through the function
+ * codes below; GET_INFO and READ_REGS behave as in M2. Nothing in the driver
+ * writes a job register, allocates a buffer or runs a _DSM until one of these
+ * is called, so an installed M3 driver that only ever sees `rknputest info`
+ * does what the M2 driver did.
+ *
+ * The model is rocket's (include/uapi/drm/rocket_accel.h, MIT, and
+ * drivers/accel/rocket/rocket_job.c): buffers with a 32-bit NPU address, jobs
+ * of tasks, each task one register command stream given by its NPU address
+ * and its entry count. What differs, and why:
+ *
+ *   - Buffers are physically contiguous, below 4 GiB, and mapped
+ *     write-combined (Normal non-cacheable on ARM64) in the kernel and, after
+ *     MAP_BO, in the caller. The NPU IOMMUs are left as the firmware leaves
+ *     them, paging off, so the NPU address of a buffer is its physical
+ *     address. No cache maintenance is needed, so rocket's PREP_BO and
+ *     FINI_BO have no M3 counterpart; their codes stay reserved for the
+ *     cached buffers of M5.
+ *   - WRITE_BO and READ_BO copy through the driver, so a test can run with
+ *     no user mapping of NPU memory at all. MAP_BO is there, and optional.
+ *   - SUBMIT returns at once with a sequence number; WAIT waits for it, with
+ *     a timeout. A job that times out is stopped and its core is reset
+ *     through the SSDT's _DSM (function 1) before WAIT returns.
+ *   - One job per core at a time: no software queue yet (M5).
  */
-#define RKNPU_FN_CREATE_BO      0x810   /* RESERVED (M3): DRM_ROCKET_CREATE_BO + mmap */
-#define RKNPU_FN_FREE_BO        0x811   /* RESERVED (M3): DRM_IOCTL_GEM_CLOSE */
-#define RKNPU_FN_PREP_BO        0x812   /* RESERVED (M3): DRM_ROCKET_PREP_BO, by range */
-#define RKNPU_FN_FINI_BO        0x813   /* RESERVED (M3): DRM_ROCKET_FINI_BO, by range */
-#define RKNPU_FN_SUBMIT         0x814   /* RESERVED (M3): DRM_ROCKET_SUBMIT */
-#define RKNPU_FN_WAIT           0x815   /* RESERVED (M3): wait for a job sequence number */
-#define RKNPU_FN_RESET          0x816   /* RESERVED (M3): core soft reset through _DSM function 1 */
-#define RKNPU_FN_RESERVED_LAST  0x81F   /* 0x817..0x81F: RESERVED for M3 and M5 */
+#define RKNPU_M3_VERSION        1       /* rknpu_info.m3_version */
+
+#define RKNPU_FN_CREATE_BO      0x810   /* DRM_ROCKET_CREATE_BO, no mmap */
+#define RKNPU_FN_FREE_BO        0x811   /* DRM_IOCTL_GEM_CLOSE */
+#define RKNPU_FN_PREP_BO        0x812   /* RESERVED (M5): DRM_ROCKET_PREP_BO, cached buffers */
+#define RKNPU_FN_FINI_BO        0x813   /* RESERVED (M5): DRM_ROCKET_FINI_BO */
+#define RKNPU_FN_SUBMIT         0x814   /* DRM_ROCKET_SUBMIT, one job */
+#define RKNPU_FN_WAIT           0x815   /* wait for a job's sequence number */
+#define RKNPU_FN_RESET          0x816   /* core soft reset through _DSM function 1 */
+#define RKNPU_FN_MAP_BO         0x817   /* map a buffer into the caller (mmap) */
+#define RKNPU_FN_UNMAP_BO       0x818   /* undo MAP_BO */
+#define RKNPU_FN_WRITE_BO       0x819   /* copy into a buffer */
+#define RKNPU_FN_READ_BO        0x81A   /* copy out of a buffer */
+#define RKNPU_FN_RESERVED_LAST  0x81F   /* 0x81B..0x81F: RESERVED */
+
+#ifndef METHOD_IN_DIRECT
+#define METHOD_IN_DIRECT  1
+#define METHOD_OUT_DIRECT 2
+#endif
+
+#define IOCTL_RKNPU_CREATE_BO   CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_CREATE_BO, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_RKNPU_FREE_BO     CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_FREE_BO, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_RKNPU_SUBMIT      CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_SUBMIT, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_RKNPU_WAIT        CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_WAIT, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_RKNPU_RESET       CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_RESET, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_RKNPU_MAP_BO      CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_MAP_BO, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_RKNPU_UNMAP_BO    CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_UNMAP_BO, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+/* the data travel in the second buffer, described by an MDL (direct I/O) */
+#define IOCTL_RKNPU_WRITE_BO    CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_WRITE_BO, METHOD_IN_DIRECT, FILE_WRITE_ACCESS)
+#define IOCTL_RKNPU_READ_BO     CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_READ_BO, METHOD_OUT_DIRECT, FILE_READ_ACCESS)
 
 #pragma pack(push, 8)
 
@@ -102,7 +146,12 @@ typedef struct rknpu_core_info {
     unsigned int last_mmu_int_status[RKNPU_MMUS_PER_CORE];
     unsigned int last_mmu_fault_addr[RKNPU_MMUS_PER_CORE];
 
-    unsigned int reserved[8];
+    /* M3 (0 from an M2 driver): jobs on this core since the driver started */
+    unsigned int jobs_submitted;
+    unsigned int jobs_completed;        /* by the interrupt */
+    unsigned int jobs_timed_out;
+    unsigned int resets;                /* _DSM resets of this core */
+    unsigned int reserved[4];
 } rknpu_core_info;
 
 /*
@@ -133,7 +182,10 @@ typedef struct rknpu_info {
     unsigned int reserved0;
     rknpu_core_info core[RKNPU_NUM_CORES];
     rknpu_clock_info clocks;
-    unsigned int reserved[16];          /* M3: queue depth, seqno page, ... */
+    unsigned int m3_version;            /* RKNPU_M3_VERSION; 0 from an M2 driver */
+    unsigned int bo_count;              /* buffers allocated now, all handles */
+    unsigned int bo_kib;                /* their size */
+    unsigned int reserved[13];
 } rknpu_info;
 
 /* ---- READ_REGS ---------------------------------------------------------- */
@@ -159,6 +211,155 @@ typedef struct rknpu_read_regs_in {
     unsigned int count;                 /* words, 1..RKNPU_MAX_READ_WORDS */
 } rknpu_read_regs_in;
 /* output: count words */
+
+/* ---- M3 structures ------------------------------------------------------ */
+
+#define RKNPU_BO_MAX_SIZE       (64u << 20)     /* one buffer */
+#define RKNPU_BO_MAX_TOTAL      (512u << 20)    /* all buffers of the device */
+#define RKNPU_BO_IO_MAX         (16u << 20)     /* one WRITE_BO or READ_BO */
+#define RKNPU_MAX_TASKS         64              /* per job */
+#define RKNPU_MAX_REGCMD        131072u         /* entries per task: REGISTER_AMOUNTS is 16 bits of pairs */
+
+/* CREATE_BO, in and out. */
+typedef struct rknpu_create_bo {
+    unsigned int size;                  /* in: bytes; out: rounded up to 4 KiB */
+    unsigned int flags;                 /* in: 0 */
+    unsigned int handle;                /* out: nonzero */
+    unsigned int dma_address;           /* out: the NPU's address, = physical; below 4 GiB */
+} rknpu_create_bo;
+
+/* FREE_BO and UNMAP_BO, in. FREE_BO also undoes MAP_BO. */
+typedef struct rknpu_bo_handle {
+    unsigned int handle;
+    unsigned int reserved;
+} rknpu_bo_handle;
+
+/* MAP_BO, in and out: the whole buffer, write-combined, in the caller. */
+typedef struct rknpu_map_bo {
+    unsigned int handle;                /* in */
+    unsigned int reserved;
+    unsigned long long user_va;         /* out */
+} rknpu_map_bo;
+
+/*
+ * WRITE_BO and READ_BO, in. The data are the other buffer of the call:
+ * WRITE_BO reads `length` bytes from it into the buffer at `offset`,
+ * READ_BO writes them to it. Both inside the buffer, at most RKNPU_BO_IO_MAX.
+ */
+typedef struct rknpu_bo_io {
+    unsigned int handle;
+    unsigned int offset;
+    unsigned int length;
+    unsigned int reserved;
+} rknpu_bo_io;
+
+/* struct drm_rocket_task: the stream's NPU address and its 64-bit entry count. */
+/*
+ * SUBMIT reads each stream first and fails with STATUS_ACCESS_VIOLATION
+ * (ERROR_NOACCESS, 998) if an entry breaks the rules in rknpu_regcmd.h, and
+ * with STATUS_INVALID_DEVICE_STATE (ERROR_BAD_COMMAND, 22) if the stream's
+ * buffer is mapped with MAP_BO. The task is never started then.
+ */
+typedef struct rknpu_task {
+    unsigned int regcmd;                /* 16-byte aligned, inside one of this handle's buffers */
+    unsigned int regcmd_count;          /* 1..RKNPU_MAX_REGCMD */
+} rknpu_task;
+
+/* rknpu_submit_in.flags */
+#define RKNPU_SUBMIT_NO_CRUMBS  0x00000001u /* skip the registry breadcrumbs (timing runs) */
+
+/* SUBMIT, in. Tasks run in order on one core, one interrupt each. */
+typedef struct rknpu_submit_in {
+    unsigned int core;                  /* 0 or 1 */
+    unsigned int flags;                 /* RKNPU_SUBMIT_* */
+    unsigned int task_count;            /* 1..RKNPU_MAX_TASKS */
+    unsigned int reserved;
+    rknpu_task tasks[RKNPU_MAX_TASKS];
+} rknpu_submit_in;
+
+/* SUBMIT, out. */
+typedef struct rknpu_submit_out {
+    unsigned long long seqno;           /* for WAIT */
+    unsigned int core;
+    unsigned int reserved;
+} rknpu_submit_out;
+
+/* WAIT, in. */
+typedef struct rknpu_wait_in {
+    unsigned long long seqno;
+    unsigned int timeout_ms;            /* 0: RKNPU_WAIT_DEFAULT_MS */
+    unsigned int flags;                 /* 0 */
+} rknpu_wait_in;
+
+#define RKNPU_WAIT_DEFAULT_MS   500     /* rocket's JOB_TIMEOUT_MS */
+#define RKNPU_WAIT_MAX_MS       10000
+
+/* rknpu_wait_out.result */
+#define RKNPU_JOB_DONE          0       /* every task raised its DPU interrupt */
+#define RKNPU_JOB_TIMEOUT       1       /* stopped; the core was reset (reset_status) */
+#define RKNPU_JOB_DMA_ERROR     2       /* a DMA read or write error was raised; stopped */
+#define RKNPU_JOB_UNKNOWN       3       /* no such job on this handle */
+
+/* WAIT, out. */
+typedef struct rknpu_wait_out {
+    unsigned long long seqno;
+    unsigned int result;                /* RKNPU_JOB_* */
+    unsigned int core;
+    unsigned int raw_status;            /* PC INTERRUPT_RAW_STATUS at the last interrupt, or at the timeout */
+    unsigned int task_status;           /* PC TASK_STATUS, same moment */
+    unsigned int tasks_done;            /* tasks that raised their interrupt */
+    unsigned int task_count;
+    unsigned int isr_count;             /* interrupts claimed for this job */
+    unsigned int hw_us;                 /* first OPERATION_ENABLE to the last interrupt */
+    unsigned int wait_us;               /* time spent in WAIT */
+    unsigned int reset_status;          /* NTSTATUS of the _DSM reset; 0 if none */
+    unsigned int version_after;         /* PC VERSION read after the job (after the reset) */
+    unsigned int mmu_status[RKNPU_MMUS_PER_CORE];
+    unsigned int reserved[5];
+} rknpu_wait_out;
+
+/* RESET, in. */
+typedef struct rknpu_reset_in {
+    unsigned int core;
+    unsigned int reserved;
+} rknpu_reset_in;
+
+/* RESET, out. */
+typedef struct rknpu_reset_out {
+    unsigned int dsm_status;            /* NTSTATUS of IOCTL_ACPI_EVAL_METHOD */
+    unsigned int dsm_return;            /* the _DSM's return value: 0 done, 1 bad core */
+    unsigned int version_after;         /* PC VERSION after the reset */
+    unsigned int mmu_status[RKNPU_MMUS_PER_CORE];
+    unsigned int reserved[3];
+} rknpu_reset_out;
+
+/*
+ * Breadcrumbs. At each M3 stage the driver writes these DWORDs under the
+ * device's "Device Parameters" key and flushes the key (ZwFlushKey), so they
+ * survive a hang that takes the board down before the tool can print:
+ *
+ *   HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\RKCP3576\0\Device Parameters
+ *
+ *   M3Stage     the last stage reached, RKNPU_CRUMB_*
+ *   M3Seq       its job's sequence number (low 32 bits)
+ *   M3Core      its core
+ *   M3Value1    stage-specific: CREATE_BO size, SUBMIT stream address,
+ *               WAIT raw status, RESET NTSTATUS
+ *   M3Value2    stage-specific: CREATE_BO address, SUBMIT entry count,
+ *               WAIT task status, RESET version after
+ *   M3Count     the stage's running count (buffers, jobs, timeouts, ...)
+ *
+ * SUBMIT writes and flushes its crumb before OPERATION_ENABLE.
+ */
+#define RKNPU_CRUMB_BO_CREATE   1
+#define RKNPU_CRUMB_BO_MAP      2
+#define RKNPU_CRUMB_SUBMIT      3       /* flushed, then OPERATION_ENABLE */
+#define RKNPU_CRUMB_IRQ_SEEN    4       /* WAIT found the job completed by the interrupt */
+#define RKNPU_CRUMB_STATUS      5       /* WAIT returned; Value1/2 = raw / task status */
+#define RKNPU_CRUMB_TIMEOUT     6       /* WAIT timed out; about to reset */
+#define RKNPU_CRUMB_RESET       7       /* a _DSM reset returned */
+#define RKNPU_CRUMB_BO_UNMAP    8
+#define RKNPU_CRUMB_BO_FREE     9
 
 #pragma pack(pop)
 
@@ -193,5 +394,16 @@ RKNPU_ASSERT_SIZE(rknpu_core_info, 132);
 RKNPU_ASSERT_SIZE(rknpu_clock_info, 64);
 RKNPU_ASSERT_SIZE(rknpu_info, 424);
 RKNPU_ASSERT_SIZE(rknpu_read_regs_in, 8);
+RKNPU_ASSERT_SIZE(rknpu_create_bo, 16);
+RKNPU_ASSERT_SIZE(rknpu_bo_handle, 8);
+RKNPU_ASSERT_SIZE(rknpu_map_bo, 16);
+RKNPU_ASSERT_SIZE(rknpu_bo_io, 16);
+RKNPU_ASSERT_SIZE(rknpu_task, 8);
+RKNPU_ASSERT_SIZE(rknpu_submit_in, 528);
+RKNPU_ASSERT_SIZE(rknpu_submit_out, 16);
+RKNPU_ASSERT_SIZE(rknpu_wait_in, 16);
+RKNPU_ASSERT_SIZE(rknpu_wait_out, 80);
+RKNPU_ASSERT_SIZE(rknpu_reset_in, 8);
+RKNPU_ASSERT_SIZE(rknpu_reset_out, 32);
 
 #endif /* RKNPU_IOCTL_H */

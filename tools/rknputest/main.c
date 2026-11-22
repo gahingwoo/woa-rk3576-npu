@@ -7,8 +7,11 @@
  *   rknputest selftest          interface layout and range checks; needs no
  *                               device and runs on any host (CI runs it on
  *                               Linux)
+ *   rknputest m3 [options]      M3: int8 matmuls on the NPU, compared bit for
+ *                               bit with the CPU (see cmd_m3 and docs/M3.md)
  *
- * Exit status: 0 ok, 1 usage or device error, 2 a check in `info` failed.
+ * Exit status: 0 ok, 1 usage or device error, 2 a check in `info` failed,
+ * 3 an m3 result was wrong, 4 an m3 job did not complete.
  *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
@@ -21,8 +24,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <time.h>
+#endif
 
 #include "rknpu_ioctl.h"
+#include "m3_gemm.h"
 
 #define EXPECT_DSU0_HZ  594000000u
 
@@ -56,6 +63,13 @@ static int dev_ioctl(DWORD code, const void *in, DWORD in_len, void *out, DWORD 
         *got = n;
     return 0;
 }
+#elif defined(RKNPU_FAKE_DEVICE)
+#include "fakedev.h"
+static int dev_open(void)
+{
+    printf("(fakedev: no NPU, the matmul is done in C; this checks the tool, not the hardware)\n");
+    return 0;
+}
 #else
 static int dev_open(void)
 {
@@ -78,6 +92,8 @@ static int dev_info(rknpu_info *o)
         }
     }
     return 0;
+#elif defined(RKNPU_FAKE_DEVICE)
+    return fake_ioctl(IOCTL_RKNPU_GET_INFO, NULL, 0, o, sizeof(*o));
 #else
     return -1;
 #endif
@@ -142,7 +158,14 @@ static int cmd_info(void)
                c->gsiv, c->isr_count, c->isr_unclaimed, c->dpc_count, c->last_pc_status,
                c->last_mmu_int_status[0], c->last_mmu_int_status[1],
                c->last_mmu_fault_addr[0], c->last_mmu_fault_addr[1]);
+        if (in.m3_version)
+            printf("  m3: jobs %u submitted, %u completed, %u timed out, %u resets\n",
+                   c->jobs_submitted, c->jobs_completed, c->jobs_timed_out, c->resets);
     }
+    if (in.m3_version)
+        printf("m3: version %u, %u buffers, %u KiB\n", in.m3_version, in.bo_count, in.bo_kib);
+    else
+        printf("m3: not in this driver (an M2 build)\n");
 
     if (in.flags & RKNPU_INFO_CLOCKS_VALID) {
         const rknpu_clock_info *k = &in.clocks;
@@ -168,8 +191,14 @@ static int cmd_info(void)
         check(!(c->mmu_status[0] & 1) && !(c->mmu_status[1] & 1), line);
         snprintf(line, sizeof(line), "core %u interrupt is GSIV %u", n, expect_gsiv[n]);
         check(c->gsiv == expect_gsiv[n], line);
-        snprintf(line, sizeof(line), "core %u no interrupt seen (no job was started)", n);
-        check(c->isr_count == 0 && c->isr_unclaimed == 0, line);
+        if (c->jobs_submitted == 0) {
+            snprintf(line, sizeof(line), "core %u no interrupt seen (no job was started)", n);
+            check(c->isr_count == 0 && c->isr_unclaimed == 0, line);
+        } else {
+            snprintf(line, sizeof(line), "core %u no unclaimed interrupt (%u jobs, %u isr)", n,
+                     c->jobs_submitted, c->isr_count);
+            check(c->isr_unclaimed == 0, line);
+        }
     }
     if (in.flags & RKNPU_INFO_CLOCKS_VALID)
         check(in.clocks.dsu0_hz == EXPECT_DSU0_HZ, "clk_rknn_dsu0 is 594 MHz (GPLL / 2)");
@@ -228,7 +257,575 @@ static int cmd_regs(const char *off_s, const char *n_s)
     return 0;
 }
 
+/* ---------------------------------------------------------------- m3 */
+
+/*
+ * rknputest m3 [--core 0|1|both] [--iters N] [--shape M K N] [--map] [--no-reset]
+ *
+ * Runs a ladder of int8 matmuls C = A * B^T on the NPU and compares every
+ * output word with the CPU: M = 1, K = 64, N = 64 first (the shape charsiu's
+ * lab notebook records exact on the board), then up to M = 16, K = 1024,
+ * N = 1024. A job of M rows is M tasks, one per row, which also exercises the
+ * driver's task chaining from the interrupt. m3_gemm.h has the format and
+ * where each part of it comes from. The ladder stops at the first failure.
+ *
+ * Every buffer is written and read through WRITE_BO and READ_BO, so no NPU
+ * page is mapped into this process unless --map is given (then the output is
+ * read through a MAP_BO mapping as well, and unmapped before it is freed).
+ * Each output row has 4 KiB of canary after it; a canary word the NPU
+ * overwrote is reported as an overrun, since with the IOMMU off an overrun
+ * lands in whatever memory follows.
+ *
+ * After the ladder, unless --no-reset, each core is reset through RESET (the
+ * SSDT's _DSM) and the first shape is run again on it: the path a timed-out
+ * job takes, tried while nothing is wrong.
+ */
+
+#define M3_CANARY       0xA5A5A5A5u
+#define M3_TIMEOUT_MS   2000u
+
+static double now_us(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f;
+    LARGE_INTEGER t;
+
+    if (!f.QuadPart)
+        QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1e6 / (double)f.QuadPart;
+#else
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
+#endif
+}
+
+struct m3_bo {
+    unsigned int handle, addr, size;
+};
+
+static int m3_call(unsigned int code, const void *in, unsigned int in_len, void *out, unsigned int out_len)
+{
+#ifdef _WIN32
+    return dev_ioctl(code, in, in_len, out, out_len, NULL);
+#elif defined(RKNPU_FAKE_DEVICE)
+    if (fake_ioctl(code, in, in_len, out, out_len)) {
+        fprintf(stderr, "fakedev: ioctl 0x%08x failed\n", code);
+        return -1;
+    }
+    return 0;
+#else
+    (void)code; (void)in; (void)in_len; (void)out; (void)out_len;
+    return -1;
+#endif
+}
+
+static int bo_create(unsigned int size, struct m3_bo *b)
+{
+    rknpu_create_bo c;
+
+    memset(&c, 0, sizeof(c));
+    c.size = size;
+    memset(b, 0, sizeof(*b));
+    if (m3_call(IOCTL_RKNPU_CREATE_BO, &c, sizeof(c), &c, sizeof(c)))
+        return -1;
+    b->handle = c.handle;
+    b->addr = c.dma_address;
+    b->size = c.size;
+    return 0;
+}
+
+static void bo_free(struct m3_bo *b)
+{
+    rknpu_bo_handle h;
+
+    if (!b->handle)
+        return;
+    memset(&h, 0, sizeof(h));
+    h.handle = b->handle;
+    m3_call(IOCTL_RKNPU_FREE_BO, &h, sizeof(h), NULL, 0);
+    b->handle = 0;
+}
+
+static int bo_io(unsigned int code, const struct m3_bo *b, unsigned int off, void *p, size_t len)
+{
+    rknpu_bo_io io;
+    size_t done = 0;
+
+    while (done < len) {
+        unsigned int n = (unsigned int)(len - done > RKNPU_BO_IO_MAX ? RKNPU_BO_IO_MAX : len - done);
+
+        memset(&io, 0, sizeof(io));
+        io.handle = b->handle;
+        io.offset = off + (unsigned int)done;
+        io.length = n;
+        if (m3_call(code, &io, sizeof(io), (unsigned char *)p + done, n))
+            return -1;
+        done += n;
+    }
+    return 0;
+}
+
+/* The rules SUBMIT enforces (rknpu_regcmd.h), checked here first for a clearer message. */
+static int m3_stream_ok(const unsigned long long *e, unsigned int count, const struct m3_bo *bos, unsigned int nbo)
+{
+    unsigned int i, j, fetched = (count + 1) / 2 * 2;
+
+    for (i = 0; i < fetched; i++) {
+        unsigned long long x = i < count ? e[i] : 0;
+        unsigned int reg = RKNPU_RC_REG(x), v = RKNPU_RC_VALUE(x);
+        int inside = 0;
+
+        if (x == 0)
+            continue;
+        if (rknpu_rc_is_pc_reg(reg))
+            return 0;
+        if (!rknpu_rc_is_addr_reg(reg) || v == 0)
+            continue;
+        for (j = 0; j < nbo; j++)
+            if (v >= bos[j].addr && (unsigned long long)v < (unsigned long long)bos[j].addr + bos[j].size)
+                inside = 1;
+        if (!inside)
+            return 0;
+    }
+    return 1;
+}
+
+static void m3_crumb_hint(void)
+{
+    printf("  the driver's last stage is in the registry (it survives a hang):\n"
+           "    reg query \"HKLM\\SYSTEM\\CurrentControlSet\\Enum\\ACPI\\RKCP3576\\0\\Device Parameters\"\n"
+           "  M3Stage: 3 submitted, 4 interrupt seen, 5 returned, 6 timed out, 7 reset\n");
+}
+
+static void m3_print_wait(const rknpu_wait_out *w)
+{
+    printf("    wait: result %u, raw 0x%08x task_status 0x%08x, tasks %u of %u, isr %u, hw %u us, "
+           "reset 0x%08x, version after 0x%08x, mmu 0x%08x/0x%08x\n",
+           w->result, w->raw_status, w->task_status, w->tasks_done, w->task_count, w->isr_count, w->hw_us,
+           w->reset_status, w->version_after, w->mmu_status[0], w->mmu_status[1]);
+}
+
+/* 0 exact, 1 setup error, 3 wrong, 4 the job did not complete */
+static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned int n, unsigned int iters, int map)
+{
+    const struct m3_shape *s = m3_find_shape(k, n);
+    unsigned int rc_slot, in_slot, out_slot, r, i, it;
+    size_t wsz, csz, in_total, out_total, rc_total;
+    unsigned char *A = NULL, *B = NULL, *wbuf = NULL, *cbuf = NULL, *ibuf = NULL, *obuf = NULL;
+    unsigned long long *rcbuf = NULL;
+    int *want = NULL;
+    struct m3_bo bo[5];     /* regcmd, input, weights, coefs, output */
+    double cpu_us, t0, rt_sum = 0, hw_sum = 0, rt_min = 1e30;
+    unsigned int hw_min = 0xFFFFFFFFu;
+    int ret = 1;
+
+    memset(bo, 0, sizeof(bo));
+    if (!s || m == 0 || m > RKNPU_MAX_TASKS) {
+        fprintf(stderr, "m3: no captured stream for K=%u N=%u, or M=%u is not 1..%u (shapes:", k, n, m,
+                RKNPU_MAX_TASKS);
+        for (i = 0; i < sizeof(m3_shapes) / sizeof(m3_shapes[0]); i++)
+            fprintf(stderr, " %ux%u", m3_shapes[i].k, m3_shapes[i].n);
+        fprintf(stderr, ")\n");
+        return 1;
+    }
+    printf("core %u: M=%u K=%u N=%u, %u task%s of %u entries\n", core, m, k, n, m, m > 1 ? "s" : "", s->count);
+    fflush(stdout);
+
+    rc_slot = M3_ALIGN((s->count + 1) * 8u, 256u);
+    in_slot = (unsigned int)M3_ALIGN(m3_input_row_bytes(k) + 4096u, 4096u);
+    out_slot = M3_ALIGN(n * 4u, 4096u) + 4096u;
+    wsz = m3_weight_bytes(k, n) + 4096u;
+    csz = m3_coef_bytes(n) + 4096u;
+    rc_total = (size_t)rc_slot * m;
+    in_total = (size_t)in_slot * m;
+    out_total = (size_t)out_slot * m;
+
+    A = (unsigned char *)malloc((size_t)m * k);
+    B = (unsigned char *)malloc((size_t)n * k);
+    wbuf = (unsigned char *)malloc(wsz);
+    cbuf = (unsigned char *)malloc(csz);
+    ibuf = (unsigned char *)malloc(in_total);
+    obuf = (unsigned char *)malloc(out_total);
+    rcbuf = (unsigned long long *)calloc(rc_total / 8, 8);
+    want = (int *)malloc((size_t)m * n * sizeof(int));
+    if (!A || !B || !wbuf || !cbuf || !ibuf || !obuf || !rcbuf || !want) {
+        fprintf(stderr, "m3: out of memory\n");
+        goto out;
+    }
+
+    /* npu_gemm_test.c main(): the same data */
+    for (r = 0; r < m; r++)
+        for (i = 0; i < k; i++)
+            A[(size_t)r * k + i] = m3_mix(r * 2u + 1u, i, 15);
+    for (r = 0; r < n; r++)
+        for (i = 0; i < k; i++)
+            B[(size_t)r * k + i] = m3_mix(r, i, 15);
+    t0 = now_us();
+    for (r = 0; r < m; r++)
+        m3_reference_row(k, n, A + (size_t)r * k, B, want + (size_t)r * n);
+    cpu_us = now_us() - t0;
+
+    if (bo_create((unsigned int)rc_total, &bo[0]) || bo_create((unsigned int)in_total, &bo[1]) ||
+        bo_create((unsigned int)wsz, &bo[2]) || bo_create((unsigned int)csz, &bo[3]) ||
+        bo_create((unsigned int)out_total, &bo[4])) {
+        fprintf(stderr, "m3: CREATE_BO failed\n");
+        goto out;
+    }
+    printf("  buffers (NPU = physical): regcmd 0x%08x input 0x%08x weights 0x%08x coefs 0x%08x output 0x%08x\n",
+           bo[0].addr, bo[1].addr, bo[2].addr, bo[3].addr, bo[4].addr);
+
+    memset(wbuf, 0, wsz);
+    m3_pack_weights(k, n, B, wbuf);
+    memset(cbuf, 0, csz);
+    m3_build_coefs(n, cbuf);
+    for (r = 0; r < m; r++)
+        m3_pack_input(k, A + (size_t)r * k, ibuf + (size_t)r * in_slot, in_slot);
+    for (r = 0; r < m; r++) {
+        unsigned int base[M3_NBUF];
+
+        base[M3_BUF_INPUT] = bo[1].addr + r * in_slot;
+        base[M3_BUF_WEIGHT] = bo[2].addr;
+        base[M3_BUF_OUTPUT] = bo[4].addr + r * out_slot;
+        base[M3_BUF_COEF] = bo[3].addr;
+        m3_build_stream(s, base, rcbuf + (size_t)r * rc_slot / 8);
+        if (!m3_stream_ok(rcbuf + (size_t)r * rc_slot / 8, s->count, bo, 5)) {
+            fprintf(stderr, "m3: the stream for row %u breaks the SUBMIT rules (a bug in this tool)\n", r);
+            goto out;
+        }
+    }
+    if (bo_io(IOCTL_RKNPU_WRITE_BO, &bo[0], 0, rcbuf, rc_total) || bo_io(IOCTL_RKNPU_WRITE_BO, &bo[1], 0, ibuf, in_total) ||
+        bo_io(IOCTL_RKNPU_WRITE_BO, &bo[2], 0, wbuf, wsz) || bo_io(IOCTL_RKNPU_WRITE_BO, &bo[3], 0, cbuf, csz)) {
+        fprintf(stderr, "m3: WRITE_BO failed\n");
+        goto out;
+    }
+
+    for (it = 0; it < iters; it++) {
+        rknpu_submit_in sub;
+        rknpu_submit_out so;
+        rknpu_wait_in wi;
+        rknpu_wait_out wo;
+        unsigned int bad = 0, untouched = 0, overrun = 0;
+        long long worst = 0, first_delta = 0;
+        int same_delta = 1;
+        double rt;
+
+        for (i = 0; i < out_total / 4; i++) {
+            const unsigned int canary = M3_CANARY;
+            memcpy(obuf + (size_t)i * 4, &canary, 4);
+        }
+        if (bo_io(IOCTL_RKNPU_WRITE_BO, &bo[4], 0, obuf, out_total)) {
+            fprintf(stderr, "m3: WRITE_BO (output canary) failed\n");
+            goto out;
+        }
+
+        memset(&sub, 0, sizeof(sub));
+        sub.core = core;
+        sub.task_count = m;
+        if (it > 0)
+            sub.flags = RKNPU_SUBMIT_NO_CRUMBS;     /* the first run leaves the breadcrumbs */
+        for (r = 0; r < m; r++) {
+            sub.tasks[r].regcmd = bo[0].addr + r * rc_slot;
+            sub.tasks[r].regcmd_count = s->count;
+        }
+        t0 = now_us();
+        if (m3_call(IOCTL_RKNPU_SUBMIT, &sub, sizeof(sub), &so, sizeof(so))) {
+            fprintf(stderr, "m3: SUBMIT refused\n");
+            goto out;
+        }
+        memset(&wi, 0, sizeof(wi));
+        wi.seqno = so.seqno;
+        wi.timeout_ms = M3_TIMEOUT_MS;
+        if (m3_call(IOCTL_RKNPU_WAIT, &wi, sizeof(wi), &wo, sizeof(wo))) {
+            fprintf(stderr, "m3: WAIT failed\n");
+            goto out;
+        }
+        rt = now_us() - t0;
+        if (wo.result != RKNPU_JOB_DONE) {
+            printf("  job %llu did not complete (%s)\n", so.seqno,
+                   wo.result == RKNPU_JOB_TIMEOUT ? "timed out, the core was reset" :
+                   wo.result == RKNPU_JOB_DMA_ERROR ? "DMA error" : "unknown job");
+            m3_print_wait(&wo);
+            m3_crumb_hint();
+            ret = 4;
+            goto out;
+        }
+        if (it == 0)
+            m3_print_wait(&wo);
+
+        if (map && it == 0) {
+            rknpu_map_bo mb;
+            rknpu_bo_handle h;
+
+            memset(&mb, 0, sizeof(mb));
+            mb.handle = bo[4].handle;
+            if (m3_call(IOCTL_RKNPU_MAP_BO, &mb, sizeof(mb), &mb, sizeof(mb))) {
+                fprintf(stderr, "m3: MAP_BO failed\n");
+                goto out;
+            }
+            memcpy(obuf, (const void *)(size_t)mb.user_va, out_total);
+            memset(&h, 0, sizeof(h));
+            h.handle = bo[4].handle;
+            if (m3_call(IOCTL_RKNPU_UNMAP_BO, &h, sizeof(h), NULL, 0)) {
+                fprintf(stderr, "m3: UNMAP_BO failed\n");
+                goto out;
+            }
+            printf("  output read through MAP_BO at %p, then unmapped\n", (void *)(size_t)mb.user_va);
+        } else if (bo_io(IOCTL_RKNPU_READ_BO, &bo[4], 0, obuf, out_total)) {
+            fprintf(stderr, "m3: READ_BO failed\n");
+            goto out;
+        }
+
+        for (r = 0; r < m; r++) {
+            const unsigned char *row = obuf + (size_t)r * out_slot;
+
+            for (i = 0; i < n; i++) {
+                int got;
+                long long d;
+
+                memcpy(&got, row + (size_t)i * 4, 4);
+                if ((unsigned int)got == M3_CANARY)
+                    untouched++;
+                d = (long long)got - want[(size_t)r * n + i];
+                if (d) {
+                    if (!bad)
+                        first_delta = d;
+                    else if (d != first_delta)
+                        same_delta = 0;
+                    bad++;
+                    if ((d < 0 ? -d : d) > (worst < 0 ? -worst : worst))
+                        worst = d;
+                }
+            }
+            for (i = n * 4u; i + 4 <= out_slot; i += 4) {
+                unsigned int w;
+
+                memcpy(&w, row + i, 4);
+                if (w != M3_CANARY)
+                    overrun++;
+            }
+        }
+        if (bad || overrun) {
+            printf("  run %u: %u of %u words wrong (worst delta %lld), %u never written, %u canary words "
+                   "after the rows overwritten\n", it, bad, m * n, worst, untouched, overrun);
+            if (bad && same_delta)
+                printf("  every wrong word is off by the same %lld: an offset in the output stage, "
+                       "not the arithmetic\n", first_delta);
+            printf("    got: ");
+            for (i = 0; i < 8 && i < n; i++) {
+                int g;
+
+                memcpy(&g, obuf + (size_t)i * 4, 4);
+                printf(" %d", g);
+            }
+            printf("\n    want:");
+            for (i = 0; i < 8 && i < n; i++)
+                printf(" %d", want[i]);
+            printf("\n");
+            m3_print_wait(&wo);
+            ret = 3;
+            goto out;
+        }
+        rt_sum += rt;
+        hw_sum += wo.hw_us;
+        if (rt < rt_min)
+            rt_min = rt;
+        if (wo.hw_us < hw_min)
+            hw_min = wo.hw_us;
+    }
+    {
+        double macs = (double)m * k * n;
+
+        printf("  EXACT: %u x %u words, %u run%s. hw %u us min / %.0f avg (%.1f us a task), "
+               "submit to wait return %.0f us min / %.0f avg, CPU reference %.0f us; %.2f GMAC/s on the NPU\n",
+               m, n, iters, iters > 1 ? "s" : "", hw_min, hw_sum / iters, (double)hw_min / m,
+               rt_min, rt_sum / iters, cpu_us, hw_min ? macs / hw_min / 1e3 : 0.0);
+    }
+    ret = 0;
+out:
+    for (i = 0; i < 5; i++)
+        bo_free(&bo[i]);
+    free(A); free(B); free(wbuf); free(cbuf); free(ibuf); free(obuf); free(rcbuf); free(want);
+    fflush(stdout);
+    return ret;
+}
+
+static int m3_reset(unsigned int core)
+{
+    rknpu_reset_in in;
+    rknpu_reset_out o;
+
+    memset(&in, 0, sizeof(in));
+    memset(&o, 0, sizeof(o));
+    in.core = core;
+    printf("core %u: RESET (_DSM function 1)\n", core);
+    fflush(stdout);
+    if (m3_call(IOCTL_RKNPU_RESET, &in, sizeof(in), &o, sizeof(o)))
+        return 1;
+    printf("  _DSM status 0x%08x returned %u, version after 0x%08x, mmu 0x%08x/0x%08x\n", o.dsm_status,
+           o.dsm_return, o.version_after, o.mmu_status[0], o.mmu_status[1]);
+    return (o.dsm_status == 0 && o.dsm_return == 0 && o.version_after != 0 && o.version_after != 0xFFFFFFFFu &&
+            !(o.mmu_status[0] & 1) && !(o.mmu_status[1] & 1)) ? 0 : 1;
+}
+
+static const struct { unsigned int m, k, n; } m3_ladder[] = {
+    { 1, 64, 64 },          /* charsiu lab notebook: exact on the board under Linux */
+    { 4, 256, 64 },         /* four tasks in one job: the ISR starts tasks 2..4 */
+    { 8, 256, 256 },
+    { 16, 1024, 1024 },     /* medium: 1 MiB of weights read by each of 16 tasks */
+};
+
+static int cmd_m3(int argc, char **argv)
+{
+    unsigned int cores[2] = { 0, 1 }, ncores = 2, iters = 5, c, i, sm = 0, sk = 0, sn = 0;
+    int map = 0, reset = 1, a, rc;
+    rknpu_info info;
+
+    for (a = 0; a < argc; a++) {
+        if (!strcmp(argv[a], "--core") && a + 1 < argc) {
+            a++;
+            if (!strcmp(argv[a], "both")) {
+                ncores = 2;
+            } else if (!parse_u32(argv[a], &cores[0]) && cores[0] < RKNPU_NUM_CORES) {
+                ncores = 1;
+            } else {
+                fprintf(stderr, "m3: --core 0, 1 or both\n");
+                return 1;
+            }
+        } else if (!strcmp(argv[a], "--iters") && a + 1 < argc) {
+            if (parse_u32(argv[++a], &iters) || iters == 0 || iters > 1000) {
+                fprintf(stderr, "m3: --iters 1..1000\n");
+                return 1;
+            }
+        } else if (!strcmp(argv[a], "--shape") && a + 3 < argc) {
+            if (parse_u32(argv[a + 1], &sm) || parse_u32(argv[a + 2], &sk) || parse_u32(argv[a + 3], &sn)) {
+                fprintf(stderr, "m3: --shape M K N\n");
+                return 1;
+            }
+            a += 3;
+        } else if (!strcmp(argv[a], "--map")) {
+            map = 1;
+        } else if (!strcmp(argv[a], "--no-reset")) {
+            reset = 0;
+        } else {
+            fprintf(stderr, "m3: unknown option %s\n", argv[a]);
+            return 1;
+        }
+    }
+
+    if (dev_open() || dev_info(&info))
+        return 1;
+    printf("rknputest m3: driver m3 version %u, flags 0x%08x\n", info.m3_version, info.flags);
+    if (info.m3_version != RKNPU_M3_VERSION) {
+        fprintf(stderr, "m3: the driver is not an M3 build (m3_version %u); install the M3 package\n",
+                info.m3_version);
+        return 1;
+    }
+    if (!(info.flags & RKNPU_INFO_INTERRUPTS_CONNECTED) || !(info.flags & RKNPU_INFO_DOMAINS_ON)) {
+        fprintf(stderr, "m3: interrupts not connected or NPU domains off; run `rknputest info`\n");
+        return 1;
+    }
+    for (c = 0; c < ncores; c++)
+        if ((info.core[cores[c]].mmu_status[0] | info.core[cores[c]].mmu_status[1]) & 1) {
+            fprintf(stderr, "m3: core %u has IOMMU paging on; M3 needs it off\n", cores[c]);
+            return 1;
+        }
+
+    for (c = 0; c < ncores; c++) {
+        if (sm) {
+            rc = m3_run(cores[c], sm, sk, sn, iters, map);
+            if (rc)
+                goto done;
+            continue;
+        }
+        for (i = 0; i < sizeof(m3_ladder) / sizeof(m3_ladder[0]); i++) {
+            rc = m3_run(cores[c], m3_ladder[i].m, m3_ladder[i].k, m3_ladder[i].n, iters, map && i == 0);
+            if (rc)
+                goto done;
+        }
+    }
+    rc = 0;
+    if (reset) {
+        for (c = 0; c < ncores && !rc; c++) {
+            if (m3_reset(cores[c])) {
+                printf("  the reset did not come back clean\n");
+                rc = 4;
+                break;
+            }
+            rc = m3_run(cores[c], m3_ladder[0].m, m3_ladder[0].k, m3_ladder[0].n, 1, 0);
+        }
+    }
+done:
+    if (dev_info(&info) == 0)
+        for (c = 0; c < RKNPU_NUM_CORES; c++)
+            printf("core %u totals: %u submitted, %u completed, %u timed out, %u resets, isr %u unclaimed %u\n", c,
+                   info.core[c].jobs_submitted, info.core[c].jobs_completed, info.core[c].jobs_timed_out,
+                   info.core[c].resets, info.core[c].isr_count, info.core[c].isr_unclaimed);
+    printf("%s\n", rc ? "RKNPU M3: FAILED" : "RKNPU M3: PASS");
+    return rc;
+}
+
 /* ---------------------------------------------------------- selftest */
+
+/*
+ * The m3 pieces that need no device: every captured stream, relocated into
+ * made-up buffers, passes the SUBMIT rules and carries the addresses it was
+ * given; a stream pointed outside its buffers, or one that writes the PC
+ * block, fails them. (That the streams and packing equal charsiu's is
+ * tools/m3gen's check, which links charsiu.)
+ */
+static int m3_selftest(void)
+{
+    static unsigned long long e[4096];
+    struct m3_bo bos[4] = {
+        { 1, 0x50000000u, 0x00100000u }, { 2, 0x50200000u, 0x00200000u },
+        { 3, 0x50400000u, 0x00010000u }, { 4, 0x50800000u, 0x00080000u },
+    };
+    unsigned int base[M3_NBUF], i, j;
+    int bad = 0;
+
+    base[M3_BUF_INPUT] = bos[0].addr + 0x1000;
+    base[M3_BUF_WEIGHT] = bos[1].addr;
+    base[M3_BUF_OUTPUT] = bos[2].addr + 0x2000;
+    base[M3_BUF_COEF] = bos[3].addr;
+    for (i = 0; i < sizeof(m3_shapes) / sizeof(m3_shapes[0]); i++) {
+        const struct m3_shape *s = &m3_shapes[i];
+        unsigned int seen = 0;
+
+        if (s->count + 1 > sizeof(e) / sizeof(e[0]) || s->count > RKNPU_MAX_REGCMD) {
+            printf("  m3 shape %ux%u: %u entries is too many\n", s->k, s->n, s->count);
+            bad = 1;
+            continue;
+        }
+        m3_build_stream(s, base, e);
+        for (j = 0; j < s->nrel; j++) {
+            unsigned int v = RKNPU_RC_VALUE(e[s->rel[j].index]);
+            if (v != base[s->rel[j].buf] + s->rel[j].offset || !rknpu_rc_is_addr_reg(RKNPU_RC_REG(e[s->rel[j].index])))
+                bad = 1;
+            seen |= 1u << s->rel[j].buf;
+        }
+        if (seen != (1u << M3_NBUF) - 1 || !m3_stream_ok(e, s->count, bos, 4)) {
+            printf("  m3 shape %ux%u: relocated stream fails the SUBMIT rules\n", s->k, s->n);
+            bad = 1;
+        }
+        /* the output moved past every buffer must be refused */
+        e[s->rel[2].index] = RKNPU_RC_ENTRY(RKNPU_RC_DPU, RKNPU_RC_DPU_DST_ADDR, 0x60000000u);
+        if (m3_stream_ok(e, s->count, bos, 4)) {
+            printf("  m3 shape %ux%u: an address outside the buffers passed\n", s->k, s->n);
+            bad = 1;
+        }
+        m3_build_stream(s, base, e);
+        e[s->count - 1] = RKNPU_RC_ENTRY(RKNPU_RC_CNA, 0x0010, 0x50000000u);  /* PC_BASE_ADDRESS */
+        if (m3_stream_ok(e, s->count, bos, 4)) {
+            printf("  m3 shape %ux%u: a PC block write passed\n", s->k, s->n);
+            bad = 1;
+        }
+    }
+    printf("m3: %u captured shapes checked\n", (unsigned)(sizeof(m3_shapes) / sizeof(m3_shapes[0])));
+    return bad;
+}
 
 static int cmd_selftest(void)
 {
@@ -256,6 +853,7 @@ static int cmd_selftest(void)
             bad = 1;
         }
     }
+    bad |= m3_selftest();
     printf("%s\n", bad ? "SELFTEST FAILED" : "SELFTEST OK");
     return bad;
 }
@@ -267,7 +865,8 @@ static void usage(void)
     fprintf(stderr,
             "usage: rknputest info\n"
             "       rknputest regs <offset> <count>\n"
-            "       rknputest selftest\n");
+            "       rknputest selftest\n"
+            "       rknputest m3 [--core 0|1|both] [--iters N] [--shape M K N] [--map] [--no-reset]\n");
 }
 
 int main(int argc, char **argv)
@@ -280,6 +879,8 @@ int main(int argc, char **argv)
         rc = cmd_regs(argv[2], argv[3]);
     else if (argc == 2 && !strcmp(argv[1], "selftest"))
         rc = cmd_selftest();
+    else if (argc >= 2 && !strcmp(argv[1], "m3"))
+        rc = cmd_m3(argc - 2, argv + 2);
     else {
         usage();
         return 1;
