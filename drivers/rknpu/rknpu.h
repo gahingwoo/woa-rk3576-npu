@@ -13,10 +13,12 @@
 #ifndef RKNPU_DRV_H
 #define RKNPU_DRV_H
 
-#include <ntddk.h>
+#include <ntifs.h>     /* includes ntddk.h */
 #include <wdf.h>
+#include <intrin.h>
 
 #include "rknpu_ioctl.h"
+#include "rknpu_regcmd.h"
 
 #define RKNPU_LOG(fmt, ...) \
     DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "rknpu: " fmt "\n", __VA_ARGS__)
@@ -41,6 +43,28 @@
 #define PC_TASK_STATUS          0x003Cu
 #define PC_INTERRUPT_ALL        0x1FFFFu    /* rocket_job_handle_irq() */
 
+/* M3: the job registers rocket_job_hw_submit() writes (rocket_registers.h) */
+#define PC_BASE_ADDRESS         0x0010u
+#define PC_REGISTER_AMOUNTS     0x0014u
+#define PC_TASK_DMA_BASE_ADDR   0x0034u
+#define PC_INT_DPU_0            0x00000100u /* PC_INTERRUPT_*_DPU_0 */
+#define PC_INT_DPU_1            0x00000200u
+#define PC_INT_DMA_READ_ERROR   0x00001000u
+#define PC_INT_DMA_WRITE_ERROR  0x00002000u
+#define PC_DATA_AMOUNT_MASK     0x0000FFFFu /* PC_REGISTER_AMOUNTS_PC_DATA_AMOUNT */
+#define CNA_S_POINTER           (NPU_CNA_OFF + 0x0004u)     /* REG_CNA_S_POINTER */
+#define CORE_S_POINTER          (NPU_CORE_OFF + 0x0004u)    /* REG_CORE_S_POINTER */
+#define S_POINTER_PP_EN         (1u << 1)   /* *_S_POINTER_POINTER_PP_EN(1) */
+#define S_POINTER_EXECUTER_PP_EN (1u << 2)  /* *_S_POINTER_EXECUTER_PP_EN(1) */
+#define S_POINTER_PP_MODE       (1u << 3)   /* *_S_POINTER_POINTER_PP_MODE(1) */
+#define S_POINTER_CORE_BIT      0x10000000u /* "extra_bit", times the core index */
+/* v17-0009, rocket_job.c: the RK3576 PC_TASK_CON layout */
+#define RK3576_TASK_NUMBER(n)   ((n) & 0xFFFFu)
+#define RK3576_TASK_PP_EN       (1u << 16)
+#define RK3576_TASK_COUNT_CLEAR (1u << 17)
+#define RK3576_TASK_LAST_LAYER_CLEAR (1u << 18)
+#define RK_MMU_STATUS_PAGING    0x00000001u
+
 /* IOMMU (rockchip-iommu.c) */
 #define RK_MMU_DTE_ADDR         0x00u
 #define RK_MMU_STATUS           0x04u
@@ -62,6 +86,44 @@
 #define CRU_GATE(n)             (0x800u + (n) * 4u)
 #define OSC_HZ                  24000000u
 
+#define RKNPU_POOL_TAG          'UPNR'
+
+/* One buffer (M3): contiguous, below 4 GiB, write-combined. */
+typedef struct _NPU_BO {
+    LIST_ENTRY      Link;
+    ULONG           Handle;
+    PVOID           Kva;
+    PHYSICAL_ADDRESS Pa;
+    SIZE_T          Size;
+    PMDL            Mdl;            /* built on the first MAP_BO */
+    PVOID           UserVa;         /* the caller's mapping, or NULL */
+    PEPROCESS       Process;        /* referenced while UserVa is set */
+    WDFFILEOBJECT   Owner;
+} NPU_BO, *PNPU_BO;
+
+/*
+ * The job on a core (M3). Written at PASSIVE_LEVEL under the interrupt lock
+ * before the first task starts; afterwards only the ISR moves it, until the
+ * DPC or a recovery takes it back. No wait ever happens under that lock.
+ */
+typedef struct _CORE_JOB {
+    BOOLEAN         InFlight;       /* the hardware owns the job */
+    BOOLEAN         CompletePending;/* the ISR finished it; the DPC has not run */
+    BOOLEAN         NoCrumbs;       /* RKNPU_SUBMIT_NO_CRUMBS */
+    ULONG           Result;         /* RKNPU_JOB_* once finished */
+    ULONGLONG       Seq;            /* 0: never used */
+    WDFFILEOBJECT   Owner;
+    ULONG           TaskCount;
+    ULONG           NextTask;
+    ULONG           TasksDone;
+    ULONG           IsrCount;
+    ULONG           RawStatus;
+    ULONG           TaskStatus;
+    LARGE_INTEGER   T0;             /* QPC at the first OPERATION_ENABLE */
+    LARGE_INTEGER   T1;             /* QPC at the last interrupt */
+    rknpu_task      Tasks[RKNPU_MAX_TASKS];
+} CORE_JOB;
+
 typedef struct _CORE_STATE {
     WDFINTERRUPT    Interrupt;
     ULONG           Gsiv;
@@ -71,6 +133,15 @@ typedef struct _CORE_STATE {
     ULONG           LastPcStatus;
     ULONG           LastMmuIntStatus[RKNPU_MMUS_PER_CORE];
     ULONG           LastMmuFault[RKNPU_MMUS_PER_CORE];
+
+    /* M3 */
+    CORE_JOB        Job;
+    KEVENT          Done;           /* set by the DPC when Job finishes */
+    ULONG           Version;        /* PC VERSION at D0 entry, to check a reset against */
+    volatile LONG   JobsSubmitted;
+    volatile LONG   JobsCompleted;
+    volatile LONG   JobsTimedOut;
+    volatile LONG   Resets;
 } CORE_STATE;
 
 typedef struct _DEVICE_CONTEXT {
@@ -83,6 +154,18 @@ typedef struct _DEVICE_CONTEXT {
     BOOLEAN         InterruptsConnected;
     CORE_STATE      Core[RKNPU_NUM_CORES];
     WDFQUEUE        Queue;
+
+    /* M3. Lock order: JobLock, then BoLock, then an interrupt lock. */
+    WDFWAITLOCK     JobLock;        /* SUBMIT, WAIT, RESET, cleanup */
+    WDFWAITLOCK     BoLock;         /* the buffer list */
+    LIST_ENTRY      Bos;
+    ULONG           NextHandle;
+    ULONG           BoCount;
+    SIZE_T          BoBytes;
+    ULONGLONG       NextSeq;
+    LONG            CrumbCounts[16];
+    WDFKEY          CrumbKey;       /* Device Parameters; NULL if it would not open */
+    LARGE_INTEGER   QpcFreq;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetContext)
@@ -107,5 +190,20 @@ static __forceinline ULONG NpuCoreBase(ULONG core)
 {
     return core * NPU_CORE_STRIDE;
 }
+
+/* driver.c */
+BOOLEAN NpuSafeToRead(_In_ PDEVICE_CONTEXT Ctx);
+
+/* m3.c */
+NTSTATUS NpuM3DeviceInit(_In_ PDEVICE_CONTEXT Ctx);
+VOID NpuM3D0Entry(_In_ PDEVICE_CONTEXT Ctx);
+VOID NpuM3D0Exit(_In_ PDEVICE_CONTEXT Ctx);
+BOOLEAN NpuM3Isr(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N);
+VOID NpuM3Dpc(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N);
+BOOLEAN NpuM3InCallerContext(_In_ PDEVICE_CONTEXT Ctx, _In_ WDFREQUEST Request, _In_ ULONG IoControlCode);
+BOOLEAN NpuM3DeviceControl(_In_ PDEVICE_CONTEXT Ctx, _In_ WDFREQUEST Request, _In_ ULONG IoControlCode,
+                           _Out_ NTSTATUS *Status, _Out_ ULONG_PTR *Info);
+VOID NpuM3FileCleanup(_In_ PDEVICE_CONTEXT Ctx, _In_ WDFFILEOBJECT FileObject);
+VOID NpuM3FreeAll(_In_ PDEVICE_CONTEXT Ctx);
 
 #endif

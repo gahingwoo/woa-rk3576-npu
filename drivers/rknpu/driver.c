@@ -1,5 +1,5 @@
 /*
- * driver.c - RK3576 NPU (RKNN, two cores), M2 driver skeleton
+ * driver.c - RK3576 NPU (RKNN, two cores): device, interrupts, M2 IOCTLs
  *
  * A KMDF function driver for ACPI\RKCP3576, which edk2-rk3576 publishes in
  * an SSDT (Npu.asl, OEM table ID RKNPU) only when "NPU (experimental)" is
@@ -28,6 +28,12 @@
  * INT_CLEAR. Nothing writes GLOBAL_OPERATION_ENABLE (0xf008): from core 0's
  * window it hits NPU1 in single-core mode.
  *
+ * M3 (m3.c) adds buffers, job submission, completion and a core reset, all
+ * behind IOCTLs of their own (0x810 on). The writes above stay the only ones
+ * until one of those is called; then the job registers rocket writes are
+ * written too (m3.c says which). The ISR hands a job's DPU interrupt to m3.c
+ * first and keeps the M2 handling for everything else.
+ *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -44,6 +50,9 @@ EVT_WDF_DEVICE_D0_EXIT_PRE_INTERRUPTS_DISABLED NpuEvtD0ExitPreInterrupts;
 EVT_WDF_INTERRUPT_ISR NpuEvtIsr;
 EVT_WDF_INTERRUPT_DPC NpuEvtDpc;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL NpuEvtIoDeviceControl;
+EVT_WDF_IO_IN_CALLER_CONTEXT NpuEvtIoInCallerContext;
+EVT_WDF_FILE_CLEANUP NpuEvtFileCleanup;
+EVT_WDF_OBJECT_CONTEXT_CLEANUP NpuEvtDeviceCleanup;
 
 #define REGS_MIN_LEN    RKNPU_REGS_WINDOW
 
@@ -142,7 +151,7 @@ NpuReadClocks(
  * or not clocked: then no NPU register may be read. Without the PMU and CRU
  * the driver relies on _STA, which reported the device only when it was.
  */
-static BOOLEAN
+BOOLEAN
 NpuSafeToRead(
     _In_ PDEVICE_CONTEXT Ctx
     )
@@ -171,9 +180,14 @@ NpuEvtIsr(
 
     UNREFERENCED_PARAMETER(MessageID);
 
-    /* The PC block. M2 starts no job and leaves the mask at 0, so this is
-     * not expected to fire; if it does, do what rocket does on completion. */
-    st = NpuRd(ctx, base + PC_INTERRUPT_STATUS);
+    /* A job's DPU interrupt (M3): acked, and the next task started, there.
+     * The PC block is then left alone: the next task may already be running. */
+    if (NpuM3Isr(ctx, n))
+        ours = TRUE;
+
+    /* The PC block outside a job. The mask is 0 then, so this is not
+     * expected to fire; if it does, do what rocket does on completion. */
+    st = ours ? 0 : NpuRd(ctx, base + PC_INTERRUPT_STATUS);
     if (st) {
         NpuWr(ctx, base + PC_INTERRUPT_MASK, 0);
         NpuWr(ctx, base + PC_OPERATION_ENABLE, 0);
@@ -209,11 +223,12 @@ NpuEvtDpc(
     )
 {
     PDEVICE_CONTEXT ctx = GetContext(WdfInterruptGetDevice(Interrupt));
+    ULONG n = GetInterruptContext(Interrupt)->CoreIndex;
 
     UNREFERENCED_PARAMETER(AssociatedObject);
 
-    /* M3 completes jobs here. */
-    InterlockedIncrement(&ctx->Core[GetInterruptContext(Interrupt)->CoreIndex].DpcCount);
+    InterlockedIncrement(&ctx->Core[n].DpcCount);
+    NpuM3Dpc(ctx, n);       /* completes a finished job */
 }
 
 /* ---------------------------------------------------------- hardware */
@@ -332,6 +347,7 @@ NpuEvtD0Entry(
         NpuWr(ctx, base + PC_INTERRUPT_MASK, 0);
         NpuWr(ctx, base + PC_INTERRUPT_CLEAR, PC_INTERRUPT_ALL);
     }
+    NpuM3D0Entry(ctx);      /* records each core's version, to check a reset against */
     return STATUS_SUCCESS;
 }
 
@@ -346,7 +362,7 @@ NpuEvtD0EntryPostInterrupts(
     return STATUS_SUCCESS;
 }
 
-/* No power change and no register access. */
+/* No power change. A job still running (M3) is stopped; otherwise no register access. */
 NTSTATUS
 NpuEvtD0ExitPreInterrupts(
     _In_ WDFDEVICE Device,
@@ -355,6 +371,7 @@ NpuEvtD0ExitPreInterrupts(
 {
     UNREFERENCED_PARAMETER(TargetState);
     GetContext(Device)->InterruptsConnected = FALSE;
+    NpuM3D0Exit(GetContext(Device));
     return STATUS_SUCCESS;
 }
 
@@ -397,6 +414,10 @@ NpuFillCore(
         O->last_mmu_int_status[i] = core->LastMmuIntStatus[i];
         O->last_mmu_fault_addr[i] = core->LastMmuFault[i];
     }
+    O->jobs_submitted = (ULONG)core->JobsSubmitted;
+    O->jobs_completed = (ULONG)core->JobsCompleted;
+    O->jobs_timed_out = (ULONG)core->JobsTimedOut;
+    O->resets         = (ULONG)core->Resets;
 }
 
 VOID
@@ -442,6 +463,9 @@ NpuEvtIoDeviceControl(
             o->flags |= RKNPU_INFO_DOMAINS_ON;
         for (i = 0; i < RKNPU_NUM_CORES; i++)
             NpuFillCore(ctx, i, on, &o->core[i]);
+        o->m3_version = RKNPU_M3_VERSION;
+        o->bo_count = ctx->BoCount;
+        o->bo_kib = (ULONG)(ctx->BoBytes / 1024);
         info = sizeof(*o);
         break;
     }
@@ -472,11 +496,53 @@ NpuEvtIoDeviceControl(
         break;
     }
     default:
-        /* includes the function codes reserved for M3 */
-        status = STATUS_INVALID_DEVICE_REQUEST;
+        /* M3 (m3.c); anything it does not know, reserved codes included,
+         * is STATUS_INVALID_DEVICE_REQUEST */
+        NpuM3DeviceControl(ctx, Request, IoControlCode, &status, &info);
         break;
     }
     WdfRequestCompleteWithInformation(Request, status, info);
+}
+
+/*
+ * MAP_BO, UNMAP_BO and FREE_BO need the caller's address space (a mapping is
+ * made and undone in the process that holds it); m3.c completes those here.
+ * Everything else goes to the queue as in M2.
+ */
+VOID
+NpuEvtIoInCallerContext(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request
+    )
+{
+    WDF_REQUEST_PARAMETERS params;
+    NTSTATUS status;
+
+    WDF_REQUEST_PARAMETERS_INIT(&params);
+    WdfRequestGetParameters(Request, &params);
+    if (params.Type == WdfRequestTypeDeviceControl &&
+        NpuM3InCallerContext(GetContext(Device), Request, params.Parameters.DeviceIoControl.IoControlCode))
+        return;
+    status = WdfDeviceEnqueueRequest(Device, Request);
+    if (!NT_SUCCESS(status))
+        WdfRequestComplete(Request, status);
+}
+
+/* The handle closes, in its process: its jobs end and its buffers go (m3.c). */
+VOID
+NpuEvtFileCleanup(
+    _In_ WDFFILEOBJECT FileObject
+    )
+{
+    NpuM3FileCleanup(GetContext(WdfFileObjectGetDevice(FileObject)), FileObject);
+}
+
+VOID
+NpuEvtDeviceCleanup(
+    _In_ WDFOBJECT Object
+    )
+{
+    NpuM3FreeAll(GetContext((WDFDEVICE)Object));
 }
 
 /* ------------------------------------------------------------- setup */
@@ -508,6 +574,7 @@ NpuEvtDeviceAdd(
 {
     WDF_PNPPOWER_EVENT_CALLBACKS pnp;
     WDF_OBJECT_ATTRIBUTES attr;
+    WDF_FILEOBJECT_CONFIG fcfg;
     WDF_IO_QUEUE_CONFIG qcfg;
     WDFDEVICE device;
     PDEVICE_CONTEXT ctx;
@@ -527,6 +594,10 @@ NpuEvtDeviceAdd(
     pnp.EvtDeviceD0ExitPreInterruptsDisabled = NpuEvtD0ExitPreInterrupts;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
 
+    WDF_FILEOBJECT_CONFIG_INIT(&fcfg, WDF_NO_EVENT_CALLBACK, WDF_NO_EVENT_CALLBACK, NpuEvtFileCleanup);
+    WdfDeviceInitSetFileObjectConfig(DeviceInit, &fcfg, WDF_NO_OBJECT_ATTRIBUTES);
+    WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, NpuEvtIoInCallerContext);
+
     WdfDeviceInitSetExclusive(DeviceInit, TRUE);
     status = WdfDeviceInitAssignName(DeviceInit, &name);
     if (!NT_SUCCESS(status))
@@ -536,12 +607,16 @@ NpuEvtDeviceAdd(
         return status;
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attr, DEVICE_CONTEXT);
+    attr.EvtCleanupCallback = NpuEvtDeviceCleanup;
     status = WdfDeviceCreate(&DeviceInit, &attr, &device);
     if (!NT_SUCCESS(status))
         return status;
 
     ctx = GetContext(device);
     ctx->Device = device;
+    status = NpuM3DeviceInit(ctx);
+    if (!NT_SUCCESS(status))
+        return status;
 
     status = WdfDeviceCreateSymbolicLink(device, &link);
     if (!NT_SUCCESS(status))

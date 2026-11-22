@@ -1,12 +1,13 @@
 ;
-; rknpu.inf - RK3576 NPU (RKNN, two cores), M2 driver skeleton
+; rknpu.inf - RK3576 NPU (RKNN, two cores), bring-up driver (M2 + M3)
 ;
 ; Target: Windows on ARM64. Binds ACPI\RKCP3576, which edk2-rk3576 publishes
 ; in an SSDT (OEM table ID RKNPU) only when "NPU (experimental)" is enabled
 ; in the firmware's ACPI / Device Tree setup page. The firmware powers and
 ; clocks the NPU; this driver maps its registers, connects its two
-; interrupts and gives tools\rknputest read-only access (\\.\RKNPU,
-; administrators only). It runs no NPU jobs.
+; interrupts and gives tools\rknputest access (\\.\RKNPU, administrators
+; only). It runs an NPU job only when asked to through the M3 IOCTLs
+; (rknputest m3); until then it does what the M2 driver did.
 ;
 ; Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
 ; SPDX-License-Identifier: GPL-2.0-only

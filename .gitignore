@@ -2,3 +2,6 @@
 ARM64/
 *.user
 .vs/
+
+# tools/m3gen (Linux host build)
+tools/m3gen/build/

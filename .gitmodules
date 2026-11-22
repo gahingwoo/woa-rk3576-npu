@@ -1,0 +1,5 @@
+[submodule "external/charsiu"]
+	path = external/charsiu
+	url = https://github.com/gahingwoo/charsiu.git
+	branch = stable
+	shallow = true

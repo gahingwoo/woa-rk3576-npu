@@ -72,11 +72,13 @@
 
   <ItemGroup>
     <ClCompile Include="driver.c" />
+    <ClCompile Include="m3.c" />
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="rknpu.h" />
     <ClInclude Include="..\..\include\rknpu_ioctl.h" />
+    <ClInclude Include="..\..\include\rknpu_regcmd.h" />
   </ItemGroup>
 
   <ItemGroup>
