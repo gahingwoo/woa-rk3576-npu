@@ -6,7 +6,7 @@
 [charsiu](https://github.com/gahingwoo/charsiu) 大模型运行时的移植，让在
 Linux 上能用 NPU 跑的模型，在 Windows 上也能跑。
 
-现状：还没有任何东西在硬件上跑过。可行性研究见
+现状：NPU 已经在泰山派 3M 的 Windows 下上电，驱动也能启动（M1 和 M2，2026 年 11 月 22 日）；还没有在它上面跑过任务。可行性研究见
 [docs/FEASIBILITY.md](docs/FEASIBILITY.md)（英文）。在板子上的 Linux 下运行的 M0 测量工具在
 [tools/m0](tools/m0/README.md)（英文）。M2 的驱动框架（[drivers/rknpu](drivers/rknpu)）、
 测试工具（[tools/rknputest](tools/rknputest)）和 IOCTL 头文件
@@ -36,9 +36,9 @@ Linux 上能用 NPU 跑的模型，在 Windows 上也能跑。
 | # | 内容 | 完成标准 | 状态 |
 |---|---|---|---|
 | M0 | 在 Linux 上测量 | 关掉 IOMMU 分页后，一个 NPU 任务的结果和 CPU 完全一致 | 工具已写好（[tools/m0](tools/m0/README.md)），未运行 |
-| M1 | 固件：上电、时钟、ACPI | 设备出现在 ACPI 里，能读到版本寄存器 | 已写好（edk2-rk3576 的 `npu-acpi` 分支），能编译，未运行 |
-| M2 | 驱动框架和测试工具 | 设备启动，没有错误代码 | 已写好，CI 编译并做测试签名，未运行（[docs/M2.md](docs/M2.md)） |
-| M3 | 缓冲区、提交、中断 | GEMM 结果和 CPU 完全一致 | 未开始 |
+| M1 | 固件：上电、时钟、ACPI | 设备出现在 ACPI 里，能读到版本寄存器 | 已在泰山派 3M 上完成（2026-11-22）：电压 750 调到 800 mV，clk_rknn_dsu0 594 MHz，两个核都读到版本 0x46495245（edk2-rk3576 的 `npu-acpi` 分支，设置项默认关闭） |
+| M2 | 驱动框架和测试工具 | 设备启动，没有错误代码 | 已在泰山派 3M 上完成（2026-11-22）：`ACPI\RKCP3576` 已启动，`rknputest info` 全部检查通过（[docs/M2.md](docs/M2.md)） |
+| M3 | 缓冲区、提交、中断 | GEMM 结果和 CPU 完全一致 | 进行中 |
 | M4 | 移植 charsiu | Llama-3.2-1B 输出的文字和 Linux 上一样 | 未开始 |
 | M5 | 性能 | 每秒 token 数和 Linux 的差距在给定范围内 | 未开始 |
 | M6 | 驱动自己管理 NPU 的 IOMMU | 用分散的、4 GiB 以上的内存再跑一遍 M4 | 未开始 |
