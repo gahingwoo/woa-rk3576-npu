@@ -5,3 +5,6 @@ ARM64/
 
 # tools/m3gen (Linux host build)
 tools/m3gen/build/
+
+# port/ (make win, host, linux-ref)
+port/build/

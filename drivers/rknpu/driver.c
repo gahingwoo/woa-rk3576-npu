@@ -466,6 +466,10 @@ NpuEvtIoDeviceControl(
         o->m3_version = RKNPU_M3_VERSION;
         o->bo_count = ctx->BoCount;
         o->bo_kib = (ULONG)(ctx->BoBytes / 1024);
+        o->m4_version = RKNPU_M4_VERSION;
+        o->copy_arena_bytes = RKNPU_COPY_ARENA_BYTES;
+        o->bo_max_kib = RKNPU_BO_MAX_SIZE / 1024;
+        o->bo_max_total_kib = RKNPU_BO_MAX_TOTAL / 1024;
         info = sizeof(*o);
         break;
     }

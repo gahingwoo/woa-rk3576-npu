@@ -43,6 +43,17 @@
  * (SRST_A_RKNN0/1 for 10 us, rocket_core_reset()). The CRU is not ours, so
  * the driver never writes it.
  *
+ * M4 (rknpu_ioctl.h, M4 section). SUBMIT with RKNPU_SUBMIT_COPY copies each
+ * stream into the core's copy arena (contiguous, below 4 GiB, never mapped
+ * into a process), checks the copy and starts the PC on it, so a stream in a
+ * user-mapped buffer can be run safely: what was checked is what runs. The
+ * check now also refuses any register charsiu never writes
+ * (rknpu_regcmd_allow.h). With copies, the M3 rules that froze a checked
+ * stream (no MAP_BO, no WRITE_BO while a job runs) only matter while an M3
+ * style job runs, and FREE_BO only waits for the caller's own jobs. WAIT can
+ * poll, and a finished job is kept in a short history so its WAIT still
+ * answers after another handle's job took the core.
+ *
  * LOCKING. Every wait (job completion, the _DSM call, a breadcrumb flush)
  * happens at PASSIVE_LEVEL holding at most the two wait locks. The interrupt
  * spin lock is held only around register writes and job bookkeeping, never
@@ -111,6 +122,17 @@ NpuCrumb(
     if (KeGetCurrentIrql() != PASSIVE_LEVEL || !Ctx->CrumbKey)
         return;
     count = InterlockedIncrement(&Ctx->CrumbCounts[Stage & 15]);
+    /*
+     * M4: charsiu makes about 1600 buffers for Llama-3.2-1B, and a flushed
+     * crumb for each create, map and free would be thousands of registry
+     * flushes on eMMC. The buffer stages leave the first 32 of each kind,
+     * then every 256th; the job stages are the caller's choice
+     * (RKNPU_SUBMIT_NO_CRUMBS), and a timeout or a refusal always writes.
+     */
+    if ((Stage == RKNPU_CRUMB_BO_CREATE || Stage == RKNPU_CRUMB_BO_MAP ||
+         Stage == RKNPU_CRUMB_BO_UNMAP || Stage == RKNPU_CRUMB_BO_FREE) &&
+        count > 32 && count % 256 != 0)
+        return;
     CrumbSet(Ctx->CrumbKey, L"M3Stage", Stage);
     CrumbSet(Ctx->CrumbKey, L"M3Seq", (ULONG)Seq);
     CrumbSet(Ctx->CrumbKey, L"M3Core", Core);
@@ -154,6 +176,16 @@ NpuM3DeviceInit(
     if (!NT_SUCCESS(status)) {
         RKNPU_LOG("breadcrumbs: cannot open Device Parameters: 0x%08x", status);
         Ctx->CrumbKey = NULL;
+    } else {
+        UNICODE_STRING name;
+        ULONG v = 0;
+
+        /* M4: the back-out for a register the list missed (rknpu_regcmd.h) */
+        RtlInitUnicodeString(&name, L"M4AllowUnlisted");
+        if (NT_SUCCESS(WdfRegistryQueryULong(Ctx->CrumbKey, &name, &v)) && v == 1) {
+            Ctx->AllowUnlisted = TRUE;
+            RKNPU_LOG("M4AllowUnlisted = 1: registers charsiu never writes are let through (logged)");
+        }
     }
     return STATUS_SUCCESS;
 }
@@ -179,15 +211,32 @@ JobActive(
     return J->InFlight || J->CompletePending;
 }
 
+/* A job whose streams are in the caller's buffers (M3, no RKNPU_SUBMIT_COPY):
+ * while one runs, nothing may make those streams writable. */
 static BOOLEAN
-AnyJobActive(
+AnyUncopiedJobActive(
     _In_ PDEVICE_CONTEXT Ctx
     )
 {
     ULONG n;
 
     for (n = 0; n < RKNPU_NUM_CORES; n++)
-        if (JobActive(&Ctx->Core[n].Job))
+        if (JobActive(&Ctx->Core[n].Job) && !Ctx->Core[n].Job.Copied)
+            return TRUE;
+    return FALSE;
+}
+
+/* A job of this handle runs: its buffers may be in use by the NPU. */
+static BOOLEAN
+OwnerJobActive(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ WDFFILEOBJECT Owner
+    )
+{
+    ULONG n;
+
+    for (n = 0; n < RKNPU_NUM_CORES; n++)
+        if (JobActive(&Ctx->Core[n].Job) && Ctx->Core[n].Job.Owner == Owner)
             return TRUE;
     return FALSE;
 }
@@ -511,45 +560,169 @@ BoFindRangeLocked(
     return NULL;
 }
 
+/* rknpu_rc_check_stream()'s in_bo: one of Owner's buffers, the last hit first
+ * (a stream's five addresses are in three or four buffers). BoLock held. */
+typedef struct _BO_LOOKUP {
+    PDEVICE_CONTEXT Ctx;
+    WDFFILEOBJECT   Owner;
+    PNPU_BO         Last;
+} BO_LOOKUP;
+
+static int
+BoLookupInBo(
+    _In_ void *C,
+    _In_ unsigned int Addr
+    )
+{
+    BO_LOOKUP *l = (BO_LOOKUP *)C;
+    PNPU_BO bo = l->Last;
+
+    if (bo && Addr >= (ULONGLONG)bo->Pa.QuadPart && Addr < (ULONGLONG)bo->Pa.QuadPart + bo->Size)
+        return 1;
+    bo = BoFindRangeLocked(l->Ctx, l->Owner, Addr, 1);
+    if (bo)
+        l->Last = bo;
+    return bo != NULL;
+}
+
 /*
- * The stream rules of rknpu_regcmd.h, over every entry the PC will fetch
- * (it fetches pairs, so an odd count reads one entry more). An all-zero
- * entry is padding and allowed. The stream's buffer must not be mapped into
- * a process: the caller could otherwise rewrite it after this check.
- * BoLock held, PASSIVE_LEVEL. *Bad is the first refused entry.
+ * rknpu_rc_check_stream() over the Count entries at Ent, with the log line
+ * and the breadcrumb if it refuses. StreamAddr and Core are for those.
+ * BoLock held, PASSIVE_LEVEL.
+ */
+static NTSTATUS
+NpuCheckEntriesLocked(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ BO_LOOKUP *L,
+    _In_ const ULONGLONG *Ent,
+    _In_ ULONG Count,
+    _In_ ULONG StreamAddr,
+    _In_ ULONG Core
+    )
+{
+    unsigned int bad = 0, unlisted = 0;
+    int why;
+
+    why = rknpu_rc_check_stream_ex((const unsigned long long *)Ent, Count,
+                                   Ctx->AllowUnlisted ? RKNPU_RC_ALLOW_UNLISTED : 0,
+                                   BoLookupInBo, L, &bad, &unlisted);
+    if (unlisted && InterlockedIncrement(&Ctx->UnlistedLogged) <= 16)
+        RKNPU_LOG("SUBMIT: stream 0x%08x has %u entries off the list, let through (M4AllowUnlisted)",
+                  StreamAddr, unlisted);
+    if (why == RKNPU_RC_OK)
+        return STATUS_SUCCESS;
+    RKNPU_LOG("SUBMIT: stream 0x%08x entry %u (0x%016llx) refused: %s", StreamAddr, bad, Ent[bad],
+              rknpu_rc_why(why));
+    NpuCrumb(Ctx, RKNPU_CRUMB_REFUSED, Ctx->NextSeq + 1, Core, bad,
+             RKNPU_RC_TARGET(Ent[bad]) << 16 | RKNPU_RC_REG(Ent[bad]));
+    return STATUS_ACCESS_VIOLATION;
+}
+
+/*
+ * M3: the stream rules over every entry the PC will fetch, in place (it
+ * fetches pairs, so an odd count reads one entry more). The stream's buffer
+ * must not be mapped into a process: the caller could otherwise rewrite it
+ * after this check. BoLock held, PASSIVE_LEVEL.
  */
 static NTSTATUS
 NpuCheckStreamLocked(
     _In_ PDEVICE_CONTEXT Ctx,
     _In_ WDFFILEOBJECT Owner,
     _In_ const rknpu_task *T,
-    _Out_ ULONG *Bad
+    _In_ ULONG Core
     )
 {
     ULONG fetched = ((T->regcmd_count + 1) / 2) * 2;
     PNPU_BO bo = BoFindRangeLocked(Ctx, Owner, T->regcmd, fetched * 8);
-    const volatile ULONGLONG *ent;
-    ULONG i;
+    BO_LOOKUP l;
 
-    *Bad = 0;
     if (!bo)
         return STATUS_INVALID_PARAMETER;
     if (bo->UserVa)
         return STATUS_INVALID_DEVICE_STATE;
-    ent = (const volatile ULONGLONG *)((PUCHAR)bo->Kva + (T->regcmd - (ULONG)bo->Pa.QuadPart));
-    for (i = 0; i < fetched; i++) {
-        ULONGLONG e = ent[i];
-        ULONG reg = RKNPU_RC_REG(e), v = RKNPU_RC_VALUE(e);
+    l.Ctx = Ctx;
+    l.Owner = Owner;
+    l.Last = NULL;
+    /* mapped nowhere but the kernel, so it cannot change under the check */
+    return NpuCheckEntriesLocked(Ctx, &l,
+                                 (const ULONGLONG *)((PUCHAR)bo->Kva + (T->regcmd - (ULONG)bo->Pa.QuadPart)),
+                                 fetched, T->regcmd, Core);
+}
 
-        if (e == 0)
-            continue;
-        if (rknpu_rc_is_pc_reg(reg) ||
-            (rknpu_rc_is_addr_reg(reg) && v != 0 && !BoFindRangeLocked(Ctx, Owner, v, 1))) {
-            *Bad = i;
-            RKNPU_LOG("SUBMIT: stream 0x%08x entry %u (0x%016llx) refused: %s", T->regcmd, i, e,
-                      rknpu_rc_is_pc_reg(reg) ? "writes the PC block" : "address outside the caller's buffers");
-            return STATUS_ACCESS_VIOLATION;
-        }
+/* M4: the core's copy arena, allocated on first use. JobLock held, PASSIVE_LEVEL. */
+static NTSTATUS
+NpuArenaEnsure(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ ULONG N
+    )
+{
+    CORE_STATE *core = &Ctx->Core[N];
+    PHYSICAL_ADDRESS low, high, skip;
+
+    if (core->Arena)
+        return STATUS_SUCCESS;
+    low.QuadPart = 0;
+    high.QuadPart = 0xFFFFFFFF;
+    skip.QuadPart = 0;
+    core->Arena = (PUCHAR)MmAllocateContiguousNodeMemory(RKNPU_COPY_ARENA_BYTES, low, high, skip,
+                                                         PAGE_READWRITE | PAGE_WRITECOMBINE, MM_ANY_NODE_OK);
+    if (!core->Arena) {
+        RKNPU_LOG("SUBMIT: no contiguous %u bytes below 4 GiB for core %u's copy arena",
+                  RKNPU_COPY_ARENA_BYTES, N);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    core->ArenaPa = MmGetPhysicalAddress(core->Arena);
+    if ((ULONGLONG)core->ArenaPa.QuadPart + RKNPU_COPY_ARENA_BYTES > FOURGIB) {
+        MmFreeContiguousMemory(core->Arena);
+        core->Arena = NULL;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(core->Arena, RKNPU_COPY_ARENA_BYTES);
+    RKNPU_LOG("core %u copy arena: %u bytes at 0x%llx", N, RKNPU_COPY_ARENA_BYTES, core->ArenaPa.QuadPart);
+    NpuCrumb(Ctx, RKNPU_CRUMB_ARENA, 0, N, RKNPU_COPY_ARENA_BYTES, (ULONG)core->ArenaPa.QuadPart);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * M4: copy each task's stream (its fetched length) from the caller's buffer
+ * into the core's arena, check the copy, and point the task at it. The
+ * caller may keep writing its buffer; the NPU runs the copy. In->tasks is
+ * rewritten in place. The core has no job (SUBMIT checked), so nothing is
+ * reading the arena. JobLock and BoLock held, PASSIVE_LEVEL.
+ */
+static NTSTATUS
+NpuCopyStreamsLocked(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ WDFFILEOBJECT Owner,
+    _In_ ULONG N,
+    _Inout_ rknpu_submit_in *In
+    )
+{
+    CORE_STATE *core = &Ctx->Core[N];
+    BO_LOOKUP l;
+    ULONG i, at = 0;
+    NTSTATUS status;
+
+    l.Ctx = Ctx;
+    l.Owner = Owner;
+    l.Last = NULL;
+    for (i = 0; i < In->task_count; i++) {
+        rknpu_task *t = &In->tasks[i];
+        ULONG fetched = ((t->regcmd_count + 1) / 2) * 2, bytes = fetched * 8;
+        PNPU_BO bo = BoFindRangeLocked(Ctx, Owner, t->regcmd, bytes);
+
+        if (!bo)
+            return STATUS_INVALID_PARAMETER;
+        if (bytes > RKNPU_COPY_ARENA_BYTES - at)
+            return STATUS_INVALID_BUFFER_SIZE;
+        /* at stays a multiple of 16 (fetched is even), as the PC wants */
+        RtlCopyMemory(core->Arena + at, (PUCHAR)bo->Kva + (t->regcmd - (ULONG)bo->Pa.QuadPart), bytes);
+        status = NpuCheckEntriesLocked(Ctx, &l, (const ULONGLONG *)(core->Arena + at), fetched,
+                                       t->regcmd, N);
+        if (!NT_SUCCESS(status))
+            return status;
+        t->regcmd = (ULONG)core->ArenaPa.QuadPart + at;
+        at += bytes;
     }
     return STATUS_SUCCESS;
 }
@@ -717,8 +890,8 @@ NpuBoMap(
         status = STATUS_INVALID_HANDLE;
     } else if (bo->UserVa) {
         status = STATUS_INVALID_DEVICE_STATE;
-    } else if (AnyJobActive(Ctx)) {
-        /* a mapped stream could be rewritten after SUBMIT checked it */
+    } else if (AnyUncopiedJobActive(Ctx)) {
+        /* an M3 job's stream could be rewritten after SUBMIT checked it */
         status = STATUS_DEVICE_BUSY;
     } else {
         if (!bo->Mdl) {
@@ -783,7 +956,9 @@ NpuBoUnmap(
     return status;
 }
 
-/* Caller context (it may unmap). Refused while any job runs: the NPU may be reading it. */
+/* Caller context (it may unmap). Refused while a job of this handle runs: the
+ * NPU may be reading it. Another handle's job can only reach its own buffers
+ * through the registers SUBMIT checks (M4; M3 refused while any job ran). */
 static NTSTATUS
 NpuBoFree(
     _In_ PDEVICE_CONTEXT Ctx,
@@ -805,7 +980,7 @@ NpuBoFree(
     bo = BoFindLocked(Ctx, handle, WdfRequestGetFileObject(Request));
     if (!bo) {
         status = STATUS_INVALID_HANDLE;
-    } else if (AnyJobActive(Ctx)) {
+    } else if (OwnerJobActive(Ctx, bo->Owner)) {
         status = STATUS_DEVICE_BUSY;
         bo = NULL;
     } else {
@@ -854,7 +1029,7 @@ NpuBoCopy(
         status = STATUS_INVALID_HANDLE;
     } else if ((ULONGLONG)req.offset + req.length > bo->Size) {
         status = STATUS_INVALID_PARAMETER;
-    } else if (Write && AnyJobActive(Ctx)) {
+    } else if (Write && AnyUncopiedJobActive(Ctx)) {
         status = STATUS_DEVICE_BUSY;
     } else {
         if (Write)
@@ -868,6 +1043,34 @@ NpuBoCopy(
 }
 
 /* ------------------------------------------------------ submit, wait */
+
+/*
+ * M4: the core's last job is finished and about to be replaced; keep what
+ * its WAIT would have said. JobLock held.
+ */
+static VOID
+NpuRecordLocked(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ ULONG N
+    )
+{
+    const CORE_JOB *j = &Ctx->Core[N].Job;
+    JOB_RECORD *r;
+
+    if (j->Seq == 0 || j->Owner == NULL)
+        return;
+    r = &Ctx->History[Ctx->HistoryAt++ % RKNPU_JOB_HISTORY];
+    r->Seq = j->Seq;
+    r->Owner = j->Owner;
+    r->Core = N;
+    r->Result = j->Result;
+    r->RawStatus = j->RawStatus;
+    r->TaskStatus = j->TaskStatus;
+    r->TasksDone = j->TasksDone;
+    r->TaskCount = j->TaskCount;
+    r->IsrCount = j->IsrCount;
+    r->HwUs = QpcToUs(Ctx, j->T1.QuadPart - j->T0.QuadPart);
+}
 
 static NTSTATUS
 NpuSubmit(
@@ -884,6 +1087,7 @@ NpuSubmit(
     CORE_JOB *j;
     ULONG n, i, base;
     ULONGLONG seq;
+    BOOLEAN copy;
     NTSTATUS status;
 
     *Info = 0;
@@ -895,8 +1099,9 @@ NpuSubmit(
     if (!NT_SUCCESS(status))
         return status;
     if (in.core >= RKNPU_NUM_CORES || in.task_count == 0 || in.task_count > RKNPU_MAX_TASKS ||
-        (in.flags & ~RKNPU_SUBMIT_NO_CRUMBS))
+        (in.flags & ~(RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY)))
         return STATUS_INVALID_PARAMETER;
+    copy = (in.flags & RKNPU_SUBMIT_COPY) ? TRUE : FALSE;
     for (i = 0; i < in.task_count; i++)
         if ((in.tasks[i].regcmd & 0xF) || in.tasks[i].regcmd_count == 0 ||
             in.tasks[i].regcmd_count > RKNPU_MAX_REGCMD)
@@ -924,22 +1129,35 @@ NpuSubmit(
         }
     }
 
-    WdfWaitLockAcquire(Ctx->BoLock, NULL);
-    /* Every stream inside one of the caller's buffers, and within the rules. */
-    for (i = 0; i < in.task_count; i++) {
-        ULONG bad;
-
-        status = NpuCheckStreamLocked(Ctx, fo, &in.tasks[i], &bad);
+    if (copy) {
+        status = NpuArenaEnsure(Ctx, n);
         if (!NT_SUCCESS(status))
-            goto out_bo;
+            goto out_job;
     }
 
+    WdfWaitLockAcquire(Ctx->BoLock, NULL);
+    /* Every stream inside one of the caller's buffers, and within the rules:
+     * M4 checks the copies it will run, M3 the streams in place. */
+    if (copy) {
+        status = NpuCopyStreamsLocked(Ctx, fo, n, &in);
+        if (!NT_SUCCESS(status))
+            goto out_bo;
+    } else {
+        for (i = 0; i < in.task_count; i++) {
+            status = NpuCheckStreamLocked(Ctx, fo, &in.tasks[i], n);
+            if (!NT_SUCCESS(status))
+                goto out_bo;
+        }
+    }
+
+    NpuRecordLocked(Ctx, n);
     seq = ++Ctx->NextSeq;
     RtlZeroMemory(j, sizeof(*j));
     j->Seq = seq;
     j->Owner = fo;
     j->TaskCount = in.task_count;
     j->NoCrumbs = (in.flags & RKNPU_SUBMIT_NO_CRUMBS) ? TRUE : FALSE;
+    j->Copied = copy;
     RtlCopyMemory(j->Tasks, in.tasks, in.task_count * sizeof(rknpu_task));
     KeClearEvent(&core->Done);
     InterlockedIncrement(&core->JobsSubmitted);
@@ -994,7 +1212,7 @@ NpuWait(
     status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
     if (!NT_SUCCESS(status))
         return status;
-    if (in.flags != 0)
+    if (in.flags & ~RKNPU_WAIT_POLL)
         return STATUS_INVALID_PARAMETER;
     ms = in.timeout_ms ? in.timeout_ms : RKNPU_WAIT_DEFAULT_MS;
     if (ms > RKNPU_WAIT_MAX_MS)
@@ -1005,9 +1223,35 @@ NpuWait(
         if (in.seqno != 0 && Ctx->Core[n].Job.Seq == in.seqno && Ctx->Core[n].Job.Owner == fo)
             break;
     if (n == RKNPU_NUM_CORES) {
+        ULONG h;
+
         RtlZeroMemory(out, sizeof(*out));
         out->seqno = in.seqno;
         out->result = RKNPU_JOB_UNKNOWN;
+        /* M4: finished, and its core has run another handle's job since */
+        for (h = 0; in.seqno != 0 && h < RKNPU_JOB_HISTORY; h++) {
+            const JOB_RECORD *r = &Ctx->History[h];
+
+            if (r->Seq == in.seqno && r->Owner == fo) {
+                out->result = r->Result;
+                out->core = r->Core;
+                out->raw_status = r->RawStatus;
+                out->task_status = r->TaskStatus;
+                out->tasks_done = r->TasksDone;
+                out->task_count = r->TaskCount;
+                out->isr_count = r->IsrCount;
+                out->hw_us = r->HwUs;
+                break;
+            }
+        }
+    } else if ((in.flags & RKNPU_WAIT_POLL) && JobActive(&Ctx->Core[n].Job)) {
+        /* M4: still running; stop nothing */
+        RtlZeroMemory(out, sizeof(*out));
+        out->seqno = in.seqno;
+        out->core = n;
+        out->result = RKNPU_JOB_RUNNING;
+        out->task_count = Ctx->Core[n].Job.TaskCount;
+        out->tasks_done = Ctx->Core[n].Job.TasksDone;
     } else {
         /* crumbs follow the submit's choice; a timeout always leaves them */
         NpuJobFinish(Ctx, n, ms, !Ctx->Core[n].Job.NoCrumbs, out);
@@ -1149,6 +1393,10 @@ NpuM3FileCleanup(
     for (n = 0; n < RKNPU_NUM_CORES; n++)
         if (Ctx->Core[n].Job.Owner == FileObject)
             Ctx->Core[n].Job.Owner = NULL;
+    /* a later handle may get the same file object address */
+    for (n = 0; n < RKNPU_JOB_HISTORY; n++)
+        if (Ctx->History[n].Owner == FileObject)
+            RtlZeroMemory(&Ctx->History[n], sizeof(Ctx->History[n]));
 
     WdfWaitLockAcquire(Ctx->BoLock, NULL);
     for (e = Ctx->Bos.Flink; e != &Ctx->Bos; e = next) {
@@ -1206,6 +1454,7 @@ NpuM3FreeAll(
     )
 {
     LIST_ENTRY mine;
+    ULONG n;
 
     if (!Ctx->BoLock)
         return;
@@ -1218,4 +1467,11 @@ NpuM3FreeAll(
     WdfWaitLockRelease(Ctx->BoLock);
     while (!IsListEmpty(&mine))
         BoDestroy(CONTAINING_RECORD(RemoveHeadList(&mine), NPU_BO, Link));
+    /* M4: every handle has closed, so no job is running from an arena */
+    for (n = 0; n < RKNPU_NUM_CORES; n++) {
+        if (Ctx->Core[n].Arena) {
+            MmFreeContiguousMemory(Ctx->Core[n].Arena);
+            Ctx->Core[n].Arena = NULL;
+        }
+    }
 }

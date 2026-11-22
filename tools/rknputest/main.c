@@ -166,6 +166,11 @@ static int cmd_info(void)
         printf("m3: version %u, %u buffers, %u KiB\n", in.m3_version, in.bo_count, in.bo_kib);
     else
         printf("m3: not in this driver (an M2 build)\n");
+    if (in.m4_version)
+        printf("m4: version %u, copy arena %u KiB a core, buffers up to %u KiB each and %u MiB in all\n",
+               in.m4_version, in.copy_arena_bytes / 1024, in.bo_max_kib, in.bo_max_total_kib / 1024);
+    else if (in.m3_version)
+        printf("m4: not in this driver (an M3 build)\n");
 
     if (in.flags & RKNPU_INFO_CLOCKS_VALID) {
         const rknpu_clock_info *k = &in.clocks;

@@ -92,6 +92,38 @@
 #define RKNPU_FN_READ_BO        0x81A   /* copy out of a buffer */
 #define RKNPU_FN_RESERVED_LAST  0x81F   /* 0x81B..0x81F: RESERVED */
 
+/* ---- M4: what charsiu needs ---------------------------------------------- */
+/*
+ * No new function codes. M4 names reserved fields and adds flags, so an M3
+ * caller sees the M3 driver; RKNPU_M4_VERSION in rknpu_info says M4 is there.
+ *
+ *   - SUBMIT with RKNPU_SUBMIT_COPY: charsiu writes its streams through the
+ *     buffer's mapping, as it does under rocket, so the M3 rule (a stream's
+ *     buffer may not be mapped) cannot hold. With this flag the driver copies
+ *     every stream into a buffer of its own for the core (the copy arena,
+ *     never mapped into any process), checks the COPY, and points the PC at
+ *     the copy. What runs is what was checked, whatever the caller writes
+ *     afterwards. The streams of one SUBMIT must fit the arena together:
+ *     each takes its fetched length (rounded up to an even entry count) times
+ *     8 bytes, and more than RKNPU_COPY_ARENA_BYTES in total is refused with
+ *     STATUS_INVALID_BUFFER_SIZE (ERROR_INVALID_USER_BUFFER, 1784). charsiu's
+ *     largest SUBMIT is 16 streams of 148 entries, 18944 bytes.
+ *   - Because a copied stream cannot change after the check, the M3 rules
+ *     that kept a checked stream fixed (MAP_BO and WRITE_BO refused while a
+ *     job runs) now apply only while a job submitted WITHOUT the flag runs.
+ *     FREE_BO is refused only while a job of the same handle runs: a job can
+ *     only reach its own handle's buffers through the registers checked.
+ *   - WAIT with RKNPU_WAIT_POLL returns RKNPU_JOB_RUNNING if the job has not
+ *     finished, and stops nothing. Without the flag WAIT is M3's.
+ *   - A finished job stays answerable: WAIT finds it in a short history even
+ *     after another handle's job has taken its core.
+ *   - The address registers SUBMIT checks are every one charsiu's kernels
+ *     write (rknpu_regcmd.h), not only the five of the M3 int8 matmul.
+ */
+#define RKNPU_M4_VERSION        1       /* rknpu_info.m4_version */
+#define RKNPU_COPY_ARENA_BYTES  (256u << 10)    /* per core: 64 tasks of 512 entries */
+#define RKNPU_JOB_HISTORY       32      /* finished jobs WAIT can still answer for */
+
 #ifndef METHOD_IN_DIRECT
 #define METHOD_IN_DIRECT  1
 #define METHOD_OUT_DIRECT 2
@@ -185,7 +217,12 @@ typedef struct rknpu_info {
     unsigned int m3_version;            /* RKNPU_M3_VERSION; 0 from an M2 driver */
     unsigned int bo_count;              /* buffers allocated now, all handles */
     unsigned int bo_kib;                /* their size */
-    unsigned int reserved[13];
+    /* M4 (0 from an M3 driver) */
+    unsigned int m4_version;            /* RKNPU_M4_VERSION */
+    unsigned int copy_arena_bytes;      /* RKNPU_COPY_ARENA_BYTES */
+    unsigned int bo_max_kib;            /* RKNPU_BO_MAX_SIZE / 1024 */
+    unsigned int bo_max_total_kib;      /* RKNPU_BO_MAX_TOTAL / 1024 */
+    unsigned int reserved[9];
 } rknpu_info;
 
 /* ---- READ_REGS ---------------------------------------------------------- */
@@ -215,7 +252,9 @@ typedef struct rknpu_read_regs_in {
 /* ---- M3 structures ------------------------------------------------------ */
 
 #define RKNPU_BO_MAX_SIZE       (64u << 20)     /* one buffer */
-#define RKNPU_BO_MAX_TOTAL      (512u << 20)    /* all buffers of the device */
+#define RKNPU_BO_MAX_TOTAL      (1024u << 20)   /* all buffers of the device; M3 had 512 MiB,
+                                                 * Llama-3.2-1B through charsiu needs about
+                                                 * 700 MiB at 512 tokens of context, 790 at 2048 */
 #define RKNPU_BO_IO_MAX         (16u << 20)     /* one WRITE_BO or READ_BO */
 #define RKNPU_MAX_TASKS         64              /* per job */
 #define RKNPU_MAX_REGCMD        131072u         /* entries per task: REGISTER_AMOUNTS is 16 bits of pairs */
@@ -267,6 +306,7 @@ typedef struct rknpu_task {
 
 /* rknpu_submit_in.flags */
 #define RKNPU_SUBMIT_NO_CRUMBS  0x00000001u /* skip the registry breadcrumbs (timing runs) */
+#define RKNPU_SUBMIT_COPY       0x00000002u /* M4: run copies of the streams (see the M4 section) */
 
 /* SUBMIT, in. Tasks run in order on one core, one interrupt each. */
 typedef struct rknpu_submit_in {
@@ -288,8 +328,11 @@ typedef struct rknpu_submit_out {
 typedef struct rknpu_wait_in {
     unsigned long long seqno;
     unsigned int timeout_ms;            /* 0: RKNPU_WAIT_DEFAULT_MS */
-    unsigned int flags;                 /* 0 */
+    unsigned int flags;                 /* 0 or RKNPU_WAIT_POLL */
 } rknpu_wait_in;
+
+/* rknpu_wait_in.flags (M4) */
+#define RKNPU_WAIT_POLL         0x00000001u /* return RKNPU_JOB_RUNNING at once if not finished */
 
 #define RKNPU_WAIT_DEFAULT_MS   500     /* rocket's JOB_TIMEOUT_MS */
 #define RKNPU_WAIT_MAX_MS       10000
@@ -299,6 +342,7 @@ typedef struct rknpu_wait_in {
 #define RKNPU_JOB_TIMEOUT       1       /* stopped; the core was reset (reset_status) */
 #define RKNPU_JOB_DMA_ERROR     2       /* a DMA read or write error was raised; stopped */
 #define RKNPU_JOB_UNKNOWN       3       /* no such job on this handle */
+#define RKNPU_JOB_RUNNING       4       /* M4, RKNPU_WAIT_POLL only: not finished; nothing was stopped */
 
 /* WAIT, out. */
 typedef struct rknpu_wait_out {
@@ -360,6 +404,10 @@ typedef struct rknpu_reset_out {
 #define RKNPU_CRUMB_RESET       7       /* a _DSM reset returned */
 #define RKNPU_CRUMB_BO_UNMAP    8
 #define RKNPU_CRUMB_BO_FREE     9
+#define RKNPU_CRUMB_REFUSED     10      /* M4: SUBMIT refused a stream; Value1 = entry index,
+                                         * Value2 = target << 16 | register */
+#define RKNPU_CRUMB_ARENA       11      /* M4: a core's copy arena was allocated; Value1 = size,
+                                         * Value2 = its address */
 
 #pragma pack(pop)
 

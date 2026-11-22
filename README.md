@@ -45,7 +45,7 @@ is [docs/M2.md](docs/M2.md).
 | M1 | Firmware power, clocks, ACPI | the device appears in ACPI with its version register readable | done on the TaishanPi 3M, 22 Nov 2026: rail 750 to 800 mV, clk_rknn_dsu0 594 MHz, both cores read version 0x46495245 (edk2-rk3576 branch `npu-acpi`, setup option off by default) |
 | M2 | Driver skeleton and test tool | the device starts with no problem code | done on the TaishanPi 3M, 22 Nov 2026: `ACPI\RKCP3576` started, `rknputest info` passes every check ([docs/M2.md](docs/M2.md)) |
 | M3 | Buffers, submission, interrupts | GEMM results exact against the CPU | done on the TaishanPi 3M, 22 Nov 2026: `rknputest m3` exact on both cores up to 16x1024x1024 (1.9 ms on the NPU, 24.7 ms on the CPU), no timeouts ([docs/M3.md](docs/M3.md)) |
-| M4 | charsiu port | Llama-3.2-1B gives the same text as on Linux | not started |
+| M4 | charsiu port | Llama-3.2-1B gives the same text as on Linux | code complete, not run on a board: charsiu builds for ARM64 Windows in CI over rknpu.sys ([port](port), [docs/M4.md](docs/M4.md)) |
 | M5 | Performance | tokens per second within a stated margin of Linux | not started |
 | M6 | Driver-managed NPU IOMMU | M4 again with scattered and high memory | not started |
 | M7 | Install script, `charsiu serve` | answers from a second machine | not started |

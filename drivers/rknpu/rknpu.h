@@ -110,6 +110,7 @@ typedef struct _CORE_JOB {
     BOOLEAN         InFlight;       /* the hardware owns the job */
     BOOLEAN         CompletePending;/* the ISR finished it; the DPC has not run */
     BOOLEAN         NoCrumbs;       /* RKNPU_SUBMIT_NO_CRUMBS */
+    BOOLEAN         Copied;         /* M4: RKNPU_SUBMIT_COPY, the streams are in the arena */
     ULONG           Result;         /* RKNPU_JOB_* once finished */
     ULONGLONG       Seq;            /* 0: never used */
     WDFFILEOBJECT   Owner;
@@ -142,7 +143,26 @@ typedef struct _CORE_STATE {
     volatile LONG   JobsCompleted;
     volatile LONG   JobsTimedOut;
     volatile LONG   Resets;
+
+    /* M4: the copy arena, allocated by the first RKNPU_SUBMIT_COPY on the core */
+    PUCHAR          Arena;
+    PHYSICAL_ADDRESS ArenaPa;
 } CORE_STATE;
+
+/* M4: a finished job, kept so a WAIT that comes after another handle's job
+ * took the core still gets its answer. */
+typedef struct _JOB_RECORD {
+    ULONGLONG       Seq;            /* 0: empty */
+    WDFFILEOBJECT   Owner;
+    ULONG           Core;
+    ULONG           Result;
+    ULONG           RawStatus;
+    ULONG           TaskStatus;
+    ULONG           TasksDone;
+    ULONG           TaskCount;
+    ULONG           IsrCount;
+    ULONG           HwUs;
+} JOB_RECORD;
 
 typedef struct _DEVICE_CONTEXT {
     WDFDEVICE       Device;
@@ -166,6 +186,12 @@ typedef struct _DEVICE_CONTEXT {
     LONG            CrumbCounts[16];
     WDFKEY          CrumbKey;       /* Device Parameters; NULL if it would not open */
     LARGE_INTEGER   QpcFreq;
+
+    /* M4 */
+    JOB_RECORD      History[RKNPU_JOB_HISTORY];     /* JobLock */
+    ULONG           HistoryAt;
+    BOOLEAN         AllowUnlisted;  /* Device Parameters\M4AllowUnlisted, read at start */
+    volatile LONG   UnlistedLogged;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetContext)

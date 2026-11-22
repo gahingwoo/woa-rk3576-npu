@@ -79,6 +79,7 @@
     <ClInclude Include="rknpu.h" />
     <ClInclude Include="..\..\include\rknpu_ioctl.h" />
     <ClInclude Include="..\..\include\rknpu_regcmd.h" />
+    <ClInclude Include="..\..\include\rknpu_regcmd_allow.h" />
   </ItemGroup>
 
   <ItemGroup>
