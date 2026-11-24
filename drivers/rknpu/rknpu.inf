@@ -1,5 +1,13 @@
 ;
-; rknpu.inf - RK3576 NPU (RKNN, two cores), bring-up driver (M2 + M3)
+; rknpu.inf - RK3576 NPU (RKNN, two cores)
+;
+; Device setup class: ComputeAccelerator, which Device Manager lists as
+; "Neural processors" (the class MCDM NPU drivers such as Intel's use).
+; Nothing in Windows treats a device differently for being in it; this
+; driver is plain KMDF, not MCDM, and only the grouping and the name change.
+; ClassInstall32 registers the class on a Windows that does not have it yet;
+; Windows processes it only when the class key is missing, so where the
+; class is already registered the system's own name and icon win.
 ;
 ; Target: Windows on ARM64. Binds ACPI\RKCP3576, which edk2-rk3576 publishes
 ; in an SSDT (OEM table ID RKNPU) only when "NPU (experimental)" is enabled
@@ -22,12 +30,18 @@
 
 [Version]
 Signature   = "$WINDOWS NT$"
-Class       = System
-ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Class       = ComputeAccelerator
+ClassGuid   = {F01A9D53-3FF6-48D2-9F97-C8A7004BE10C}
 Provider    = %ProviderName%
 DriverVer   = ; set by stampinf during build
 CatalogFile = rknpu.cat
 PnpLockdown = 1
+
+[ClassInstall32]
+AddReg = RKNPU_ClassReg
+
+[RKNPU_ClassReg]
+HKR,,,0,%ClassName%
 
 [DestinationDirs]
 DefaultDestDir = 13
@@ -71,5 +85,6 @@ KmdfLibraryVersion = 1.33
 [Strings]
 ProviderName     = "woa-rk3576-npu"
 DiskName         = "RK3576 NPU Installation Disk"
-RKNPU.DeviceDesc = "Rockchip RK3576 NPU (RKNN, bring-up)"
-RKNPU.SvcDesc    = "Rockchip RK3576 NPU bring-up driver"
+ClassName        = "Neural processors"
+RKNPU.DeviceDesc = "Rockchip RK3576 NPU"
+RKNPU.SvcDesc    = "Rockchip RK3576 NPU driver"

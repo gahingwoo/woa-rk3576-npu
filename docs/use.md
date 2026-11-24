@@ -58,7 +58,10 @@ CI artifacts.
    C:\rknpu\rknputest.exe info
    ```
 
-   It ends with `RKNPU INFO: OK`.
+   It ends with `RKNPU INFO: OK`. Device Manager lists the device as
+   "Rockchip RK3576 NPU" under *Neural processors* (packages built from
+   2026-11-24 on; older ones put "Rockchip RK3576 NPU (RKNN, bring-up)" under
+   *System devices*).
 
 7. Run a prompt on the NPU:
 
