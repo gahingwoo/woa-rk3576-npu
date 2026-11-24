@@ -121,8 +121,12 @@ TablePageAlloc(
     PHYSICAL_ADDRESS low, high, skip;
     PVOID p;
 
+    /* Below 4 GiB, although v2 entries reach 2^40: then the directory and
+     * table addresses never use the shuffled bits 11:4 of an entry, and
+     * DTE_ADDR reads back as rk_iommu_force_reset() expects. One page at a
+     * time, so this never meets M4's contiguity problem. */
     low.QuadPart = 0;
-    high.QuadPart = (LONGLONG)PHYS_40BIT;
+    high.QuadPart = 0xFFFFFFFF;
     skip.QuadPart = 0;
     p = MmAllocateContiguousNodeMemory(PAGE_SIZE, low, high, skip,
                                        PAGE_READWRITE | PAGE_WRITECOMBINE, MM_ANY_NODE_OK);
