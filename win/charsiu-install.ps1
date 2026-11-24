@@ -19,8 +19,10 @@
 #   --driver [ZIP]     administrator: stage rknpu.sys from the release's
 #                      rknpu-windows-arm64.zip (or ZIP / a folder) and mark the
 #                      device for reinstall at the next restart
-#   --user-access      administrator: let ordinary users open the NPU
-#                      (Device Parameters\UserAccess = 1; takes a restart)
+#   --admin-only       keep the NPU for administrators. By default an install
+#                      from an administrator PowerShell lets ordinary users
+#                      open it (Device Parameters\UserAccess = 1, IOMMU mode
+#                      only; takes a restart), as Linux lets the video group
 #   --update           what `charsiu update` runs: replace the programs only
 #   --uninstall        remove the programs and the PATH entry (models stay;
 #                      --purge removes %LOCALAPPDATA%\charsiu as well)
@@ -49,7 +51,7 @@ function Install-Charsiu {
 
     # ---- options ---------------------------------------------------------
     $o = @{ DryRun = $false; Yes = $false; Zip = ''; Version = ''; Dir = ''; Model = ''; NoModel = $false
-            NoDemo = $false; Driver = $false; DriverZip = ''; UserAccess = $false; Update = $false
+            NoDemo = $false; Driver = $false; DriverZip = ''; AdminOnly = $false; Update = $false
             Uninstall = $false; Purge = $false }
     $list = @($args)
     if ($env:CHARSIU_INSTALL_ARGS) { $list += ($env:CHARSIU_INSTALL_ARGS -split '\s+' | Where-Object { $_ }) }
@@ -71,13 +73,15 @@ function Install-Charsiu {
                 if ($next -and -not $next.StartsWith('-')) { $o.DriverZip = $next; $i++ }
                 continue
             }
-            '^(--user-access|-UserAccess)$' { $o.UserAccess = $true; continue }
+            # the default now; accepted so the commands already written down still work
+            '^(--user-access|-UserAccess)$' { $o.AdminOnly = $false; continue }
+            '^(--admin-only|-AdminOnly)$' { $o.AdminOnly = $true; continue }
             '^(--update|-Update)$' { $o.Update = $true; $o.NoModel = $true; $o.NoDemo = $true; continue }
             '^(--uninstall|-Uninstall)$' { $o.Uninstall = $true; continue }
             '^(--purge|-Purge)$' { $o.Purge = $true; continue }
             '^(--help|-h|-Help|/\?)$' {
                 Write-Host 'charsiu-install.ps1 [--dry-run] [--yes] [--zip FILE] [--version TAG] [--dir DIR] [--model NAME]'
-                Write-Host '                    [--no-model] [--no-demo] [--driver [ZIP]] [--user-access] [--update] [--uninstall [--purge]]'
+                Write-Host '                    [--no-model] [--no-demo] [--driver [ZIP]] [--admin-only] [--update] [--uninstall [--purge]]'
                 return
             }
             default { throw "charsiu-install: unknown option $a (--help lists them)" }
@@ -115,6 +119,26 @@ function Install-Charsiu {
     function ReleaseUrl($name) {
         if ($o.Version) { return "https://github.com/$Repo/releases/download/$($o.Version)/$name" }
         return "https://github.com/$Repo/releases/latest/download/$name"
+    }
+
+    # The device's Enum key, Device Parameters included, is SYSTEM's: an
+    # administrator cannot write it. Run a few lines as SYSTEM through a
+    # one-shot scheduled task, wait for them, and hand back their log.
+    function Invoke-AsSystem([string]$Name, [string]$Body) {
+        $f = Join-Path $env:SystemRoot "Temp\$Name.ps1"
+        $log = Join-Path $env:SystemRoot "Temp\$Name.log"
+        Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
+        [IO.File]::WriteAllText($f, "`$ErrorActionPreference = 'Stop'`r`ntry {`r`n$Body`r`n'done' | Out-File -Encoding ascii -Append '$log'`r`n} catch { `$_ | Out-File -Encoding ascii -Append '$log' }`r`n")
+        $tn = "charsiu-$Name"
+        & schtasks /create /tn $tn /sc once /st 23:59 /ru SYSTEM /f /tr "powershell -NoProfile -ExecutionPolicy Bypass -File $f" | Out-Null
+        & schtasks /run /tn $tn | Out-Null
+        for ($w = 0; $w -lt 30; $w++) {
+            if ((Test-Path -LiteralPath $log) -and (Select-String -Quiet -LiteralPath $log -Pattern '^done$|Exception|Error')) { break }
+            Start-Sleep -Seconds 1
+        }
+        & schtasks /delete /tn $tn /f | Out-Null
+        if (Test-Path -LiteralPath $log) { return (Get-Content -LiteralPath $log -Raw) }
+        return ''
     }
 
     $LocalApp = $env:LOCALAPPDATA
@@ -177,12 +201,19 @@ function Install-Charsiu {
     if ($arch -ne 'ARM64') { Bad "this is $arch; charsiu's Windows build is ARM64 only"; if (-not $o.DryRun) { return } }
     else { Ok "ARM64, Windows build $build" }
     $admin = IsAdmin
-    if ($admin) { Ok 'administrator session' } else { Note 'not an administrator session (only --driver and --user-access need one)' }
+    if ($admin) { Ok 'administrator session' } else { Note 'not an administrator session (the driver and NPU access for ordinary users need one; the rest does not)' }
 
     # ---- 2. the NPU and its driver ---------------------------------------
     Step 'the NPU'
     $dev = $null
     try { $dev = Get-CimInstance Win32_PnPEntity -Filter "DeviceID LIKE 'ACPI\\\\RKCP3576%'" | Select-Object -First 1 } catch { }
+    # for CI only: a dry run that pretends the NPU and an administrator are
+    # here, so the steps that need both can be checked off the board
+    if ($o.DryRun -and $env:CHARSIU_INSTALL_FAKE_NPU -eq '1') {
+        $dev = [pscustomobject]@{ ConfigManagerErrorCode = 0; Status = 'OK' }
+        $admin = $true
+        Note 'CHARSIU_INSTALL_FAKE_NPU=1: pretending the NPU and an administrator are here'
+    }
     $npuStarted = $false
     if (-not $dev) {
         Bad 'no NPU device (ACPI\RKCP3576). Turn on "NPU (experimental)" in the firmware setup (ACPI / Device Tree page), save and restart.'
@@ -245,13 +276,8 @@ function Install-Charsiu {
             if ($LASTEXITCODE -ne 0) { throw "pnputil /add-driver failed ($LASTEXITCODE)" }
             Ok 'rknpu.inf staged'
             # the Enum key is SYSTEM's: run the reinstall mark as SYSTEM
-            $keep = Join-Path $env:SystemRoot 'Temp\rknpu-reinstall.ps1'
-            Copy-Item -LiteralPath $re.FullName -Destination $keep -Force
-            $tn = 'charsiu-rknpu-reinstall'
-            & schtasks /create /tn $tn /sc once /st 23:59 /ru SYSTEM /f /tr "powershell -NoProfile -ExecutionPolicy Bypass -File $keep" | Out-Null
-            & schtasks /run /tn $tn | Out-Null
-            Start-Sleep -Seconds 5
-            & schtasks /delete /tn $tn /f | Out-Null
+            $body = (Get-Content -LiteralPath $re.FullName -Raw) -replace '(?m)^\$ErrorActionPreference.*$', ''
+            [void](Invoke-AsSystem 'rknpu-reinstall' $body)
             $cf = (Get-ItemProperty -Path $NpuKey -Name ConfigFlags).ConfigFlags
             if ($cf -band 0x20) { Ok ('ConfigFlags 0x{0:x8}: PnP binds the new package at the next restart' -f $cf) }
             else { Bad ('ConfigFlags is 0x{0:x8}; the SYSTEM task did not set 0x20 (see %SystemRoot%\Temp\rknpu-reinstall.log)' -f $cf) }
@@ -272,28 +298,39 @@ function Install-Charsiu {
         }
     }
 
-    if ($o.UserAccess) {
-        Step 'NPU access for ordinary users'
-        if (-not $admin) { Bad '--user-access needs an administrator PowerShell'; if (-not $o.DryRun) { return } }
-        if (-not $dev) { Bad 'there is no NPU device'; if (-not $o.DryRun) { return } }
-        Note 'With this, any interactive user of this machine may open \\.\RKNPU. The driver grants'
-        Note 'it only in IOMMU mode, where every address a job can use is checked and the NPU can'
-        Note 'reach only buffers mapped for it; in bypass mode it stays administrators only.'
-        if (-not (Ask 'Allow it?' $true)) { Note 'left administrators only' }
-        elseif ($o.DryRun) { Would "set $NpuKey\Device Parameters\UserAccess = 1 (read when the device starts: takes a restart)" }
-        else {
-            $dp = Join-Path $NpuKey 'Device Parameters'
-            if (-not (Test-Path $dp)) { New-Item -Path $dp -Force | Out-Null }
-            New-ItemProperty -Path $dp -Name UserAccess -Value 1 -PropertyType DWord -Force | Out-Null
-            Ok 'UserAccess = 1; it takes effect at the next restart'
-            $reboot = $true
-        }
-    } elseif ($npuStarted -and -not $admin) {
-        $ua = $false
-        try { $ua = ((Get-ItemProperty -Path (Join-Path $NpuKey 'Device Parameters') -ErrorAction Stop).UserAccess -eq 1) } catch { }
-        if (-not $ua) {
-            Note 'rknpu.sys lets only administrators use the NPU. Run charsiu from an administrator terminal,'
-            Note 'or allow ordinary users once, from an administrator PowerShell, with --user-access (then restart).'
+    # ---- NPU access for ordinary users (the default) -----------------------
+    if ($dev) {
+        $dpKey = "$NpuKey\Device Parameters"
+        $ua = 0
+        try { $v = (Get-ItemProperty -Path $dpKey -ErrorAction Stop).UserAccess; if ($null -ne $v) { $ua = [int]$v } } catch { }
+        $want = 1; if ($o.AdminOnly) { $want = 0 }
+        Step 'who may use the NPU'
+        if ($ua -eq $want) {
+            if ($want) { Ok 'ordinary users may use the NPU (UserAccess = 1)' } else { Ok 'administrators only (UserAccess = 0)' }
+        } elseif (-not $admin) {
+            if ($want) {
+                Note 'rknpu.sys lets only administrators use the NPU. Run this installer once from an'
+                Note 'administrator PowerShell to let ordinary users use it (then restart), or run charsiu'
+                Note 'from an administrator terminal. --admin-only keeps it as it is.'
+            } else { Note 'UserAccess is 1; --admin-only needs an administrator PowerShell to change it' }
+        } else {
+            if ($want) {
+                Note 'Any interactive user of this machine will be able to open \\.\RKNPU. The driver grants'
+                Note 'it only in IOMMU mode, where every address a job can use is checked against that'
+                Note "user's own buffers and the NPU reaches only buffers mapped for it; in bypass mode it"
+                Note 'stays administrators only. All users share one NPU address space, so on a machine'
+                Note "with several users one user's job could reach another's NPU buffers. --admin-only"
+                Note 'keeps the NPU for administrators.'
+            }
+            $body = "if (-not (Test-Path '$dpKey')) { New-Item -Path '$dpKey' | Out-Null }`r`nNew-ItemProperty -Path '$dpKey' -Name UserAccess -Value $want -PropertyType DWord -Force | Out-Null"
+            if ($o.DryRun) { Would "set UserAccess = $want in $dpKey, as SYSTEM (read when the device starts: takes a restart)" }
+            else {
+                $log = Invoke-AsSystem 'rknpu-useraccess' $body
+                $now = -1
+                try { $now = [int](Get-ItemProperty -Path $dpKey -ErrorAction Stop).UserAccess } catch { }
+                if ($now -eq $want) { Ok "UserAccess = $want; it takes effect at the next restart"; $reboot = $true }
+                else { Bad "UserAccess is still $ua ($log)" }
+            }
         }
     }
 

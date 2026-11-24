@@ -117,7 +117,7 @@ export LOCALAPPDATA="$T/la" TEMP="$T/tmp" PROCESSOR_ARCHITECTURE=ARM64
 "$PW" -NoProfile -File "$T/bin/charsiu-install.ps1" --dry-run > "$T/i1.out" 2>&1 || { cat "$T/i1.out"; fail "installer -File"; }
 (cd "$T/bin" && CHARSIU_INSTALL_ARGS=--dry-run "$PW" -NoProfile -Command 'Get-Content ./charsiu-install.ps1 -Raw | iex') \
 	> "$T/i2.out" 2>&1 || { cat "$T/i2.out"; fail "installer through iex"; }
-(cd "$T/bin" && "$PW" -NoProfile -Command '& ([scriptblock]::Create((Get-Content ./charsiu-install.ps1 -Raw))) -DryRun --driver --user-access') \
+(cd "$T/bin" && CHARSIU_INSTALL_FAKE_NPU=1 "$PW" -NoProfile -Command '& ([scriptblock]::Create((Get-Content ./charsiu-install.ps1 -Raw))) -DryRun --driver') \
 	> "$T/i3.out" 2>&1 || { cat "$T/i3.out"; fail "installer through a scriptblock"; }
 for f in i1 i2 i3; do
 	grep -q 'DRY RUN. Nothing above was done' "$T/$f.out" || { cat "$T/$f.out"; fail "$f: no dry run summary"; }
@@ -126,7 +126,11 @@ for f in i1 i2 i3; do
 done
 grep -q 'would pnputil /add-driver' "$T/i3.out" && grep -q 'stage only' "$T/i3.out" || fail "--driver dry run"
 grep -q 'ConfigFlags |= 0x20' "$T/i3.out" || fail "--driver does not mark the device for reinstall"
-grep -q 'UserAccess = 1' "$T/i3.out" || fail "--user-access dry run"
+grep -q 'would set UserAccess = 1 in .*, as SYSTEM' "$T/i3.out" || fail "ordinary users are not given the NPU by default"
+(cd "$T/bin" && CHARSIU_INSTALL_FAKE_NPU=1 "$PW" -NoProfile -File ./charsiu-install.ps1 --dry-run --admin-only) > "$T/i4.out" 2>&1 \
+	|| { cat "$T/i4.out"; fail "--admin-only"; }
+grep -q 'UserAccess = 1' "$T/i4.out" && fail "--admin-only still gives ordinary users the NPU"
+grep -q 'administrators only (UserAccess = 0)' "$T/i4.out" || fail "--admin-only"
 [ -z "$(ls "$T/la")" ] || fail "a dry run wrote into LOCALAPPDATA"
 
 echo "FRONTDOOR: PASS"

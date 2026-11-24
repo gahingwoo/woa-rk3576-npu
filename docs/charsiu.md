@@ -37,8 +37,8 @@ What it does, in order:
    a driver on the running device: `pnputil /add-driver` only stages, and
    ConfigFlags 0x20 is set as SYSTEM through a one-shot scheduled task, the
    same steps as [use.md](use.md) 4 and 5.
-3. With `--user-access` (administrator): lets ordinary users open the NPU
-   (below). Takes a restart.
+3. From an administrator PowerShell, lets ordinary users open the NPU
+   (below; `--admin-only` does not). Takes a restart.
 4. Downloads `charsiu-windows-arm64.zip` from the latest release (or
    `--zip FILE`), checks it against its `.sha256`, and puts it in
    `%LOCALAPPDATA%\Programs\charsiu`.
@@ -96,15 +96,18 @@ them from `[npu]` in the config, as the Linux one does, so `charsiu`,
 `charsiu serve` and the desktop app use the NPU without anybody knowing the
 names; `charsiu --show` prints them. When the NPU cannot be used it says why
 before the run (no device: the firmware setting; no driver: `--driver`; no
-access: an administrator terminal or `--user-access`) and charsiu then runs
+access: the installer once from an administrator PowerShell, or an
+administrator terminal) and charsiu then runs
 on the CPU.
 
 ## Who may use the NPU
 
 rknpu.sys creates `\\.\RKNPU` for administrators and SYSTEM only, so by
 default charsiu reaches the NPU only from an administrator terminal; from an
-ordinary one it says so and runs on the CPU. `--user-access` sets
-`Device Parameters\UserAccess = 1` on the device; the driver then also
+ordinary one it says so and runs on the CPU. The installer, run from an
+administrator PowerShell, sets `Device Parameters\UserAccess = 1` on the
+device by default (`--admin-only` leaves it at 0, the driver's own default);
+the driver then also
 admits interactive users, which is what the desktop app needs and what
 Linux does (the accel node belongs to the video group).
 
@@ -114,10 +117,13 @@ buffers, and the IOMMU confines the NPU to the buffers mapped for it. In
 bypass mode (`M6Iommu = 0`, or `M4AllowUnlisted = 1`) a job's unchecked
 sizes reach physical memory, so the device stays administrators only, and
 if the IOMMU could not be set up when the device started, opening it is
-refused to anyone who is not an administrator. What it does not protect:
-the IOMMU is one address space for all handles, so one user's job could
-reach another user's NPU buffers. On a one-user machine that is the same
-user.
+refused to anyone who is not an administrator.
+
+**The caveat, for a machine with more than one user:** the IOMMU is one
+address space for all handles, so one user's job could read or overwrite
+another user's NPU buffers (their model weights, activations and text while
+a run is in progress). On a one-user machine, which is what this board is,
+that is the same user. Use `--admin-only` on a shared machine.
 
 ## Board test
 
@@ -127,11 +133,11 @@ artifacts, unpacked once each so that `charsiu-windows-arm64.zip` and
 `rknpu-windows-arm64.zip` are in, say, `R:\ci`.
 
 1. Dry run, ordinary PowerShell:
-   `powershell -NoProfile -ExecutionPolicy Bypass -File R:\ci\charsiu-install.ps1 --dry-run --zip R:\ci\charsiu-windows-arm64.zip --driver R:\ci\rknpu-windows-arm64.zip --user-access`
+   `powershell -NoProfile -ExecutionPolicy Bypass -File R:\ci\charsiu-install.ps1 --dry-run --zip R:\ci\charsiu-windows-arm64.zip --driver R:\ci\rknpu-windows-arm64.zip`
    (extract `charsiu-install.ps1` from the zip first). Every step says
    `would`; nothing under `%LOCALAPPDATA%` changes.
 2. The driver with user access, administrator PowerShell:
-   `... -File R:\ci\charsiu-install.ps1 --zip R:\ci\charsiu-windows-arm64.zip --driver R:\ci\rknpu-windows-arm64.zip --user-access --no-model`
+   `... -File R:\ci\charsiu-install.ps1 --zip R:\ci\charsiu-windows-arm64.zip --driver R:\ci\rknpu-windows-arm64.zip --no-model`
    Expect `rknpu.inf staged`, `ConfigFlags 0x...: PnP binds the new package
    at the next restart`, `UserAccess = 1`. Restart.
 3. After the restart, an administrator PowerShell: run the same installer
@@ -152,7 +158,7 @@ artifacts, unpacked once each so that `charsiu-windows-arm64.zip` and
 8. `charsiu serve`, and from a second window:
    `curl.exe -N http://127.0.0.1:11434/v1/chat/completions -d "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"`.
    Then the desktop app (charsiu-desktop) against it.
-9. Without `--user-access` (set `UserAccess` to 0 and restart, or a machine
+9. With `--admin-only` (administrator PowerShell, then restart; or a machine
    without it): `charsiu` from an ordinary terminal warns that the NPU is
    administrators only and runs on the CPU.
 

@@ -302,9 +302,9 @@ function Write-NpuHint {
     if (-not $d.Present) {
         Warn "no NPU device: enable 'NPU (experimental)' in the firmware setup. This run uses the CPU."
     } elseif (-not $d.Started) {
-        Warn "the NPU has no working driver (problem $($d.Problem)). charsiu-install.ps1 -Driver stages rknpu.sys. This run uses the CPU."
+        Warn "the NPU has no working driver (problem $($d.Problem)). charsiu-install.ps1 --driver, from an administrator PowerShell, stages rknpu.sys. This run uses the CPU."
     } elseif (-not (Test-Admin) -and -not $d.UserAccess) {
-        Warn "rknpu.sys lets only administrators use the NPU. Run this from an administrator terminal, or allow it once with: charsiu-install.ps1 -UserAccess (then restart). This run uses the CPU."
+        Warn "rknpu.sys lets only administrators use the NPU here. Run charsiu-install.ps1 once from an administrator PowerShell (it lets ordinary users use the NPU, then restart), or run this from an administrator terminal. This run uses the CPU."
     }
 }
 
@@ -785,7 +785,7 @@ function Invoke-Doctor {
     if ($d.Started) {
         if (Test-Admin) { Row $true 'npu access' 'this is an administrator session' }
         elseif ($d.UserAccess) { Row $true 'npu access' 'UserAccess = 1: this user may open the NPU' }
-        else { Row $false 'npu access' 'administrators only: use an administrator terminal, or charsiu-install.ps1 -UserAccess and restart' }
+        else { Row $false 'npu access' 'administrators only: run charsiu-install.ps1 once from an administrator PowerShell and restart, or use an administrator terminal' }
         if (-not $d.Iommu) { Row $null 'npu iommu' 'M6Iommu = 0 (bypass): the NPU stays administrators only' }
         if (Get-NpuCounters) { Row $true 'counters' '"RK3576 NPU" performance counters are registered' }
         else { Row $null 'counters' 'not registered; tools\rknpu-perfcounters.ps1 registers them (charsiu ps, the desktop app)' }
