@@ -26,8 +26,10 @@
  *   RKNPU_FAKE_REGS      a file: every (block, register) any stream wrote
  *   RKNPU_FAKE_REPORT    1: the totals at exit, on stderr
  *   RKNPU_FAKE_M4        1: answer as the M4 driver (bypass, write-combined,
- *                        no PREP_BO / FINI_BO); default the M6 driver in
+ *                        no PREP_BO / FINI_BO); default the M7 driver in
  *                        IOMMU mode with cached buffers
+ *   RKNPU_FAKE_M6        1: answer as the M6 driver (no RKNPU_SUBMIT_CLEAN,
+ *                        RKNPU_WAIT_PREP or RKNPU_WAIT_LEAN)
  *
  * M6: a cached buffer counts the PREP_BO and FINI_BO it gets, and SUBMIT
  * refuses (-EIO, logged) a job whose stream buffer was written through its
@@ -93,7 +95,9 @@ static unsigned char arena[RKNPU_COPY_ARENA_BYTES];
 static unsigned long long n_submit, n_tasks, n_entries, max_tasks, max_entries, max_arena;
 static unsigned long long n_busy, n_refused, n_wait, n_poll;
 static unsigned long long n_prep, n_fini, n_unfini, n_overlap, n_cbuf_wait;
-static int m4;
+static unsigned long long n_clean, n_wprep;     /* M7: FINIs a SUBMIT did, PREPs a WAIT did */
+static unsigned long long n_ufini, n_uprep;     /* M7: the same done by the caller (UCACHE) */
+static int m4, m6;
 
 /* the scan: (target << 16 | reg) -> count, for values inside a buffer */
 #define SCAN_SLOTS 4096
@@ -120,6 +124,7 @@ static void init(void)
 	scribble = getenv("RKNPU_FAKE_SCRIBBLE") != NULL;
 	regs_path = getenv("RKNPU_FAKE_REGS");
 	m4 = getenv("RKNPU_FAKE_M4") != NULL;
+	m6 = m4 || getenv("RKNPU_FAKE_M6") != NULL;
 	atexit(report);
 }
 
@@ -194,13 +199,18 @@ static void retire(unsigned c)
 	hist[hist_at++ % RKNPU_JOB_HISTORY] = core_job[c];
 }
 
-static int do_submit(struct rkx *x, const rknpu_submit_in *in, rknpu_submit_out *out)
+static int do_submit(struct rkx *x, const rknpu_submit_in *in, unsigned inlen, rknpu_submit_out *out)
 {
 	unsigned i, at = 0, key = RKNPU_RC_CBUF_ANY, other = in->core ^ 1u;
 	struct fjob *j;
+	unsigned allowed = RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY | (m6 ? 0 : RKNPU_SUBMIT_CLEAN);
 
 	if (in->core >= RKNPU_NUM_CORES || !in->task_count || in->task_count > RKNPU_MAX_TASKS ||
-	    (in->flags & ~(RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY)))
+	    (in->flags & ~allowed))
+		return -EINVAL;
+	if ((in->flags & RKNPU_SUBMIT_CLEAN) &&
+	    (inlen < sizeof(rknpu_submit_m7_in) ||
+	     ((const rknpu_submit_m7_in *)in)->clean_count > RKNPU_M7_MAX_CLEAN))
 		return -EINVAL;
 	if (!(in->flags & RKNPU_SUBMIT_COPY))
 		return -EINVAL;    /* charsiu always copies; the M3 path is rknputest's */
@@ -212,6 +222,18 @@ static int do_submit(struct rkx *x, const rknpu_submit_in *in, rknpu_submit_out 
 	if (j->active) {
 		n_busy++;
 		return -EBUSY;
+	}
+	/* M7: the deferred FINI_BOs, all of them before any stream is read */
+	if (in->flags & RKNPU_SUBMIT_CLEAN) {
+		const rknpu_submit_m7_in *m = (const rknpu_submit_m7_in *)in;
+
+		for (i = 0; i < m->clean_count; i++)
+			if (!find(x, m->clean[i]))
+				return -EINVAL;     /* STATUS_INVALID_HANDLE */
+		for (i = 0; i < m->clean_count; i++) {
+			find(x, m->clean[i])->dirty = 0;
+			n_clean++;
+		}
 	}
 	/* the copy and the check, as NpuCopyStreamsLocked */
 	for (i = 0; i < in->task_count; i++) {
@@ -298,7 +320,36 @@ static int do_submit(struct rkx *x, const rknpu_submit_in *in, rknpu_submit_out 
 	return 0;
 }
 
-static int do_wait(struct rkx *x, const rknpu_wait_in *in, rknpu_wait_out *o)
+static int do_wait1(struct rkx *x, const rknpu_wait_in *in, rknpu_wait_out *o);
+
+static int do_wait(struct rkx *x, const rknpu_wait_in *in, unsigned inlen, rknpu_wait_out *o)
+{
+	unsigned allowed = RKNPU_WAIT_POLL | (m6 ? 0 : RKNPU_WAIT_PREP | RKNPU_WAIT_LEAN);
+	unsigned prep = 0;
+	struct fbo *b;
+	int r;
+
+	if (in->flags & ~allowed)
+		return -EINVAL;
+	if (in->flags & RKNPU_WAIT_PREP) {
+		if (inlen < sizeof(rknpu_wait_m7_in) || (in->flags & RKNPU_WAIT_POLL))
+			return -EINVAL;
+		prep = ((const rknpu_wait_m7_in *)in)->prep_handle;
+	}
+	r = do_wait1(x, in, o);
+	if (r || !(in->flags & RKNPU_WAIT_PREP) || o->result == RKNPU_JOB_RUNNING)
+		return r;
+	b = find(x, prep);
+	if (!b)
+		return -EINVAL;
+	b->dirty = 1;           /* as PREP_BO: the CPU may write it from here */
+	n_prep++;
+	n_wprep++;
+	o->m7_flags |= RKNPU_WAIT_OUT_PREPPED;
+	return 0;
+}
+
+static int do_wait1(struct rkx *x, const rknpu_wait_in *in, rknpu_wait_out *o)
 {
 	unsigned c, h;
 
@@ -404,6 +455,8 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 			i->mem_mode = RKNPU_MEM_IOMMU;
 			i->bo_cached = 1;
 		}
+		if (!m6)
+			i->m7_version = RKNPU_M7_VERSION;
 		*got = sizeof(*i);
 		break;
 	}
@@ -508,7 +561,7 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 			r = -EINVAL;
 			break;
 		}
-		r = do_submit(x, in, out);
+		r = do_submit(x, in, inlen, out);
 		if (!r)
 			*got = sizeof(rknpu_submit_out);
 		break;
@@ -517,7 +570,7 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 			r = -EINVAL;
 			break;
 		}
-		r = do_wait(x, in, out);
+		r = do_wait(x, in, inlen, out);
 		if (!r)
 			*got = sizeof(rknpu_wait_out);
 		break;
@@ -558,6 +611,56 @@ const char *rkx_mem_report(void)
 
 void charsiu_port_crash_handler_install(void)
 {
+}
+
+/* M7: the host has no NPU to be coherent with; RKNPU_FAKE_UCACHE=1 says
+ * user mode may do the maintenance, which is then a fence */
+int rkx_dc_usable(void)
+{
+	return getenv("RKNPU_FAKE_UCACHE") != NULL;
+}
+
+/* the buffer whose mapping p is, marked as its FINI_BO (clean) or PREP_BO
+ * (dirty from here) would mark it */
+static void fake_dc(const void *p, size_t n, int dirty)
+{
+	unsigned i;
+
+	(void)n;
+	pthread_mutex_lock(&lk);
+	for (i = 0; i < nbo; i++)
+		if (bos[i].mem == p) {
+			bos[i].dirty = dirty;
+			if (dirty)
+				n_uprep++;
+			else
+				n_ufini++;
+			break;
+		}
+	pthread_mutex_unlock(&lk);
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+void rkx_dc_clean(const void *p, size_t n)
+{
+	fake_dc(p, n, 0);
+}
+
+void rkx_dc_clean_inval(const void *p, size_t n)
+{
+	fake_dc(p, n, 1);
+}
+
+/* for port/test/devtest.c (M7) */
+void rkx_fake_m7_counts(unsigned long long *cleans, unsigned long long *wait_preps,
+			unsigned long long *ufinis, unsigned long long *upreps)
+{
+	pthread_mutex_lock(&lk);
+	*cleans = n_clean;
+	*wait_preps = n_wprep;
+	*ufinis = n_ufini;
+	*upreps = n_uprep;
+	pthread_mutex_unlock(&lk);
 }
 
 /* for port/test/devtest.c (M6) */
@@ -633,8 +736,10 @@ static void report(void)
 			"%llu refused, %llu waits (%llu polled RUNNING); buffers peak %llu "
 			"(%.1f MiB), largest %.1f MiB; %llu PREP_BO, %llu FINI_BO, %llu jobs "
 			"from unflushed streams; %llu SUBMITs overlapped the other core's job, "
-			"%llu of them on the same CBUF window (waited)\n",
+			"%llu of them on the same CBUF window (waited); M7: %llu FINIs by SUBMIT, "
+			"%llu PREPs by WAIT\n",
 			n_submit, n_tasks, max_tasks, n_entries, max_entries, max_arena, n_busy,
 			n_refused, n_wait, n_poll, nbo_peak, total_peak / 1048576.0,
-			bo_max_seen / 1048576.0, n_prep, n_fini, n_unfini, n_overlap, n_cbuf_wait);
+			bo_max_seen / 1048576.0, n_prep, n_fini, n_unfini, n_overlap, n_cbuf_wait,
+			n_clean, n_wprep);
 }

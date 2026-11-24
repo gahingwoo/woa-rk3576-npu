@@ -476,6 +476,7 @@ NpuEvtIoDeviceControl(
         o->bo_cached = ctx->CachedBos ? 1 : 0;
         o->iova_kib = ctx->Mmu.ChunksUsed << (NPU_IOVA_CHUNK_SHIFT - 10);
         o->pt_pages = ctx->Mmu.PtPages;
+        o->m7_version = RKNPU_M7_VERSION;
         info = sizeof(*o);
         break;
     }

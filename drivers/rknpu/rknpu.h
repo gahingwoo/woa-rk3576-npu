@@ -182,6 +182,7 @@ typedef struct _CORE_JOB {
     ULONG           FaultStatus;
     LARGE_INTEGER   T0;             /* QPC at the first OPERATION_ENABLE */
     LARGE_INTEGER   T1;             /* QPC at the last interrupt */
+    LARGE_INTEGER   T2;             /* M7: QPC when the DPC set Done */
     rknpu_task      Tasks[RKNPU_MAX_TASKS];
 } CORE_JOB;
 
@@ -267,6 +268,9 @@ typedef struct _DEVICE_CONTEXT {
     BOOLEAN         CachedBos;      /* Device Parameters\M6CachedBos */
     SIZE_T          BoMaxTotal;     /* RKNPU_BO_MAX_TOTAL, or _IOMMU */
     LIST_ENTRY      BoHash[RKNPU_BO_HASH];
+
+    /* M7 */
+    KPRIORITY       WakeBoost;      /* Device Parameters\M7WakeBoost: KeSetEvent's increment */
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetContext)

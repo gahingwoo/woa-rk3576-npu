@@ -216,6 +216,9 @@ NpuM3DeviceInit(
     /* M6 defaults: the driver's IOMMU, cached buffers */
     Ctx->Mmu.On = TRUE;
     Ctx->CachedBos = TRUE;
+    /* M7: the waiter of a finished job gets a priority boost, as an I/O
+     * completion would (EVENT_INCREMENT); M7WakeBoost = 0 is M6's none */
+    Ctx->WakeBoost = EVENT_INCREMENT;
     status = WdfDeviceOpenRegistryKey(Ctx->Device, PLUGPLAY_REGKEY_DEVICE, KEY_READ | KEY_WRITE,
                                       WDF_NO_OBJECT_ATTRIBUTES, &Ctx->CrumbKey);
     if (!NT_SUCCESS(status)) {
@@ -240,6 +243,9 @@ NpuM3DeviceInit(
         RtlInitUnicodeString(&name, L"M6CachedBos");
         if (NT_SUCCESS(WdfRegistryQueryULong(Ctx->CrumbKey, &name, &v)))
             Ctx->CachedBos = v ? TRUE : FALSE;
+        RtlInitUnicodeString(&name, L"M7WakeBoost");
+        if (NT_SUCCESS(WdfRegistryQueryULong(Ctx->CrumbKey, &name, &v)))
+            Ctx->WakeBoost = v > 8 ? 8 : (KPRIORITY)v;
     }
     if (Ctx->Mmu.On && !NT_SUCCESS(NpuMmuInit(Ctx))) {
         RKNPU_LOG("IOMMU mode: no memory for the page directory; running in bypass mode");
@@ -399,10 +405,13 @@ NpuM3Dpc(
     WdfInterruptAcquireLock(core->Interrupt);
     done = core->Job.CompletePending;
     core->Job.CompletePending = FALSE;
+    /* M7: irq_dpc_us; written while the job is still this core's */
+    if (done)
+        core->Job.T2 = KeQueryPerformanceCounter(NULL);
     WdfInterruptReleaseLock(core->Interrupt);
     if (done) {
         InterlockedIncrement(&core->JobsCompleted);
-        KeSetEvent(&core->Done, IO_NO_INCREMENT, FALSE);
+        KeSetEvent(&core->Done, Ctx->WakeBoost, FALSE);
     }
 }
 
@@ -577,6 +586,7 @@ NpuJobFinish(
     _In_ ULONG N,
     _In_ ULONG TimeoutMs,
     _In_ BOOLEAN Crumbs,
+    _In_ BOOLEAN Lean,
     _Out_opt_ rknpu_wait_out *O
     )
 {
@@ -630,7 +640,13 @@ NpuJobFinish(
         O->reset_status = (ULONG)rs;
         O->fault_addr = j->FaultAddr;
         O->fault_status = j->FaultStatus;
-        if (NpuSafeToRead(Ctx)) {
+        if (j->T2.QuadPart > j->T1.QuadPart && j->T1.QuadPart)
+            O->irq_dpc_us = QpcToUs(Ctx, j->T2.QuadPart - j->T1.QuadPart);
+        /* M7, RKNPU_WAIT_LEAN: three register reads a WAIT that only a
+         * failure needs */
+        if (Lean && !timedOut && !ver && j->Result == RKNPU_JOB_DONE) {
+            /* version_after and mmu_status stay 0 */
+        } else if (NpuSafeToRead(Ctx)) {
             O->version_after = (timedOut || ver) ? ver : NpuRd(Ctx, NpuCoreBase(N) + PC_VERSION);
             for (i = 0; i < RKNPU_MMUS_PER_CORE; i++)
                 O->mmu_status[i] = NpuRd(Ctx, NpuCoreBase(N) + MmuInst[i] + RK_MMU_STATUS);
@@ -1404,17 +1420,29 @@ NpuSubmit(
     BOOLEAN copy;
     NTSTATUS status;
     CORE_STATE *other;
+    /* M7: the buffers to FINI_BO first, and the driver's own time */
+    ULONG clean[RKNPU_M7_MAX_CLEAN], nclean = 0;
+    LARGE_INTEGER tIn = KeQueryPerformanceCounter(NULL), tOut;
+    size_t inLen = 0;
 
     *Info = 0;
-    status = WdfRequestRetrieveInputBuffer(Request, sizeof(in), (PVOID *)&pin, NULL);
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(in), (PVOID *)&pin, &inLen);
     if (!NT_SUCCESS(status))
         return status;
     RtlCopyMemory(&in, pin, sizeof(in));
+    if (in.flags & RKNPU_SUBMIT_CLEAN) {
+        const rknpu_submit_m7_in *m7 = (const rknpu_submit_m7_in *)pin;
+
+        if (inLen < sizeof(*m7) || m7->clean_count > RKNPU_M7_MAX_CLEAN)
+            return STATUS_INVALID_PARAMETER;
+        nclean = m7->clean_count;
+        RtlCopyMemory(clean, m7->clean, nclean * sizeof(clean[0]));
+    }
     status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
     if (!NT_SUCCESS(status))
         return status;
     if (in.core >= RKNPU_NUM_CORES || in.task_count == 0 || in.task_count > RKNPU_MAX_TASKS ||
-        (in.flags & ~(RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY)))
+        (in.flags & ~(RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY | RKNPU_SUBMIT_CLEAN)))
         return STATUS_INVALID_PARAMETER;
     copy = (in.flags & RKNPU_SUBMIT_COPY) ? TRUE : FALSE;
     for (i = 0; i < in.task_count; i++)
@@ -1464,6 +1492,21 @@ NpuSubmit(
             status = STATUS_DEVICE_CONFIGURATION_ERROR;
             goto out_bo;
         }
+    }
+    /*
+     * M7: FINI_BO of what the caller deferred to this SUBMIT (the device's
+     * inputs, and outputs it has finished reading), before the core can
+     * read any of it. All or nothing: a handle that is not the caller's
+     * fails the SUBMIT and the core is not started.
+     */
+    for (i = 0; i < nclean; i++) {
+        PNPU_BO cb = BoFindLocked(Ctx, clean[i], fo);
+
+        if (!cb) {
+            status = STATUS_INVALID_HANDLE;
+            goto out_bo;
+        }
+        BoClean(cb, 0, cb->Size);
     }
     /* Every stream inside one of the caller's buffers, and within the rules:
      * M4 checks the copies it will run, M3 the streams in place. */
@@ -1536,9 +1579,11 @@ NpuSubmit(
     NpuHwSubmit(Ctx, n);
     WdfInterruptReleaseLock(core->Interrupt);
 
+    tOut = KeQueryPerformanceCounter(NULL);
     RtlZeroMemory(out, sizeof(*out));
     out->seqno = seq;
     out->core = n;
+    out->drv_us = QpcToUs(Ctx, tOut.QuadPart - tIn.QuadPart);
     *Info = sizeof(*out);
     status = STATUS_SUCCESS;
 out_bo:
@@ -1558,19 +1603,29 @@ NpuWait(
     rknpu_wait_in *pin, in;
     rknpu_wait_out *out;
     WDFFILEOBJECT fo = WdfRequestGetFileObject(Request);
-    ULONG n, ms;
+    ULONG n, ms, prepHandle = 0;
+    LARGE_INTEGER woke;
+    BOOLEAN slept = FALSE;
+    size_t inLen = 0;
     NTSTATUS status;
 
     *Info = 0;
-    status = WdfRequestRetrieveInputBuffer(Request, sizeof(in), (PVOID *)&pin, NULL);
+    woke.QuadPart = 0;
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(in), (PVOID *)&pin, &inLen);
     if (!NT_SUCCESS(status))
         return status;
     in = *pin;
+    if (in.flags & ~(RKNPU_WAIT_POLL | RKNPU_WAIT_PREP | RKNPU_WAIT_LEAN))
+        return STATUS_INVALID_PARAMETER;
+    /* M7: the handle to PREP follows the M6 struct */
+    if (in.flags & RKNPU_WAIT_PREP) {
+        if (inLen < sizeof(rknpu_wait_m7_in) || (in.flags & RKNPU_WAIT_POLL))
+            return STATUS_INVALID_PARAMETER;
+        prepHandle = ((const rknpu_wait_m7_in *)pin)->prep_handle;
+    }
     status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
     if (!NT_SUCCESS(status))
         return status;
-    if (in.flags & ~RKNPU_WAIT_POLL)
-        return STATUS_INVALID_PARAMETER;
     ms = in.timeout_ms ? in.timeout_ms : RKNPU_WAIT_DEFAULT_MS;
     if (ms > RKNPU_WAIT_MAX_MS)
         ms = RKNPU_WAIT_MAX_MS;
@@ -1598,8 +1653,11 @@ NpuWait(
             if (n < RKNPU_NUM_CORES)
                 active = JobActive(&Ctx->Core[n].Job);
             WdfWaitLockRelease(Ctx->JobLock);
-            if (!active)
+            if (!active) {
+                if (!woke.QuadPart)
+                    woke = KeQueryPerformanceCounter(NULL);
                 break;
+            }
             now = KeQueryPerformanceCounter(NULL);
             left = (LONGLONG)ms * 1000 - (LONGLONG)QpcToUs(Ctx, now.QuadPart - t0.QuadPart);
             if (left <= 0)
@@ -1607,6 +1665,9 @@ NpuWait(
             to.QuadPart = -10 * left;
             if (KeWaitForSingleObject(&Ctx->Core[n].Done, Executive, KernelMode, FALSE, &to) == STATUS_TIMEOUT)
                 break;
+            /* M7: dpc_wake_us, the first time this thread runs after Done */
+            woke = KeQueryPerformanceCounter(NULL);
+            slept = TRUE;
         }
         now = KeQueryPerformanceCounter(NULL);
         left = (LONGLONG)ms * 1000 - (LONGLONG)QpcToUs(Ctx, now.QuadPart - t0.QuadPart);
@@ -1650,10 +1711,36 @@ NpuWait(
         out->task_count = Ctx->Core[n].Job.TaskCount;
         out->tasks_done = Ctx->Core[n].Job.TasksDone;
     } else {
+        const CORE_JOB *j = &Ctx->Core[n].Job;
+
         /* crumbs follow the submit's choice; a timeout always leaves them */
-        NpuJobFinish(Ctx, n, ms, !Ctx->Core[n].Job.NoCrumbs, out);
+        NpuJobFinish(Ctx, n, ms, !j->NoCrumbs, (in.flags & RKNPU_WAIT_LEAN) ? TRUE : FALSE, out);
+        if (woke.QuadPart && j->T2.QuadPart && woke.QuadPart > j->T2.QuadPart) {
+            out->dpc_wake_us = QpcToUs(Ctx, woke.QuadPart - j->T2.QuadPart);
+            if (slept)
+                out->m7_flags |= RKNPU_WAIT_OUT_SLEPT;
+        }
     }
     WdfWaitLockRelease(Ctx->JobLock);
+
+    /*
+     * M7, RKNPU_WAIT_PREP: PREP_BO (NpuBoSync) on the caller's buffer, now
+     * that the job is no longer running. A job found only in the history
+     * finished too, so its output is just as ready. A handle that is not
+     * the caller's fails the WAIT after the job's result is written.
+     */
+    if ((in.flags & RKNPU_WAIT_PREP) && out->result != RKNPU_JOB_RUNNING) {
+        PNPU_BO bo;
+
+        WdfWaitLockAcquire(Ctx->BoLock, NULL);
+        bo = BoFindLocked(Ctx, prepHandle, fo);
+        if (bo)
+            BoCleanInvalidate(bo, 0, bo->Size);
+        WdfWaitLockRelease(Ctx->BoLock);
+        if (!bo)
+            return STATUS_INVALID_HANDLE;
+        out->m7_flags |= RKNPU_WAIT_OUT_PREPPED;
+    }
     *Info = sizeof(*out);
     return STATUS_SUCCESS;
 }
@@ -1792,7 +1879,7 @@ NpuM3FileCleanup(
     WdfWaitLockAcquire(Ctx->JobLock, NULL);
     for (n = 0; n < RKNPU_NUM_CORES; n++)
         if (Ctx->Core[n].Job.Owner == FileObject && JobActive(&Ctx->Core[n].Job))
-            NpuJobFinish(Ctx, n, RKNPU_WAIT_DEFAULT_MS, TRUE, NULL);
+            NpuJobFinish(Ctx, n, RKNPU_WAIT_DEFAULT_MS, TRUE, FALSE, NULL);
     for (n = 0; n < RKNPU_NUM_CORES; n++)
         if (Ctx->Core[n].Job.Owner == FileObject)
             Ctx->Core[n].Job.Owner = NULL;

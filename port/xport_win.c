@@ -11,6 +11,7 @@
 #include <psapi.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -137,4 +138,89 @@ const char *rkx_mem_report(void)
 	snprintf(buf, sizeof(buf), "%lu page faults, peak working set %.0f MiB",
 		 (unsigned long)pmc.PageFaultCount, pmc.PeakWorkingSetSize / 1048576.0);
 	return buf;
+}
+
+/* ------------------------------------------------ M7: user-mode DC by VA */
+
+/*
+ * DC CVAC and DC CIVAC are allowed at EL0 only when the kernel sets
+ * SCTLR_EL1.UCI; otherwise they trap and Windows raises an exception. So
+ * the first use runs each once, on a line of this stack, with a vectored
+ * handler that recognises exactly these two instructions, notes the fault
+ * and steps over them. The line size is the A72's and the A53's, 64 bytes:
+ * CTR_EL0 is not read, because reading it from EL0 can trap as well
+ * (SCTLR_EL1.UCT), and a smaller line than the real one would only clean
+ * some lines twice.
+ */
+#define RKX_DC_LINE 64u
+
+void rkx_dc_probe_cvac(void *p);
+void rkx_dc_probe_civac(void *p);
+__asm__(".text\n"
+	".p2align 2\n"
+	".globl rkx_dc_probe_cvac\n"
+	"rkx_dc_probe_cvac:\n"
+	"    dc cvac, x0\n"
+	"    dsb sy\n"
+	"    ret\n"
+	".p2align 2\n"
+	".globl rkx_dc_probe_civac\n"
+	"rkx_dc_probe_civac:\n"
+	"    dc civac, x0\n"
+	"    dsb sy\n"
+	"    ret\n");
+
+static volatile LONG dc_faults;
+
+static LONG CALLBACK dc_probe_handler(EXCEPTION_POINTERS *ep)
+{
+	PVOID at = ep->ExceptionRecord->ExceptionAddress;
+
+	if (at != (PVOID)rkx_dc_probe_cvac && at != (PVOID)rkx_dc_probe_civac)
+		return EXCEPTION_CONTINUE_SEARCH;
+	InterlockedIncrement(&dc_faults);
+	ep->ContextRecord->Pc += 4;     /* step over the DC */
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+int rkx_dc_usable(void)
+{
+	static volatile LONG state;     /* 0 unknown, 1 usable, 2 not */
+	volatile unsigned char line[2 * RKX_DC_LINE];
+	PVOID h;
+
+	if (state)
+		return state == 1;
+	h = AddVectoredExceptionHandler(1, dc_probe_handler);
+	if (!h) {
+		state = 2;
+		return 0;
+	}
+	line[0] = 1;
+	rkx_dc_probe_cvac((void *)line);
+	rkx_dc_probe_civac((void *)line);
+	RemoveVectoredExceptionHandler(h);
+	state = dc_faults ? 2 : 1;
+	fprintf(stderr, "charsiu rknpu: user-mode DC CVAC / DC CIVAC %s\n",
+		state == 1 ? "work (CHARSIU_RKNPU_UCACHE can do the cache maintenance here)"
+			   : "trap (SCTLR_EL1.UCI is 0); the driver keeps doing it");
+	return state == 1;
+}
+
+void rkx_dc_clean(const void *p, size_t n)
+{
+	uintptr_t a = (uintptr_t)p & ~(uintptr_t)(RKX_DC_LINE - 1), end = (uintptr_t)p + n;
+
+	for (; a < end; a += RKX_DC_LINE)
+		__asm__ __volatile__("dc cvac, %0" :: "r"(a) : "memory");
+	__asm__ __volatile__("dsb sy" ::: "memory");
+}
+
+void rkx_dc_clean_inval(const void *p, size_t n)
+{
+	uintptr_t a = (uintptr_t)p & ~(uintptr_t)(RKX_DC_LINE - 1), end = (uintptr_t)p + n;
+
+	for (; a < end; a += RKX_DC_LINE)
+		__asm__ __volatile__("dc civac, %0" :: "r"(a) : "memory");
+	__asm__ __volatile__("dsb sy" ::: "memory");
 }

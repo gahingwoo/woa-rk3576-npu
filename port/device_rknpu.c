@@ -52,6 +52,20 @@
  *                         (M6) the cache maintenance and the process's page
  *                         faults and peak working set
  *   CHARSIU_ACCEL         the device path (default \\.\RKNPU)
+ *   CHARSIU_RKNPU_FUSE    M7, default 1 on an M7 driver: FINI_BO is deferred
+ *                         to the device's next SUBMIT (RKNPU_SUBMIT_CLEAN)
+ *                         and the PREP_BO after a job rides on its WAIT
+ *                         (RKNPU_WAIT_PREP), so a decode call is four IOCTLs
+ *                         instead of ten; 0 is M6's one IOCTL each
+ *   CHARSIU_RKNPU_UCACHE  M7, default 0: 1 does PREP and FINI in this process
+ *                         (DC CIVAC / DC CVAC on the buffer's own mapping,
+ *                         no IOCTL at all) if the CPU lets user mode do it,
+ *                         which is probed once; falls back to the above
+ *
+ * With CHARSIU_RKNPU_STATS=1 the close also prints an M7 timing line: the
+ * SUBMIT and WAIT IOCTLs' wall time against the driver's own drv_us, and the
+ * interrupt-to-DPC and DPC-to-waiter times, so the operating system's share
+ * of a call is a measurement and not a remainder.
  *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
@@ -98,6 +112,18 @@ struct charsiu_device {
 	unsigned mem_mode;              /* RKNPU_MEM_*, from GET_INFO */
 	unsigned long preps, finis;
 	unsigned long long sync_us;
+
+	/* M7 */
+	int m7;                         /* the driver has RKNPU_SUBMIT_CLEAN and RKNPU_WAIT_PREP */
+	int fuse;                       /* and they are used (CHARSIU_RKNPU_FUSE) */
+	int ucache;                     /* PREP / FINI done here (CHARSIU_RKNPU_UCACHE) */
+	unsigned defer[RKNPU_M7_MAX_CLEAN];     /* FINI_BOs for the next SUBMIT; lock */
+	unsigned ndefer;
+	unsigned long deferred, defer_full, cleaned_by_submit, prepped_by_wait, uc_ops;
+	unsigned long long uc_us;
+	/* the IOCTLs' wall time and what the driver says of it */
+	unsigned long sub_n, wait_n, wait_slept, wait_timed;
+	unsigned long long sub_wall_us, sub_drv_us, wait_wall_us, irq_dpc_us, dpc_wake_us, late_us;
 };
 
 static unsigned dev_count;              /* opened so far, under no lock: open is single-threaded */
@@ -159,20 +185,44 @@ void charsiu_spin_report(void)
 		charsiu_spin_lost ? (double)charsiu_spin_lost_us / charsiu_spin_lost : 0.0);
 }
 
+/* One WAIT. prep: M7, a buffer handle to PREP_BO in the same IOCTL, or 0. */
 static int wait_once(struct charsiu_device *dev, unsigned ms, unsigned flags,
-		     rknpu_wait_out *o)
+		     unsigned prep, rknpu_wait_out *o)
 {
-	rknpu_wait_in in;
+	rknpu_wait_m7_in in;
+	unsigned long long t0 = rkx_now_us();
 	unsigned got = 0;
 	int r;
 
 	memset(&in, 0, sizeof(in));
-	in.seqno = dev->seq;
-	in.timeout_ms = ms;
-	in.flags = flags;
-	r = rkx_ioctl(dev->x, IOCTL_RKNPU_WAIT, &in, sizeof(in), o, sizeof(*o), &got);
+	in.base.seqno = dev->seq;
+	in.base.timeout_ms = ms;
+	in.base.flags = flags;
+	if (dev->m7 && !(flags & RKNPU_WAIT_POLL))
+		in.base.flags |= RKNPU_WAIT_LEAN;
+	if (prep) {
+		in.base.flags |= RKNPU_WAIT_PREP;
+		in.prep_handle = prep;
+	}
+	r = rkx_ioctl(dev->x, IOCTL_RKNPU_WAIT, &in,
+		      prep ? (unsigned)sizeof(in) : (unsigned)sizeof(in.base),
+		      o, sizeof(*o), &got);
 	if (!r && got < sizeof(*o))
 		r = -EIO;
+	if (!r && !(flags & RKNPU_WAIT_POLL)) {
+		dev->wait_n++;
+		dev->wait_wall_us += rkx_now_us() - t0;
+		if (dev->m7) {
+			dev->wait_timed++;
+			dev->irq_dpc_us += o->irq_dpc_us;
+			if (o->m7_flags & RKNPU_WAIT_OUT_SLEPT) {
+				dev->wait_slept++;
+				dev->dpc_wake_us += o->dpc_wake_us;
+			} else {
+				dev->late_us += o->dpc_wake_us;
+			}
+		}
+	}
 	return r;
 }
 
@@ -181,12 +231,14 @@ static int wait_once(struct charsiu_device *dev, unsigned ms, unsigned flags,
  * -ETIMEDOUT (the driver stopped it and reset the core), -EIO (a DMA error,
  * or the driver did not know the job).
  */
-static int dev_wait(struct charsiu_device *dev, unsigned ms)
+static int dev_wait_prep(struct charsiu_device *dev, unsigned ms, unsigned prep, int *prepped)
 {
 	static long spin_us = -1;
 	rknpu_wait_out o;
 	int r;
 
+	if (prepped)
+		*prepped = 0;
 	if (!dev->pending)
 		return 0;
 	if (spin_us < 0)
@@ -199,7 +251,7 @@ static int dev_wait(struct charsiu_device *dev, unsigned ms)
 		charsiu_spin_tries++;
 		for (;;) {
 			dev->polls++;
-			r = wait_once(dev, 0, RKNPU_WAIT_POLL, &o);
+			r = wait_once(dev, 0, RKNPU_WAIT_POLL, 0, &o);
 			if (r || o.result != RKNPU_JOB_RUNNING) {
 				el = rkx_now_us() - t0;
 				charsiu_spin_won++;
@@ -215,7 +267,12 @@ static int dev_wait(struct charsiu_device *dev, unsigned ms)
 			}
 		}
 	}
-	r = wait_once(dev, ms, 0, &o);
+	r = wait_once(dev, ms, 0, prep, &o);
+	if (!r && prep && (o.m7_flags & RKNPU_WAIT_OUT_PREPPED)) {
+		dev->prepped_by_wait++;
+		if (prepped)
+			*prepped = 1;
+	}
 done:
 	dev->pending = 0;
 	if (r) {
@@ -251,6 +308,11 @@ done:
 		fprintf(stderr, "charsiu: rknpu job %llu: WAIT result %u\n", o.seqno, o.result);
 		return dev->last_err = -EIO;
 	}
+}
+
+static int dev_wait(struct charsiu_device *dev, unsigned ms)
+{
+	return dev_wait_prep(dev, ms, 0, NULL);
 }
 
 /* ------------------------------------------------------- open, close */
@@ -302,10 +364,21 @@ struct charsiu_device *charsiu_open(const char *path)
 	/* M6: an M4 driver leaves these 0, which is M4's model */
 	dev->mem_mode = info.m6_version ? info.mem_mode : RKNPU_MEM_BYPASS;
 	dev->cached = info.m6_version && info.bo_cached;
+	/* M7: an M6 driver leaves m7_version 0 and refuses the new flags */
+	dev->m7 = info.m6_version && info.m7_version >= RKNPU_M7_VERSION;
+	dev->fuse = dev->m7 && dev->cached && env_long("CHARSIU_RKNPU_FUSE", 1) != 0;
+	dev->ucache = dev->cached && env_long("CHARSIU_RKNPU_UCACHE", 0) != 0 && rkx_dc_usable();
 	pthread_mutex_init(&dev->lock, NULL);
 	pthread_mutex_lock(&open_lock);
 	dev->index = dev_count++;
 	pthread_mutex_unlock(&open_lock);
+	if (dev->index == 0 && env_long("CHARSIU_RKNPU_STATS", 0))
+		fprintf(stderr, "charsiu rknpu: %s driver; cache maintenance %s\n",
+			dev->m7 ? "M7" : info.m6_version ? "M6" : "M4",
+			!dev->cached ? "not needed (write-combined)" :
+			dev->ucache ? "in this process (DC by VA, CHARSIU_RKNPU_UCACHE)" :
+			dev->fuse ? "fused into SUBMIT and WAIT (CHARSIU_RKNPU_FUSE)" :
+			"one IOCTL a buffer (M6)");
 	/*
 	 * device.c burns the first buffer so that no stream sits at IOVA 0.
 	 * Physical addresses here are never 0 (DRAM starts at 0x40000000), and
@@ -334,6 +407,21 @@ void charsiu_close(struct charsiu_device *dev)
 			dev->mem_mode == RKNPU_MEM_IOMMU ? "iommu" : "bypass",
 			dev->cached ? "cached" : "write-combined", dev->preps, dev->finis,
 			dev->sync_us / 1e3, rkx_mem_report());
+	if (env_long("CHARSIU_RKNPU_STATS", 0))
+		fprintf(stderr, "charsiu rknpu dev %u timing: %lu SUBMITs %.1f us avg (driver %.1f), "
+			"%lu WAITs %.1f us avg, irq to dpc %.1f us, dpc to waiter %.1f us over %lu "
+			"that slept, %lu came after the dpc by %.1f us avg; %lu FINIs deferred "
+			"(%lu by SUBMIT, %lu list full), %lu PREPs by WAIT, %lu done here in %.1f ms\n",
+			dev->index, dev->sub_n, dev->sub_n ? (double)dev->sub_wall_us / dev->sub_n : 0.0,
+			dev->sub_n ? (double)dev->sub_drv_us / dev->sub_n : 0.0,
+			dev->wait_n, dev->wait_n ? (double)dev->wait_wall_us / dev->wait_n : 0.0,
+			dev->wait_timed ? (double)dev->irq_dpc_us / dev->wait_timed : 0.0,
+			dev->wait_slept ? (double)dev->dpc_wake_us / dev->wait_slept : 0.0,
+			dev->wait_slept, dev->wait_timed - dev->wait_slept,
+			dev->wait_timed > dev->wait_slept ?
+				(double)dev->late_us / (dev->wait_timed - dev->wait_slept) : 0.0,
+			dev->deferred, dev->cleaned_by_submit, dev->defer_full, dev->prepped_by_wait,
+			dev->uc_ops, dev->uc_us / 1e3);
 	/* closing the handle frees every buffer it still holds (NpuM3FileCleanup) */
 	rkx_close(dev->x);
 	pthread_mutex_destroy(&dev->lock);
@@ -407,6 +495,12 @@ void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo)
 		return;
 	size = (unsigned)((bo->size + 4095) & ~(size_t)4095);
 	pthread_mutex_lock(&dev->lock);
+	/* M7: a deferred FINI_BO of a buffer about to go would fail the SUBMIT */
+	for (unsigned i = 0; i < dev->ndefer; i++)
+		if (dev->defer[i] == bo->handle) {
+			dev->defer[i] = dev->defer[--dev->ndefer];
+			break;
+		}
 	/* the device's last job may still be reading it */
 	(void)dev_wait(dev, DEV_WAIT_MS);
 	memset(&fh, 0, sizeof(fh));
@@ -442,12 +536,25 @@ static int bo_sync(struct charsiu_device *dev, unsigned code, const struct chars
 	return r;
 }
 
+/* M7, CHARSIU_RKNPU_UCACHE: the maintenance by VA in this process */
+static void uc_sync(struct charsiu_device *dev, const struct charsiu_bo *bo, int prep)
+{
+	unsigned long long t0 = rkx_now_us();
+
+	if (prep)
+		rkx_dc_clean_inval(bo->map, bo->size);
+	else
+		rkx_dc_clean(bo->map, bo->size);
+	dev->uc_ops++;
+	dev->uc_us += rkx_now_us() - t0;
+}
+
 int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo, int64_t timeout_ns)
 {
 	long long ms = timeout_ns / 1000000;
-	int r;
+	int r, prepped = 0;
+	int want = dev && dev->cached && bo && bo->handle;
 
-	(void)bo;
 	if (!dev)
 		return -EINVAL;
 	/* a WAIT that times out stops the job, so never hand it a short one */
@@ -456,21 +563,68 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo, int64_t t
 	if (ms > RKNPU_WAIT_MAX_MS)
 		ms = RKNPU_WAIT_MAX_MS;
 	pthread_mutex_lock(&dev->lock);
-	r = dev_wait(dev, (unsigned)ms);
+	/* M7: the job's WAIT does this buffer's PREP_BO in the same IOCTL */
+	r = dev_wait_prep(dev, (unsigned)ms, want && dev->fuse && !dev->ucache ? bo->handle : 0,
+			  &prepped);
 	pthread_mutex_unlock(&dev->lock);
+	if (r || !want || prepped)
+		return r;
 	/* M6: what the NPU wrote, not what the CPU's caches still hold */
-	if (!r && dev->cached && bo && bo->handle)
-		r = bo_sync(dev, IOCTL_RKNPU_PREP_BO, bo);
-	return r;
+	if (dev->ucache && bo->map) {
+		uc_sync(dev, bo, 1);
+		return 0;
+	}
+	return bo_sync(dev, IOCTL_RKNPU_PREP_BO, bo);
 }
 
 int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo)
 {
+	unsigned i;
+
 	rkx_wmb();
+	if (!dev || !dev->cached || !bo || !bo->handle)
+		return 0;
+	if (dev->ucache && bo->map) {
+		uc_sync(dev, bo, 0);
+		return 0;
+	}
+	/*
+	 * M7: nothing but this device's next SUBMIT can make the NPU read this
+	 * buffer (the driver's address check takes this handle's buffers
+	 * only), so its clean can wait for that SUBMIT and ride on it.
+	 */
+	if (dev->fuse) {
+		pthread_mutex_lock(&dev->lock);
+		for (i = 0; i < dev->ndefer; i++)
+			if (dev->defer[i] == bo->handle)
+				break;
+		if (i < dev->ndefer || dev->ndefer < RKNPU_M7_MAX_CLEAN) {
+			if (i == dev->ndefer)
+				dev->defer[dev->ndefer++] = bo->handle;
+			dev->deferred++;
+			pthread_mutex_unlock(&dev->lock);
+			return 0;
+		}
+		dev->defer_full++;
+		pthread_mutex_unlock(&dev->lock);
+	}
 	/* M6: what the CPU wrote reaches memory before the NPU reads it */
-	if (dev && dev->cached && bo && bo->handle)
-		return bo_sync(dev, IOCTL_RKNPU_FINI_BO, bo);
-	return 0;
+	return bo_sync(dev, IOCTL_RKNPU_FINI_BO, bo);
+}
+
+/* M7: the deferred FINI_BOs one IOCTL each, when a SUBMIT could not carry
+ * them. Lock held. */
+static void defer_flush(struct charsiu_device *dev)
+{
+	struct charsiu_bo b;
+	unsigned i;
+
+	memset(&b, 0, sizeof(b));
+	for (i = 0; i < dev->ndefer; i++) {
+		b.handle = dev->defer[i];
+		(void)bo_sync(dev, IOCTL_RKNPU_FINI_BO, &b);
+	}
+	dev->ndefer = 0;
 }
 
 /* -------------------------------------------------------- submission */
@@ -495,18 +649,32 @@ static unsigned crumb_flags(struct charsiu_device *dev)
  * One SUBMIT of in->task_count tasks, on whichever core is free, the
  * device's preferred one first. Lock held, nothing pending.
  */
-static int submit_chunk(struct charsiu_device *dev, rknpu_submit_in *in)
+static int submit_chunk(struct charsiu_device *dev, rknpu_submit_m7_in *m7)
 {
-	unsigned long long t0 = 0;
-	unsigned try = 0, got = 0;
+	rknpu_submit_in *in = &m7->base;
+	unsigned long long t0 = 0, ts;
+	unsigned try = 0, got = 0, inlen = sizeof(*in);
 	rknpu_submit_out out;
 	int r;
 
 	in->flags = RKNPU_SUBMIT_COPY | crumb_flags(dev);
+	/* M7: the FINI_BOs deferred to this SUBMIT */
+	if (dev->ndefer) {
+		in->flags |= RKNPU_SUBMIT_CLEAN;
+		m7->clean_count = dev->ndefer;
+		memcpy(m7->clean, dev->defer, dev->ndefer * sizeof(m7->clean[0]));
+		inlen = sizeof(*m7);
+	}
 	for (;;) {
 		in->core = (dev->index + try) % RKNPU_NUM_CORES;
 		memset(&out, 0, sizeof(out));
-		r = rkx_ioctl(dev->x, IOCTL_RKNPU_SUBMIT, in, sizeof(*in), &out, sizeof(out), &got);
+		ts = rkx_now_us();
+		r = rkx_ioctl(dev->x, IOCTL_RKNPU_SUBMIT, m7, inlen, &out, sizeof(out), &got);
+		if (!r) {
+			dev->sub_n++;
+			dev->sub_wall_us += rkx_now_us() - ts;
+			dev->sub_drv_us += out.drv_us;
+		}
 		if (r != -EBUSY)
 			break;
 		/* the other handle's job on that core; try the other core, then wait */
@@ -518,6 +686,15 @@ static int submit_chunk(struct charsiu_device *dev, rknpu_submit_in *in)
 		else if (rkx_now_us() - t0 > DEV_BUSY_MS * 1000ull)
 			break;
 		rkx_pause(try < 64 ? 0 : 50);
+	}
+	if (in->flags & RKNPU_SUBMIT_CLEAN) {
+		if (!r)
+			dev->cleaned_by_submit += dev->ndefer;
+		else
+			defer_flush(dev);       /* do not carry them into another failure */
+		dev->ndefer = 0;
+		in->flags &= ~RKNPU_SUBMIT_CLEAN;
+		m7->clean_count = 0;
 	}
 	if (r) {
 		if (r == -EACCES)
@@ -547,7 +724,8 @@ static unsigned stream_bytes(unsigned count)
 int charsiu_submit_jobs(struct charsiu_device *dev,
 			const struct charsiu_joblist *jobs, unsigned job_count)
 {
-	rknpu_submit_in in;
+	rknpu_submit_m7_in m7;
+	rknpu_submit_in *const inp = &m7.base;
 	unsigned i, t, total = 0, bytes = 0;
 	int r = 0;
 
@@ -564,7 +742,7 @@ int charsiu_submit_jobs(struct charsiu_device *dev,
 	r = dev_wait(dev, DEV_WAIT_MS);
 	if (r)
 		goto out;
-	memset(&in, 0, sizeof(in));
+	memset(&m7, 0, sizeof(m7));
 	for (i = 0; i < job_count; i++) {
 		for (t = 0; t < jobs[i].task_count; t++) {
 			const struct charsiu_task *k = &jobs[i].tasks[t];
@@ -578,22 +756,22 @@ int charsiu_submit_jobs(struct charsiu_device *dev,
 				r = -E2BIG;
 				goto out;
 			}
-			if (in.task_count == RKNPU_MAX_TASKS || bytes + b > RKNPU_COPY_ARENA_BYTES) {
-				r = submit_chunk(dev, &in);
+			if (inp->task_count == RKNPU_MAX_TASKS || bytes + b > RKNPU_COPY_ARENA_BYTES) {
+				r = submit_chunk(dev, &m7);
 				if (!r)
 					r = dev_wait(dev, DEV_WAIT_MS);
 				if (r)
 					goto out;
-				memset(&in, 0, sizeof(in));
+				memset(&m7, 0, sizeof(m7));
 				bytes = 0;
 			}
-			in.tasks[in.task_count].regcmd = k->regcmd;
-			in.tasks[in.task_count].regcmd_count = k->regcmd_count;
-			in.task_count++;
+			inp->tasks[inp->task_count].regcmd = k->regcmd;
+			inp->tasks[inp->task_count].regcmd_count = k->regcmd_count;
+			inp->task_count++;
 			bytes += b;
 		}
 	}
-	r = submit_chunk(dev, &in);
+	r = submit_chunk(dev, &m7);
 out:
 	pthread_mutex_unlock(&dev->lock);
 	return r;

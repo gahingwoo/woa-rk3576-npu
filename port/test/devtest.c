@@ -13,7 +13,11 @@
  *   - a stream with an address outside the device's buffers, one that
  *     writes the PC block and one that writes a register charsiu never
  *     writes are each refused, and the device keeps working afterwards;
- *   - a buffer of another device is outside this one's buffers.
+ *   - a buffer of another device is outside this one's buffers;
+ *   - M7: FINI_BO rides on the next SUBMIT and PREP_BO on the WAIT (the
+ *     model refuses a stream whose clean never arrived), or, with
+ *     CHARSIU_RKNPU_UCACHE=1 and RKNPU_FAKE_UCACHE=1, both happen in the
+ *     caller; RKNPU_FAKE_M6=1 is the M6 driver, one IOCTL each.
  *
  * Nothing computes; see xport_fake.c.
  *
@@ -38,6 +42,8 @@ void rkx_fake_counts(unsigned long long *submits, unsigned long long *busy,
 void rkx_fake_sync_counts(unsigned long long *preps, unsigned long long *finis,
 			  unsigned long long *unfinished);
 void rkx_fake_cbuf_counts(unsigned long long *overlaps, unsigned long long *waits);
+void rkx_fake_m7_counts(unsigned long long *cleans, unsigned long long *wait_preps,
+			unsigned long long *ufinis, unsigned long long *upreps);
 
 static int failures;
 
@@ -241,9 +247,29 @@ int main(void)
 	{
 		unsigned long long p0, f0, u0, p1, f1, u1;
 
+		unsigned long long cl, wp, uf, up;
+		int m6 = getenv("RKNPU_FAKE_M6") || getenv("RKNPU_FAKE_M4");
+		int uc = getenv("RKNPU_FAKE_UCACHE") && getenv("CHARSIU_RKNPU_UCACHE") &&
+			 atoi(getenv("CHARSIU_RKNPU_UCACHE"));
+		int fuse = !m6 && !uc && !(getenv("CHARSIU_RKNPU_FUSE") &&
+					   !atoi(getenv("CHARSIU_RKNPU_FUSE")));
+
 		rkx_fake_sync_counts(&p0, &f0, &u0);
-		CHECK(getenv("RKNPU_FAKE_M4") || (p0 > 0 && f0 > 0 && u0 == 0),
+		rkx_fake_m7_counts(&cl, &wp, &uf, &up);
+		CHECK(getenv("RKNPU_FAKE_M4") || (p0 + up > 0 && f0 + cl + uf > 0 && u0 == 0),
 		      "PREP_BO %llu, FINI_BO %llu, unflushed jobs %llu", p0, f0, u0);
+		/* M7: which path did the work */
+		if (fuse)
+			CHECK(cl > 0 && wp > 0 && wp <= p0 && uf == 0 && up == 0,
+			      "fused: %llu FINIs by SUBMIT, %llu PREPs by WAIT, %llu FINI_BO IOCTLs",
+			      cl, wp, f0);
+		else if (uc && !getenv("RKNPU_FAKE_M4"))
+			CHECK(uf > 0 && up > 0 && cl == 0 && wp == 0 && f0 == 0,
+			      "in the caller: %llu cleans, %llu invalidates (%llu, %llu by the driver)",
+			      uf, up, cl, wp);
+		else if (!getenv("RKNPU_FAKE_M4"))
+			CHECK(cl == 0 && wp == 0 && f0 > 0, "M6: %llu FINI_BO, %llu cleans by SUBMIT",
+			      f0, cl);
 		/* ... and a stream written after its FINI is caught by the model */
 		((uint64_t *)a.reg.map)[0] = ((uint64_t *)a.reg.map)[0];
 		charsiu_bo_prep(d0, &a.reg, 1000000000);

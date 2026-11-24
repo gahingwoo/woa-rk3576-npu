@@ -48,4 +48,15 @@ void rkx_wmb(void);
  * as a short static string ("" where the host has no such numbers). */
 const char *rkx_mem_report(void);
 
+/*
+ * M7, CHARSIU_RKNPU_UCACHE: data cache maintenance by VA from this process.
+ * rkx_dc_usable() is 1 when the CPU lets user mode execute DC CVAC and DC
+ * CIVAC (SCTLR_EL1.UCI), probed once; the other two are then the driver's
+ * FINI_BO and PREP_BO on [p, p + n), each ending with a DSB.
+ */
+#include <stddef.h>
+int rkx_dc_usable(void);
+void rkx_dc_clean(const void *p, size_t n);
+void rkx_dc_clean_inval(const void *p, size_t n);
+
 #endif /* RKNPU_XPORT_H */

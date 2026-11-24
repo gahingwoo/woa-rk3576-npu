@@ -283,7 +283,9 @@ typedef struct rknpu_info {
     unsigned int bo_cached;             /* 1: new buffers are cached (RKNPU_BO_CACHED) */
     unsigned int iova_kib;              /* NPU address space in use, guard pages included */
     unsigned int pt_pages;              /* page-table pages the driver holds (directory included) */
-    unsigned int reserved[4];
+    /* M7 (0 from an M6 driver) */
+    unsigned int m7_version;            /* RKNPU_M7_VERSION */
+    unsigned int reserved[3];
 } rknpu_info;
 
 /* ---- READ_REGS ---------------------------------------------------------- */
@@ -396,7 +398,7 @@ typedef struct rknpu_submit_in {
 typedef struct rknpu_submit_out {
     unsigned long long seqno;           /* for WAIT */
     unsigned int core;
-    unsigned int reserved;
+    unsigned int drv_us;                /* M7: time inside the driver's SUBMIT (0 from M6) */
 } rknpu_submit_out;
 
 /* WAIT, in. */
@@ -438,7 +440,10 @@ typedef struct rknpu_wait_out {
     unsigned int fault_addr;            /* M6, RKNPU_JOB_MMU_FAULT: the IOVA that faulted */
     unsigned int fault_status;          /* M6: the IOMMU INT_STATUS (1 page fault, 2 bus error)
                                          * in bits 0..7, the MMU STATUS in bits 8..31 */
-    unsigned int reserved[3];
+    /* M7 (0 from an M6 driver) */
+    unsigned int irq_dpc_us;            /* the job's last interrupt to its DPC setting Done */
+    unsigned int dpc_wake_us;           /* Done set to this WAIT running again (see m7_flags) */
+    unsigned int m7_flags;              /* RKNPU_WAIT_OUT_* */
 } rknpu_wait_out;
 
 /* RESET, in. */
@@ -492,6 +497,59 @@ typedef struct rknpu_reset_out {
 #define RKNPU_CRUMB_MMU_FAULT   13      /* M6: WAIT found a job stopped by a fault; Value1 = IOVA,
                                          * Value2 = fault_status */
 
+/* ---- M7: fewer IOCTLs a call, and the driver's own clock ------------------ */
+/*
+ * No new function codes and no new layout for M6 callers. A decode call in
+ * charsiu was ten IOCTLs on M6 (two FINI_BO of the inputs, two SUBMIT, two
+ * WAIT, two PREP_BO of the outputs, two FINI_BO of the outputs); M7 lets it
+ * be four:
+ *
+ *   - SUBMIT with RKNPU_SUBMIT_CLEAN takes an rknpu_submit_m7_in (the M6
+ *     struct followed by up to RKNPU_M7_MAX_CLEAN handles) and does FINI_BO
+ *     on each of those buffers, whole, before it starts the job. A handle
+ *     that is not the caller's fails the SUBMIT (STATUS_INVALID_HANDLE) and
+ *     nothing starts. A buffer only reaches the NPU through a SUBMIT on its
+ *     own handle (the address check), so cleaning at the next SUBMIT is
+ *     never later than the NPU's first read of it.
+ *   - WAIT with RKNPU_WAIT_PREP takes an rknpu_wait_m7_in and, once the job
+ *     is no longer running, does PREP_BO on prep_handle, whole
+ *     (RKNPU_WAIT_OUT_PREPPED says it did).
+ *   - WAIT with RKNPU_WAIT_LEAN skips the diagnostic reads of PC VERSION and
+ *     the IOMMU status after a job that finished cleanly (version_after and
+ *     mmu_status are then 0).
+ *   - SUBMIT says how long it spent inside the driver (drv_us), and WAIT
+ *     the interrupt-to-DPC and DPC-to-waiter times (irq_dpc_us,
+ *     dpc_wake_us), so a caller can split its own IOCTL time into the
+ *     driver's and the operating system's.
+ *
+ * An M6 driver refuses the new flags with STATUS_INVALID_PARAMETER, so a
+ * caller uses them only when rknpu_info.m7_version says so.
+ */
+#define RKNPU_M7_VERSION        1       /* rknpu_info.m7_version */
+#define RKNPU_M7_MAX_CLEAN      32
+
+#define RKNPU_SUBMIT_CLEAN      0x00000004u /* M7: rknpu_submit_m7_in, FINI_BO the listed buffers first */
+#define RKNPU_WAIT_PREP         0x00000002u /* M7: rknpu_wait_m7_in, PREP_BO prep_handle after the job */
+#define RKNPU_WAIT_LEAN         0x00000004u /* M7: no diagnostic register reads after a clean finish */
+
+/* rknpu_wait_out.m7_flags */
+#define RKNPU_WAIT_OUT_SLEPT    0x00000001u /* WAIT blocked on the job (dpc_wake_us is a wake-up);
+                                             * otherwise it arrived after the DPC (a late caller) */
+#define RKNPU_WAIT_OUT_PREPPED  0x00000002u /* RKNPU_WAIT_PREP was done */
+
+typedef struct rknpu_submit_m7_in {
+    rknpu_submit_in base;
+    unsigned int clean_count;           /* 0..RKNPU_M7_MAX_CLEAN */
+    unsigned int reserved;
+    unsigned int clean[RKNPU_M7_MAX_CLEAN];
+} rknpu_submit_m7_in;
+
+typedef struct rknpu_wait_m7_in {
+    rknpu_wait_in base;
+    unsigned int prep_handle;           /* RKNPU_WAIT_PREP: a buffer of this handle */
+    unsigned int reserved;
+} rknpu_wait_m7_in;
+
 #pragma pack(pop)
 
 /*
@@ -537,5 +595,7 @@ RKNPU_ASSERT_SIZE(rknpu_wait_in, 16);
 RKNPU_ASSERT_SIZE(rknpu_wait_out, 80);
 RKNPU_ASSERT_SIZE(rknpu_reset_in, 8);
 RKNPU_ASSERT_SIZE(rknpu_reset_out, 32);
+RKNPU_ASSERT_SIZE(rknpu_submit_m7_in, 664);
+RKNPU_ASSERT_SIZE(rknpu_wait_m7_in, 24);
 
 #endif /* RKNPU_IOCTL_H */
