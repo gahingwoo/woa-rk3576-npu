@@ -25,6 +25,15 @@
  *                        hardware write it" checks pass and what follows runs
  *   RKNPU_FAKE_REGS      a file: every (block, register) any stream wrote
  *   RKNPU_FAKE_REPORT    1: the totals at exit, on stderr
+ *   RKNPU_FAKE_M4        1: answer as the M4 driver (bypass, write-combined,
+ *                        no PREP_BO / FINI_BO); default the M6 driver in
+ *                        IOMMU mode with cached buffers
+ *
+ * M6: a cached buffer counts the PREP_BO and FINI_BO it gets, and SUBMIT
+ * refuses (-EIO, logged) a job whose stream buffer was written through its
+ * mapping and never FINIed, which is the bug a cached buffer turns into
+ * stale data on the board. "Written" is approximated: a buffer is dirty from
+ * MAP_BO and from every PREP_BO until its next FINI_BO.
  *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
@@ -49,6 +58,7 @@ struct fbo {
 	void *mem;
 	const struct rkx *owner;
 	int mapped;
+	int dirty;              /* M6: CPU access since the last FINI_BO */
 };
 
 struct rkx {
@@ -75,6 +85,8 @@ static unsigned char arena[RKNPU_COPY_ARENA_BYTES];
 /* statistics */
 static unsigned long long n_submit, n_tasks, n_entries, max_tasks, max_entries, max_arena;
 static unsigned long long n_busy, n_refused, n_wait, n_poll;
+static unsigned long long n_prep, n_fini, n_unfini;
+static int m4;
 
 /* the scan: (target << 16 | reg) -> count, for values inside a buffer */
 #define SCAN_SLOTS 4096
@@ -100,6 +112,7 @@ static void init(void)
 	scan_path = getenv("RKNPU_FAKE_SCAN");
 	scribble = getenv("RKNPU_FAKE_SCRIBBLE") != NULL;
 	regs_path = getenv("RKNPU_FAKE_REGS");
+	m4 = getenv("RKNPU_FAKE_M4") != NULL;
 	atexit(report);
 }
 
@@ -203,6 +216,12 @@ static int do_submit(struct rkx *x, const rknpu_submit_in *in, rknpu_submit_out 
 
 		if (!b)
 			return -EINVAL;
+		if (!m4 && b->dirty) {
+			n_unfini++;
+			fprintf(stderr, "rknpu-fake: stream 0x%08x is in a cached buffer written "
+				"since its last FINI_BO\n", in->tasks[i].regcmd);
+			return -EIO;
+		}
 		if (at + fetched * 8 > sizeof(arena))
 			return -E2BIG;
 		src = (const uint64_t *)((unsigned char *)b->mem + (in->tasks[i].regcmd - b->addr));
@@ -363,7 +382,12 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 		i->m4_version = RKNPU_M4_VERSION;
 		i->copy_arena_bytes = RKNPU_COPY_ARENA_BYTES;
 		i->bo_max_kib = RKNPU_BO_MAX_SIZE >> 10;
-		i->bo_max_total_kib = RKNPU_BO_MAX_TOTAL >> 10;
+		i->bo_max_total_kib = (m4 ? RKNPU_BO_MAX_TOTAL : RKNPU_BO_MAX_TOTAL_IOMMU) >> 10;
+		if (!m4) {
+			i->m6_version = RKNPU_M6_VERSION;
+			i->mem_mode = RKNPU_MEM_IOMMU;
+			i->bo_cached = 1;
+		}
 		*got = sizeof(*i);
 		break;
 	}
@@ -403,6 +427,7 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 		if (size > bo_max_seen)
 			bo_max_seen = size;
 		req.size = size;
+		req.flags = m4 ? 0 : RKNPU_BO_CACHED;
 		req.handle = bos[nbo - 1].handle;
 		req.dma_address = bos[nbo - 1].addr;
 		memcpy(out, &req, sizeof(req));
@@ -419,6 +444,7 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 		if (!b) { r = -EINVAL; break; }
 		if (b->mapped) { r = -EIO; break; }
 		b->mapped = 1;
+		b->dirty = !m4;
 		m.user_va = (unsigned long long)(uintptr_t)b->mem;
 		memcpy(out, &m, sizeof(m));
 		*got = sizeof(m);
@@ -441,6 +467,24 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 		total -= b->size;
 		free(b->mem);
 		*b = bos[--nbo];
+		break;
+	}
+	case IOCTL_RKNPU_PREP_BO:
+	case IOCTL_RKNPU_FINI_BO: {
+		rknpu_bo_sync bs;
+		struct fbo *b;
+
+		if (m4 || inlen < sizeof(bs)) { r = -EINVAL; break; }
+		memcpy(&bs, in, sizeof(bs));
+		b = find(x, bs.handle);
+		if (!b || bs.flags || (unsigned long long)bs.offset + bs.length > b->size) { r = -EINVAL; break; }
+		if (code == IOCTL_RKNPU_PREP_BO) {
+			n_prep++;
+			b->dirty = 1;
+		} else {
+			n_fini++;
+			b->dirty = 0;
+		}
 		break;
 	}
 	case IOCTL_RKNPU_SUBMIT:
@@ -491,8 +535,24 @@ void rkx_wmb(void)
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
+const char *rkx_mem_report(void)
+{
+	return "no memory counters on the host";
+}
+
 void charsiu_port_crash_handler_install(void)
 {
+}
+
+/* for port/test/devtest.c (M6) */
+void rkx_fake_sync_counts(unsigned long long *preps, unsigned long long *finis,
+			  unsigned long long *unfinished)
+{
+	pthread_mutex_lock(&lk);
+	*preps = n_prep;
+	*finis = n_fini;
+	*unfinished = n_unfini;
+	pthread_mutex_unlock(&lk);
 }
 
 /* for port/test/devtest.c */
@@ -547,8 +607,9 @@ static void report(void)
 		fprintf(stderr, "rknpu-fake: %llu SUBMITs, %llu tasks (max %llu a SUBMIT), "
 			"%llu entries (max %llu a stream), arena peak %llu bytes, %llu busy, "
 			"%llu refused, %llu waits (%llu polled RUNNING); buffers peak %llu "
-			"(%.1f MiB), largest %.1f MiB\n",
+			"(%.1f MiB), largest %.1f MiB; %llu PREP_BO, %llu FINI_BO, %llu jobs "
+			"from unflushed streams\n",
 			n_submit, n_tasks, max_tasks, n_entries, max_entries, max_arena, n_busy,
 			n_refused, n_wait, n_poll, nbo_peak, total_peak / 1048576.0,
-			bo_max_seen / 1048576.0);
+			bo_max_seen / 1048576.0, n_prep, n_fini, n_unfini);
 }

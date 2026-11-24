@@ -35,6 +35,8 @@
 /* xport_fake.c */
 void rkx_fake_counts(unsigned long long *submits, unsigned long long *busy,
 		     unsigned long long *refused, unsigned long long *max_tasks);
+void rkx_fake_sync_counts(unsigned long long *preps, unsigned long long *finis,
+			  unsigned long long *unfinished);
 
 static int failures;
 
@@ -110,10 +112,11 @@ static int submit_n(struct charsiu_device *dev, struct mm *m, unsigned ntasks, u
 	return r;
 }
 
-/* entry i of the first stream, rewritten */
-static void poke(struct mm *m, unsigned i, uint64_t e)
+/* entry i of the first stream, rewritten, and (M6) flushed as charsiu does */
+static void poke(struct charsiu_device *dev, struct mm *m, unsigned i, uint64_t e)
 {
 	((uint64_t *)m->reg.map)[i] = e;
+	charsiu_bo_fini(dev, &m->reg);
 }
 
 static unsigned find_reg(struct mm *m, unsigned reg)
@@ -186,24 +189,41 @@ int main(void)
 	i = find_reg(&a, RKNPU_RC_DPU_DST_ADDR);
 	saved = ((uint64_t *)a.reg.map)[i];
 	CHECK(i, "the stream has a DPU destination");
-	poke(&a, i, RKNPU_RC_ENTRY(RKNPU_RC_DPU, RKNPU_RC_DPU_DST_ADDR, 0xF0000000u));
+	poke(d0, &a, i, RKNPU_RC_ENTRY(RKNPU_RC_DPU, RKNPU_RC_DPU_DST_ADDR, 0xF0000000u));
 	rkx_fake_counts(&s0, &busy0, &ref0, &maxt);
 	CHECK(submit_n(d0, &a, 1, 4096, 0) == -EACCES, "output outside every buffer is refused");
 	/* ... another device's buffer ... */
-	poke(&a, i, RKNPU_RC_ENTRY(RKNPU_RC_DPU, RKNPU_RC_DPU_DST_ADDR, (uint32_t)b.out.dma_address));
+	poke(d0, &a, i, RKNPU_RC_ENTRY(RKNPU_RC_DPU, RKNPU_RC_DPU_DST_ADDR, (uint32_t)b.out.dma_address));
 	CHECK(submit_n(d0, &a, 1, 4096, 0) == -EACCES, "output in device 1's buffer is refused");
 	/* ... the PC block ... */
-	poke(&a, i, RKNPU_RC_ENTRY(0x0101u, 0x0010u, (uint32_t)a.reg.dma_address));
+	poke(d0, &a, i, RKNPU_RC_ENTRY(0x0101u, 0x0010u, (uint32_t)a.reg.dma_address));
 	CHECK(submit_n(d0, &a, 1, 4096, 0) == -EACCES, "a PC_BASE_ADDRESS write is refused");
 	/* ... and the IOMMU, a register charsiu never writes */
-	poke(&a, i, RKNPU_RC_ENTRY(0x0201u, 0x2000u, 0));
+	poke(d0, &a, i, RKNPU_RC_ENTRY(0x0201u, 0x2000u, 0));
 	CHECK(submit_n(d0, &a, 1, 4096, 0) == -EACCES, "an IOMMU register write is refused");
 	rkx_fake_counts(&s1, &busy1, &ref1, &maxt);
 	CHECK(ref1 - ref0 == 4 && s1 == s0, "4 refused, none started (%llu, %llu)", ref1 - ref0, s1 - s0);
 	/* and the device still works */
-	poke(&a, i, saved);
+	poke(d0, &a, i, saved);
 	CHECK(submit_n(d0, &a, 2, 4096, 0) == 0, "after the refusals");
 	CHECK(charsiu_bo_prep(d0, &a.out, 1000000000) == 0, "after the refusals, wait");
+
+	/* M6: cached buffers. charsiu's own prep/fini reached the driver ... */
+	{
+		unsigned long long p0, f0, u0, p1, f1, u1;
+
+		rkx_fake_sync_counts(&p0, &f0, &u0);
+		CHECK(getenv("RKNPU_FAKE_M4") || (p0 > 0 && f0 > 0 && u0 == 0),
+		      "PREP_BO %llu, FINI_BO %llu, unflushed jobs %llu", p0, f0, u0);
+		/* ... and a stream written after its FINI is caught by the model */
+		((uint64_t *)a.reg.map)[0] = ((uint64_t *)a.reg.map)[0];
+		charsiu_bo_prep(d0, &a.reg, 1000000000);
+		r = submit_n(d0, &a, 1, 4096, 0);
+		rkx_fake_sync_counts(&p1, &f1, &u1);
+		CHECK(getenv("RKNPU_FAKE_M4") ? r == 0 : (r == -EIO && u1 == u0 + 1),
+		      "a stream not flushed since the CPU touched it: %d", r);
+		charsiu_bo_prep(d0, &a.out, 1000000000);
+	}
 
 	mm_free(d0, &a);
 	mm_free(d1, &b);

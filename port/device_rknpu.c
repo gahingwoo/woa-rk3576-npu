@@ -12,13 +12,18 @@
  *   its jobs run in order, on whichever  jobs run in order: a job waits for
  *   core is free                         the previous one of the same device,
  *                                        then takes whichever core is free
- *   CREATE_BO + mmap, IOVA per fd        CREATE_BO + MAP_BO; the address is
- *                                        physical (IOMMU bypass), below 4 GiB
+ *   CREATE_BO + mmap, IOVA per fd        CREATE_BO + MAP_BO; M6: the address
+ *                                        is an IOVA in the driver's IOMMU
+ *                                        table, shared by all handles (M4,
+ *                                        bypass: physical, below 4 GiB)
  *   PREP_BO waits for the BO's fences,   PREP waits for the device's last job
- *   then invalidates the CPU cache       (a superset of the BO's fences); the
- *                                        mapping is write-combined, so there
- *                                        is no cache to invalidate
- *   FINI_BO cleans the CPU cache         FINI drains the write-combine buffer
+ *   then invalidates the CPU cache       (a superset of the BO's fences), then
+ *                                        M6 PREP_BO cleans and invalidates a
+ *                                        cached buffer; a write-combined one
+ *                                        has no cache to invalidate
+ *   FINI_BO cleans the CPU cache         M6 FINI_BO cleans a cached buffer; a
+ *                                        write-combined one drains the WC
+ *                                        buffer, as M4
  *   SUBMIT: N jobs of tasks, queued      the tasks of all N jobs, in order,
  *                                        as SUBMITs of at most RKNPU_MAX_TASKS
  *                                        tasks and RKNPU_COPY_ARENA_BYTES of
@@ -33,13 +38,19 @@
  * is priced.
  *
  * Environment (all optional):
- *   CHARSIU_NPU_SPIN_US   poll this long before blocking in PREP (default
- *                         200, as device.c); 0 blocks at once
+ *   CHARSIU_NPU_SPIN_US   poll this long before blocking in PREP. Default 0
+ *                         here (device.c: 200): each poll is an IOCTL, and the
+ *                         M4 board run won 48 of 6484 polls (1%) while
+ *                         spending 206 us of a CPU on each wait. A blocking
+ *                         WAIT is woken by the job's interrupt (ISR, DPC,
+ *                         event), so 0 is interrupt-driven completion
  *   CHARSIU_RKNPU_CRUMBS  the driver's registry breadcrumbs: "all" on every
  *                         SUBMIT, "off" never; by default the first 16
  *                         SUBMITs of a device and every 4096th (each one is
  *                         a registry flush, which costs milliseconds)
- *   CHARSIU_RKNPU_STATS   1: one line of counters per device at close
+ *   CHARSIU_RKNPU_STATS   1: one line of counters per device at close, and
+ *                         (M6) the cache maintenance and the process's page
+ *                         faults and peak working set
  *   CHARSIU_ACCEL         the device path (default \\.\RKNPU)
  *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
@@ -81,6 +92,12 @@ struct charsiu_device {
 	unsigned long timeouts, dma_errors, refused;
 	unsigned long bos, bo_bytes, bo_peak, bo_bytes_peak;
 	unsigned long long hw_us, wait_us;
+
+	/* M6 */
+	int cached;                     /* the driver's buffers are cached: PREP/FINI do work */
+	unsigned mem_mode;              /* RKNPU_MEM_*, from GET_INFO */
+	unsigned long preps, finis;
+	unsigned long long sync_us;
 };
 
 static unsigned dev_count;              /* opened so far, under no lock: open is single-threaded */
@@ -173,7 +190,7 @@ static int dev_wait(struct charsiu_device *dev, unsigned ms)
 	if (!dev->pending)
 		return 0;
 	if (spin_us < 0)
-		spin_us = env_long("CHARSIU_NPU_SPIN_US", 200);
+		spin_us = env_long("CHARSIU_NPU_SPIN_US", 0);
 
 	dev->waits++;
 	if (spin_us > 0) {
@@ -218,6 +235,12 @@ done:
 			o.seqno, o.core, ms, o.tasks_done, o.task_count, o.raw_status,
 			o.task_status, o.reset_status);
 		return dev->last_err = -ETIMEDOUT;
+	case RKNPU_JOB_MMU_FAULT:
+		dev->dma_errors++;
+		fprintf(stderr, "charsiu: rknpu job %llu on core %u IOMMU FAULT at NPU address 0x%08x "
+			"(status 0x%08x): %u of %u tasks; the core was reset\n", o.seqno, o.core,
+			o.fault_addr, o.fault_status, o.tasks_done, o.task_count);
+		return dev->last_err = -EIO;
 	case RKNPU_JOB_DMA_ERROR:
 		dev->dma_errors++;
 		fprintf(stderr, "charsiu: rknpu job %llu on core %u DMA ERROR: raw 0x%08x, "
@@ -276,14 +299,18 @@ struct charsiu_device *charsiu_open(const char *path)
 		return NULL;
 	}
 	dev->x = x;
+	/* M6: an M4 driver leaves these 0, which is M4's model */
+	dev->mem_mode = info.m6_version ? info.mem_mode : RKNPU_MEM_BYPASS;
+	dev->cached = info.m6_version && info.bo_cached;
 	pthread_mutex_init(&dev->lock, NULL);
 	pthread_mutex_lock(&open_lock);
 	dev->index = dev_count++;
 	pthread_mutex_unlock(&open_lock);
 	/*
 	 * device.c burns the first buffer so that no stream sits at IOVA 0.
-	 * Physical addresses here are never 0 (DRAM starts at 0x40000000), so
-	 * there is nothing to burn.
+	 * Physical addresses here are never 0 (DRAM starts at 0x40000000), and
+	 * the M6 driver hands out IOVAs from 1 MiB up, so there is nothing to
+	 * burn.
 	 */
 	return dev;
 }
@@ -299,11 +326,14 @@ void charsiu_close(struct charsiu_device *dev)
 		fprintf(stderr, "charsiu rknpu dev %u: %lu submits as %lu chunks of %lu tasks, "
 			"%lu waits (%lu polls, %lu won), %lu busy retries, %lu timeouts, "
 			"%lu dma errors, %lu refused; %lu BOs now, peak %lu BOs / %.1f MiB; "
-			"NPU %.1f ms, waited %.1f ms\n",
+			"NPU %.1f ms, waited %.1f ms; %s, %s, %lu preps + %lu finis in %.1f ms; %s\n",
 			dev->index, dev->submits, dev->chunks, dev->tasks, dev->waits,
 			dev->polls, dev->poll_won, dev->busy, dev->timeouts, dev->dma_errors,
 			dev->refused, dev->bos, dev->bo_peak, dev->bo_bytes_peak / 1048576.0,
-			dev->hw_us / 1e3, dev->wait_us / 1e3);
+			dev->hw_us / 1e3, dev->wait_us / 1e3,
+			dev->mem_mode == RKNPU_MEM_IOMMU ? "iommu" : "bypass",
+			dev->cached ? "cached" : "write-combined", dev->preps, dev->finis,
+			dev->sync_us / 1e3, rkx_mem_report());
 	/* closing the handle frees every buffer it still holds (NpuM3FileCleanup) */
 	rkx_close(dev->x);
 	pthread_mutex_destroy(&dev->lock);
@@ -358,7 +388,9 @@ out:
 	if (r)
 		fprintf(stderr, "charsiu: rknpu buffer of %zu bytes failed (%d) with %lu buffers, "
 			"%.1f MiB held%s\n", size, r, dev->bos, dev->bo_bytes / 1048576.0,
-			r == -ENOMEM ? ": no contiguous memory below 4 GiB" :
+			r == -ENOMEM ? (dev->mem_mode == RKNPU_MEM_IOMMU ?
+					": no memory or no NPU address space" :
+					": no contiguous memory below 4 GiB") :
 			r == -ENOSPC ? ": the driver's total is reached" : "");
 	return r;
 }
@@ -387,6 +419,29 @@ void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo)
 	bo->handle = 0;
 }
 
+/* M6: PREP_BO or FINI_BO on the whole buffer. No lock: the driver looks the
+ * buffer up under its own, and it takes no job state. */
+static int bo_sync(struct charsiu_device *dev, unsigned code, const struct charsiu_bo *bo)
+{
+	rknpu_bo_sync bs;
+	unsigned long long t0 = rkx_now_us();
+	unsigned got = 0;
+	int r;
+
+	memset(&bs, 0, sizeof(bs));
+	bs.handle = bo->handle;
+	r = rkx_ioctl(dev->x, code, &bs, sizeof(bs), NULL, 0, &got);
+	if (code == IOCTL_RKNPU_PREP_BO)
+		dev->preps++;
+	else
+		dev->finis++;
+	dev->sync_us += rkx_now_us() - t0;
+	if (r)
+		fprintf(stderr, "charsiu: rknpu %s of buffer %u failed (%d)\n",
+			code == IOCTL_RKNPU_PREP_BO ? "PREP_BO" : "FINI_BO", bo->handle, r);
+	return r;
+}
+
 int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo, int64_t timeout_ns)
 {
 	long long ms = timeout_ns / 1000000;
@@ -403,14 +458,18 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo, int64_t t
 	pthread_mutex_lock(&dev->lock);
 	r = dev_wait(dev, (unsigned)ms);
 	pthread_mutex_unlock(&dev->lock);
+	/* M6: what the NPU wrote, not what the CPU's caches still hold */
+	if (!r && dev->cached && bo && bo->handle)
+		r = bo_sync(dev, IOCTL_RKNPU_PREP_BO, bo);
 	return r;
 }
 
 int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo)
 {
-	(void)dev;
-	(void)bo;
 	rkx_wmb();
+	/* M6: what the CPU wrote reaches memory before the NPU reads it */
+	if (dev && dev->cached && bo && bo->handle)
+		return bo_sync(dev, IOCTL_RKNPU_FINI_BO, bo);
 	return 0;
 }
 

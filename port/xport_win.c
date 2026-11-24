@@ -6,10 +6,13 @@
  */
 
 #define WIN32_LEAN_AND_MEAN
+#define PSAPI_VERSION 2         /* GetProcessMemoryInfo is kernel32's K32 export */
 #include <windows.h>
+#include <psapi.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "rknpu_ioctl.h"
 #include "rknpu_xport.h"
@@ -114,4 +117,24 @@ void rkx_wmb(void)
 	/* DSB SY, not MemoryBarrier()'s DMB: the write-combine buffer is drained
 	 * to memory, which the NPU reads without snooping, before the SUBMIT */
 	__asm__ __volatile__("dsb sy" ::: "memory");
+}
+
+/*
+ * M6: the M4 board run was 4x slower than the CPU arm in decode with only
+ * 7% of the wall in the NPU path; paging the model file back in from the
+ * USB stick under memory pressure is one candidate this line can confirm
+ * or rule out (PageFaultCount counts soft faults too, so compare arms).
+ */
+const char *rkx_mem_report(void)
+{
+	static char buf[96];
+	PROCESS_MEMORY_COUNTERS pmc;
+
+	memset(&pmc, 0, sizeof(pmc));
+	pmc.cb = sizeof(pmc);
+	if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+		return "no memory counters";
+	snprintf(buf, sizeof(buf), "%lu page faults, peak working set %.0f MiB",
+		 (unsigned long)pmc.PageFaultCount, pmc.PeakWorkingSetSize / 1048576.0);
+	return buf;
 }

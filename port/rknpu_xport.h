@@ -44,4 +44,8 @@ unsigned long long rkx_now_us(void);
 /* Every write this thread made to a write-combined mapping is out of the CPU. */
 void rkx_wmb(void);
 
+/* M6, for the stats line: the process's page faults and peak working set,
+ * as a short static string ("" where the host has no such numbers). */
+const char *rkx_mem_report(void);
+
 #endif /* RKNPU_XPORT_H */
