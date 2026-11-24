@@ -81,8 +81,8 @@
 
 #define RKNPU_FN_CREATE_BO      0x810   /* DRM_ROCKET_CREATE_BO, no mmap */
 #define RKNPU_FN_FREE_BO        0x811   /* DRM_IOCTL_GEM_CLOSE */
-#define RKNPU_FN_PREP_BO        0x812   /* RESERVED (M5): DRM_ROCKET_PREP_BO, cached buffers */
-#define RKNPU_FN_FINI_BO        0x813   /* RESERVED (M5): DRM_ROCKET_FINI_BO */
+#define RKNPU_FN_PREP_BO        0x812   /* M6: DRM_ROCKET_PREP_BO, cached buffers (see M6) */
+#define RKNPU_FN_FINI_BO        0x813   /* M6: DRM_ROCKET_FINI_BO */
 #define RKNPU_FN_SUBMIT         0x814   /* DRM_ROCKET_SUBMIT, one job */
 #define RKNPU_FN_WAIT           0x815   /* wait for a job's sequence number */
 #define RKNPU_FN_RESET          0x816   /* core soft reset through _DSM function 1 */
@@ -123,6 +123,49 @@
 #define RKNPU_M4_VERSION        1       /* rknpu_info.m4_version */
 #define RKNPU_COPY_ARENA_BYTES  (256u << 10)    /* per core: 64 tasks of 512 entries */
 #define RKNPU_JOB_HISTORY       32      /* finished jobs WAIT can still answer for */
+
+/* ---- M6: the driver owns the NPU IOMMUs ---------------------------------- */
+/*
+ * No new layout: M6 names reserved fields, implements the two reserved codes
+ * PREP_BO and FINI_BO, and adds flags. RKNPU_M6_VERSION in rknpu_info says it
+ * is there; an M4 caller still works unchanged against an M6 driver.
+ *
+ *   - Memory mode (rknpu_info.mem_mode). RKNPU_MEM_IOMMU, the default: the
+ *     driver builds one Rockchip IOMMU v2 page table (rockchip-iommu.c's
+ *     format: 32-bit NPU addresses, 4 KiB pages, 40-bit physical) and points
+ *     all four NPU IOMMU instances at it. A buffer is any pages Windows has,
+ *     above 4 GiB too, and its dma_address is an NPU virtual address (IOVA).
+ *     Nothing needs to be physically contiguous any more. RKNPU_MEM_BYPASS is
+ *     M4: paging off, contiguous memory below 4 GiB, dma_address = physical.
+ *     Device Parameters\M6Iommu = 0 selects it, read when the device starts.
+ *   - Each buffer has its own IOVA range with at least one unmapped page
+ *     after it, so a stream that runs past a buffer faults instead of landing
+ *     in the next one. A fault stops the job (RKNPU_JOB_MMU_FAULT), and WAIT
+ *     resets the core as it does on a timeout. SUBMIT still checks every
+ *     stream as M4 does (allow list, PC block, every address register inside
+ *     one of the caller's buffers): the table is shared by every handle, so
+ *     the IOMMU bounds what the NPU can reach to what the driver mapped, and
+ *     the check keeps one handle out of another's buffers.
+ *   - Cached buffers (rknpu_create_bo.flags out: RKNPU_BO_CACHED). By default
+ *     in IOMMU mode the CPU mappings, the driver's and MAP_BO's, are cached,
+ *     as rocket's are. The NPU is not coherent, so the caller brackets CPU
+ *     access as it does with rocket: FINI_BO after writing a buffer the NPU
+ *     will read (cleans the range to memory), PREP_BO after a job that wrote
+ *     it and before reading (cleans and invalidates). Neither waits for a
+ *     job; wait first. On a buffer without RKNPU_BO_CACHED both are no-ops.
+ *     WRITE_BO and READ_BO do the maintenance themselves. Device
+ *     Parameters\M6CachedBos = 0 makes every buffer write-combined again
+ *     (M4's model, no maintenance); in bypass mode that is the default.
+ *   - More than one handle may be open (M4 allowed one), so charsiu's two
+ *     devices drive both cores at once, and the driver's queue is parallel:
+ *     a WAIT on one core no longer holds up a SUBMIT on the other.
+ */
+#define RKNPU_M6_VERSION        1       /* rknpu_info.m6_version */
+#define RKNPU_MEM_BYPASS        0       /* rknpu_info.mem_mode: M4, physical addresses */
+#define RKNPU_MEM_IOMMU         1       /* rknpu_info.mem_mode: M6, the driver's page table */
+
+#define IOCTL_RKNPU_PREP_BO     CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_PREP_BO, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+#define IOCTL_RKNPU_FINI_BO     CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_FINI_BO, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
 #ifndef METHOD_IN_DIRECT
 #define METHOD_IN_DIRECT  1
@@ -183,7 +226,10 @@ typedef struct rknpu_core_info {
     unsigned int jobs_completed;        /* by the interrupt */
     unsigned int jobs_timed_out;
     unsigned int resets;                /* _DSM resets of this core */
-    unsigned int reserved[4];
+    /* M6 (0 from an M4 driver) */
+    unsigned int mmu_faults;            /* page faults and bus errors its IOMMUs raised */
+    unsigned int mmu_enables;           /* times the driver turned paging on for this core */
+    unsigned int reserved[2];
 } rknpu_core_info;
 
 /*
@@ -221,8 +267,14 @@ typedef struct rknpu_info {
     unsigned int m4_version;            /* RKNPU_M4_VERSION */
     unsigned int copy_arena_bytes;      /* RKNPU_COPY_ARENA_BYTES */
     unsigned int bo_max_kib;            /* RKNPU_BO_MAX_SIZE / 1024 */
-    unsigned int bo_max_total_kib;      /* RKNPU_BO_MAX_TOTAL / 1024 */
-    unsigned int reserved[9];
+    unsigned int bo_max_total_kib;      /* RKNPU_BO_MAX_TOTAL / 1024, or the IOMMU mode's */
+    /* M6 (0 from an M4 driver) */
+    unsigned int m6_version;            /* RKNPU_M6_VERSION */
+    unsigned int mem_mode;              /* RKNPU_MEM_* */
+    unsigned int bo_cached;             /* 1: new buffers are cached (RKNPU_BO_CACHED) */
+    unsigned int iova_kib;              /* NPU address space in use, guard pages included */
+    unsigned int pt_pages;              /* page-table pages the driver holds (directory included) */
+    unsigned int reserved[4];
 } rknpu_info;
 
 /* ---- READ_REGS ---------------------------------------------------------- */
@@ -255,6 +307,8 @@ typedef struct rknpu_read_regs_in {
 #define RKNPU_BO_MAX_TOTAL      (1024u << 20)   /* all buffers of the device; M3 had 512 MiB,
                                                  * Llama-3.2-1B through charsiu needs about
                                                  * 700 MiB at 512 tokens of context, 790 at 2048 */
+#define RKNPU_BO_MAX_TOTAL_IOMMU (1536u << 20)  /* M6, IOMMU mode: no contiguous memory is needed,
+                                                 * so the int8 Llama-3.2-1B (1379 MiB) fits */
 #define RKNPU_BO_IO_MAX         (16u << 20)     /* one WRITE_BO or READ_BO */
 #define RKNPU_MAX_TASKS         64              /* per job */
 #define RKNPU_MAX_REGCMD        131072u         /* entries per task: REGISTER_AMOUNTS is 16 bits of pairs */
@@ -262,10 +316,22 @@ typedef struct rknpu_read_regs_in {
 /* CREATE_BO, in and out. */
 typedef struct rknpu_create_bo {
     unsigned int size;                  /* in: bytes; out: rounded up to 4 KiB */
-    unsigned int flags;                 /* in: 0 */
+    unsigned int flags;                 /* in: 0; out: RKNPU_BO_* (M6) */
     unsigned int handle;                /* out: nonzero */
-    unsigned int dma_address;           /* out: the NPU's address, = physical; below 4 GiB */
+    unsigned int dma_address;           /* out: the NPU's address: physical in bypass mode,
+                                         * an IOVA in IOMMU mode (M6); never 0 */
 } rknpu_create_bo;
+
+/* rknpu_create_bo.flags, out (M6) */
+#define RKNPU_BO_CACHED         0x00000001u /* cached mappings: PREP_BO and FINI_BO are needed */
+
+/* PREP_BO and FINI_BO, in (M6). length 0 is the whole buffer (offset 0). */
+typedef struct rknpu_bo_sync {
+    unsigned int handle;
+    unsigned int flags;                 /* 0 */
+    unsigned int offset;                /* bytes into the buffer */
+    unsigned int length;                /* bytes; 0 = to the end */
+} rknpu_bo_sync;
 
 /* FREE_BO and UNMAP_BO, in. FREE_BO also undoes MAP_BO. */
 typedef struct rknpu_bo_handle {
@@ -343,6 +409,7 @@ typedef struct rknpu_wait_in {
 #define RKNPU_JOB_DMA_ERROR     2       /* a DMA read or write error was raised; stopped */
 #define RKNPU_JOB_UNKNOWN       3       /* no such job on this handle */
 #define RKNPU_JOB_RUNNING       4       /* M4, RKNPU_WAIT_POLL only: not finished; nothing was stopped */
+#define RKNPU_JOB_MMU_FAULT     5       /* M6: an IOMMU page fault or bus error; stopped, the core was reset */
 
 /* WAIT, out. */
 typedef struct rknpu_wait_out {
@@ -359,7 +426,10 @@ typedef struct rknpu_wait_out {
     unsigned int reset_status;          /* NTSTATUS of the _DSM reset; 0 if none */
     unsigned int version_after;         /* PC VERSION read after the job (after the reset) */
     unsigned int mmu_status[RKNPU_MMUS_PER_CORE];
-    unsigned int reserved[5];
+    unsigned int fault_addr;            /* M6, RKNPU_JOB_MMU_FAULT: the IOVA that faulted */
+    unsigned int fault_status;          /* M6: the IOMMU INT_STATUS (1 page fault, 2 bus error)
+                                         * in bits 0..7, the MMU STATUS in bits 8..31 */
+    unsigned int reserved[3];
 } rknpu_wait_out;
 
 /* RESET, in. */
@@ -408,6 +478,10 @@ typedef struct rknpu_reset_out {
                                          * Value2 = target << 16 | register */
 #define RKNPU_CRUMB_ARENA       11      /* M4: a core's copy arena was allocated; Value1 = size,
                                          * Value2 = its address */
+#define RKNPU_CRUMB_IOMMU       12      /* M6: paging turned on for a core; Value1 = NTSTATUS,
+                                         * Value2 = instance 0 STATUS << 16 | instance 1 STATUS */
+#define RKNPU_CRUMB_MMU_FAULT   13      /* M6: WAIT found a job stopped by a fault; Value1 = IOVA,
+                                         * Value2 = fault_status */
 
 #pragma pack(pop)
 
@@ -446,6 +520,7 @@ RKNPU_ASSERT_SIZE(rknpu_create_bo, 16);
 RKNPU_ASSERT_SIZE(rknpu_bo_handle, 8);
 RKNPU_ASSERT_SIZE(rknpu_map_bo, 16);
 RKNPU_ASSERT_SIZE(rknpu_bo_io, 16);
+RKNPU_ASSERT_SIZE(rknpu_bo_sync, 16);
 RKNPU_ASSERT_SIZE(rknpu_task, 8);
 RKNPU_ASSERT_SIZE(rknpu_submit_in, 528);
 RKNPU_ASSERT_SIZE(rknpu_submit_out, 16);

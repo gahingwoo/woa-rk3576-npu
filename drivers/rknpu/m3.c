@@ -54,10 +54,24 @@
  * poll, and a finished job is kept in a short history so its WAIT still
  * answers after another handle's job took the core.
  *
+ * M6 (rknpu_ioctl.h, M6 section; the IOMMU itself is iommu.c). In IOMMU
+ * mode a buffer is MmAllocatePagesForMdlEx pages, anywhere in memory, mapped
+ * at an IOVA, and its dma_address is that IOVA; SUBMIT turns paging on for
+ * the core when it finds it off. Buffers are cached unless M6CachedBos = 0,
+ * and PREP_BO / FINI_BO do the cache maintenance (cache.asm) the
+ * non-coherent NPU needs. The copy arena is mapped read only for the NPU.
+ * A buffer is found by its handle through a hash and by an address through
+ * the IOVA chunk table, so neither SUBMIT's check nor PREP/FINI walks the
+ * list of a thousand buffers. Bypass mode (M6Iommu = 0) is M4 exactly.
+ *
  * LOCKING. Every wait (job completion, the _DSM call, a breadcrumb flush)
  * happens at PASSIVE_LEVEL holding at most the two wait locks. The interrupt
  * spin lock is held only around register writes and job bookkeeping, never
- * across a wait; the DPC takes nothing else.
+ * across a wait; the DPC takes nothing else. M6: WAIT waits for a job with
+ * no lock held (the queue is parallel), so a WAIT on one core does not hold
+ * up a SUBMIT on the other; it takes JobLock again only to collect the
+ * result, or to stop a job that timed out. The IOMMU registers and tables
+ * are touched under BoLock.
  *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
@@ -75,6 +89,32 @@ static const GUID NpuDsmGuid =
 #define FOURGIB                 0x100000000ull
 
 static const ULONG MmuInst[RKNPU_MMUS_PER_CORE] = { NPU_MMU0_OFF, NPU_MMU1_OFF };
+
+/* ------------------------------------------------- cache maintenance (M6) */
+
+/* The CPU's writes to [Off, Off + Len) of a cached buffer reach memory. */
+static VOID
+BoClean(
+    _In_ const NPU_BO *Bo,
+    _In_ SIZE_T Off,
+    _In_ SIZE_T Len
+    )
+{
+    if (Bo->Cached && Len)
+        RknpuDcClean((PUCHAR)Bo->Kva + Off, Len);
+}
+
+/* ... and the CPU will read that range from memory, not from its caches. */
+static VOID
+BoCleanInvalidate(
+    _In_ const NPU_BO *Bo,
+    _In_ SIZE_T Off,
+    _In_ SIZE_T Len
+    )
+{
+    if (Bo->Cached && Len)
+        RknpuDcCleanInvalidate((PUCHAR)Bo->Kva + Off, Len);
+}
 
 static ULONG
 QpcToUs(
@@ -156,6 +196,8 @@ NpuM3DeviceInit(
     ULONG n;
 
     InitializeListHead(&Ctx->Bos);
+    for (n = 0; n < RKNPU_BO_HASH; n++)
+        InitializeListHead(&Ctx->BoHash[n]);
     KeQueryPerformanceCounter(&Ctx->QpcFreq);
     for (n = 0; n < RKNPU_NUM_CORES; n++)
         KeInitializeEvent(&Ctx->Core[n].Done, NotificationEvent, FALSE);
@@ -171,6 +213,9 @@ NpuM3DeviceInit(
 
     /* Opened here, once, so no two callers race to open it. Writing it
      * starts with the first M3 call; failing to open it is not fatal. */
+    /* M6 defaults: the driver's IOMMU, cached buffers */
+    Ctx->Mmu.On = TRUE;
+    Ctx->CachedBos = TRUE;
     status = WdfDeviceOpenRegistryKey(Ctx->Device, PLUGPLAY_REGKEY_DEVICE, KEY_READ | KEY_WRITE,
                                       WDF_NO_OBJECT_ATTRIBUTES, &Ctx->CrumbKey);
     if (!NT_SUCCESS(status)) {
@@ -186,7 +231,23 @@ NpuM3DeviceInit(
             Ctx->AllowUnlisted = TRUE;
             RKNPU_LOG("M4AllowUnlisted = 1: registers charsiu never writes are let through (logged)");
         }
+        /* M6: M6Iommu = 0 is M4's bypass mode, and then uncached by default */
+        RtlInitUnicodeString(&name, L"M6Iommu");
+        if (NT_SUCCESS(WdfRegistryQueryULong(Ctx->CrumbKey, &name, &v)) && v == 0) {
+            Ctx->Mmu.On = FALSE;
+            Ctx->CachedBos = FALSE;
+        }
+        RtlInitUnicodeString(&name, L"M6CachedBos");
+        if (NT_SUCCESS(WdfRegistryQueryULong(Ctx->CrumbKey, &name, &v)))
+            Ctx->CachedBos = v ? TRUE : FALSE;
     }
+    if (Ctx->Mmu.On && !NT_SUCCESS(NpuMmuInit(Ctx))) {
+        RKNPU_LOG("IOMMU mode: no memory for the page directory; running in bypass mode");
+        Ctx->Mmu.On = FALSE;
+    }
+    Ctx->BoMaxTotal = Ctx->Mmu.On ? RKNPU_BO_MAX_TOTAL_IOMMU : RKNPU_BO_MAX_TOTAL;
+    RKNPU_LOG("memory: %s, %s buffers, at most %Iu MiB", Ctx->Mmu.On ? "IOMMU" : "bypass (M4)",
+              Ctx->CachedBos ? "cached" : "write-combined", Ctx->BoMaxTotal >> 20);
     return STATUS_SUCCESS;
 }
 
@@ -337,6 +398,38 @@ NpuM3Dpc(
 }
 
 /*
+ * M6: an IOMMU on core N raised a page fault or bus error while its job ran
+ * (iommu.c, NpuMmuIsr). Stop the job as the completion path does and finish
+ * it with RKNPU_JOB_MMU_FAULT; its WAIT resets the core. DIRQL, the core's
+ * interrupt lock held (the ISR holds it).
+ */
+VOID
+NpuM3JobFaultLocked(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ ULONG N,
+    _In_ ULONG Iova,
+    _In_ ULONG Status
+    )
+{
+    CORE_JOB *j = &Ctx->Core[N].Job;
+    ULONG base = NpuCoreBase(N);
+
+    if (!j->InFlight)
+        return;
+    j->RawStatus = NpuRd(Ctx, base + PC_INTERRUPT_RAW_STATUS);
+    j->TaskStatus = NpuRd(Ctx, base + PC_TASK_STATUS);
+    NpuWr(Ctx, base + PC_INTERRUPT_MASK, 0);
+    NpuWr(Ctx, base + PC_OPERATION_ENABLE, 0);
+    NpuWr(Ctx, base + PC_INTERRUPT_CLEAR, PC_INTERRUPT_ALL);
+    j->FaultAddr = Iova;
+    j->FaultStatus = Status;
+    j->Result = RKNPU_JOB_MMU_FAULT;
+    j->T1 = KeQueryPerformanceCounter(NULL);
+    j->InFlight = FALSE;
+    j->CompletePending = TRUE;
+}
+
+/*
  * Stop a job the interrupt has not finished: what rocket_reset() writes
  * before it waits. TRUE if the job was still in flight (it timed out); FALSE
  * if it finished after all, in which case its DPC has run when this returns.
@@ -444,6 +537,13 @@ NpuResetCore(
     NTSTATUS status;
 
     *VersionAfter = 0;
+    /* M6: rocket detaches the domain before the reset; the next SUBMIT turns
+     * paging on again, whatever the reset did to the IOMMU */
+    if (Ctx->Mmu.On && NpuSafeToRead(Ctx)) {
+        WdfWaitLockAcquire(Ctx->BoLock, NULL);
+        NpuMmuDisableLocked(Ctx, N);
+        WdfWaitLockRelease(Ctx->BoLock);
+    }
     status = NpuDsmReset(Ctx, N, DsmRet);
     InterlockedIncrement(&core->Resets);
     if (NpuSafeToRead(Ctx)) {
@@ -480,12 +580,21 @@ NpuJobFinish(
 
     t0 = KeQueryPerformanceCounter(NULL);
     if (JobActive(j)) {
-        timeout.QuadPart = -10000LL * TimeoutMs;
+        timeout.QuadPart = -10000LL * TimeoutMs;    /* 0: just look (M6 WAIT has waited) */
         wait = KeWaitForSingleObject(&core->Done, Executive, KernelMode, FALSE, &timeout);
         if (wait == STATUS_TIMEOUT)
             timedOut = NpuJobStop(Ctx, N);
     }
     t1 = KeQueryPerformanceCounter(NULL);
+
+    /* M6: an IOMMU fault stopped it (NpuM3JobFaultLocked); reset the core once */
+    if (!timedOut && j->Result == RKNPU_JOB_MMU_FAULT && !j->FaultReset) {
+        j->FaultReset = TRUE;
+        RKNPU_LOG("core %u job %llu stopped by an IOMMU fault at 0x%08x (status 0x%08x)",
+                  N, j->Seq, j->FaultAddr, j->FaultStatus);
+        NpuCrumb(Ctx, RKNPU_CRUMB_MMU_FAULT, j->Seq, N, j->FaultAddr, j->FaultStatus);
+        rs = NpuResetCore(Ctx, N, j->Seq, &ret, &ver);
+    }
 
     if (timedOut) {
         InterlockedIncrement(&core->JobsTimedOut);
@@ -510,8 +619,10 @@ NpuJobFinish(
         O->hw_us = QpcToUs(Ctx, j->T1.QuadPart - j->T0.QuadPart);
         O->wait_us = QpcToUs(Ctx, t1.QuadPart - t0.QuadPart);
         O->reset_status = (ULONG)rs;
+        O->fault_addr = j->FaultAddr;
+        O->fault_status = j->FaultStatus;
         if (NpuSafeToRead(Ctx)) {
-            O->version_after = timedOut ? ver : NpuRd(Ctx, NpuCoreBase(N) + PC_VERSION);
+            O->version_after = (timedOut || ver) ? ver : NpuRd(Ctx, NpuCoreBase(N) + PC_VERSION);
             for (i = 0; i < RKNPU_MMUS_PER_CORE; i++)
                 O->mmu_status[i] = NpuRd(Ctx, NpuCoreBase(N) + MmuInst[i] + RK_MMU_STATUS);
         }
@@ -529,10 +640,10 @@ BoFindLocked(
     _In_ WDFFILEOBJECT Owner
     )
 {
-    PLIST_ENTRY e;
+    PLIST_ENTRY head = &Ctx->BoHash[Handle % RKNPU_BO_HASH], e;
 
-    for (e = Ctx->Bos.Flink; e != &Ctx->Bos; e = e->Flink) {
-        PNPU_BO bo = CONTAINING_RECORD(e, NPU_BO, Link);
+    for (e = head->Flink; e != head; e = e->Flink) {
+        PNPU_BO bo = CONTAINING_RECORD(e, NPU_BO, HashLink);
         if (bo->Handle == Handle && bo->Owner == Owner)
             return bo;
     }
@@ -550,9 +661,17 @@ BoFindRangeLocked(
 {
     PLIST_ENTRY e;
 
+    /* M6: the chunk table names the one buffer that can hold Addr */
+    if (Ctx->Mmu.On) {
+        PNPU_BO bo = NpuMmuOwnerLocked(Ctx, Addr);
+
+        if (bo && bo->Owner == Owner && Addr >= bo->Dma && (ULONGLONG)Addr + Len <= (ULONGLONG)bo->Dma + bo->Size)
+            return bo;
+        return NULL;
+    }
     for (e = Ctx->Bos.Flink; e != &Ctx->Bos; e = e->Flink) {
         PNPU_BO bo = CONTAINING_RECORD(e, NPU_BO, Link);
-        ULONGLONG lo = (ULONGLONG)bo->Pa.QuadPart, hi = lo + bo->Size;
+        ULONGLONG lo = bo->Dma, hi = lo + bo->Size;
 
         if (bo->Owner == Owner && Addr >= lo && (ULONGLONG)Addr + Len <= hi)
             return bo;
@@ -577,7 +696,7 @@ BoLookupInBo(
     BO_LOOKUP *l = (BO_LOOKUP *)C;
     PNPU_BO bo = l->Last;
 
-    if (bo && Addr >= (ULONGLONG)bo->Pa.QuadPart && Addr < (ULONGLONG)bo->Pa.QuadPart + bo->Size)
+    if (bo && Addr >= bo->Dma && (ULONGLONG)Addr < (ULONGLONG)bo->Dma + bo->Size)
         return 1;
     bo = BoFindRangeLocked(l->Ctx, l->Owner, Addr, 1);
     if (bo)
@@ -645,7 +764,7 @@ NpuCheckStreamLocked(
     l.Last = NULL;
     /* mapped nowhere but the kernel, so it cannot change under the check */
     return NpuCheckEntriesLocked(Ctx, &l,
-                                 (const ULONGLONG *)((PUCHAR)bo->Kva + (T->regcmd - (ULONG)bo->Pa.QuadPart)),
+                                 (const ULONGLONG *)((PUCHAR)bo->Kva + (T->regcmd - bo->Dma)),
                                  fetched, T->regcmd, Core);
 }
 
@@ -658,29 +777,85 @@ NpuArenaEnsure(
 {
     CORE_STATE *core = &Ctx->Core[N];
     PHYSICAL_ADDRESS low, high, skip;
+    NTSTATUS status;
 
     if (core->Arena)
         return STATUS_SUCCESS;
     low.QuadPart = 0;
-    high.QuadPart = 0xFFFFFFFF;
     skip.QuadPart = 0;
-    core->Arena = (PUCHAR)MmAllocateContiguousNodeMemory(RKNPU_COPY_ARENA_BYTES, low, high, skip,
-                                                         PAGE_READWRITE | PAGE_WRITECOMBINE, MM_ANY_NODE_OK);
-    if (!core->Arena) {
-        RKNPU_LOG("SUBMIT: no contiguous %u bytes below 4 GiB for core %u's copy arena",
-                  RKNPU_COPY_ARENA_BYTES, N);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    core->ArenaPa = MmGetPhysicalAddress(core->Arena);
-    if ((ULONGLONG)core->ArenaPa.QuadPart + RKNPU_COPY_ARENA_BYTES > FOURGIB) {
-        MmFreeContiguousMemory(core->Arena);
-        core->Arena = NULL;
-        return STATUS_INSUFFICIENT_RESOURCES;
+    if (Ctx->Mmu.On) {
+        /* M6: any pages, write-combined, mapped READ ONLY for the NPU */
+        high.QuadPart = 0xFFFFFFFFFFll;
+        core->ArenaMdl = MmAllocatePagesForMdlEx(low, high, skip, RKNPU_COPY_ARENA_BYTES, MmWriteCombined,
+                                                 MM_ALLOCATE_FULLY_REQUIRED);
+        if (!core->ArenaMdl)
+            return STATUS_INSUFFICIENT_RESOURCES;
+        core->Arena = (PUCHAR)MmMapLockedPagesSpecifyCache(core->ArenaMdl, KernelMode, MmWriteCombined, NULL,
+                                                           FALSE, NormalPagePriority | MdlMappingNoExecute);
+        status = core->Arena ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;
+        if (NT_SUCCESS(status)) {
+            WdfWaitLockAcquire(Ctx->BoLock, NULL);
+            status = NpuMmuMapLocked(Ctx, core->ArenaMdl, RKNPU_COPY_ARENA_BYTES, FALSE, NULL, &core->ArenaDma);
+            WdfWaitLockRelease(Ctx->BoLock);
+        }
+        if (!NT_SUCCESS(status)) {
+            if (core->Arena)
+                MmUnmapLockedPages(core->Arena, core->ArenaMdl);
+            core->Arena = NULL;
+            MmFreePagesFromMdl(core->ArenaMdl);
+            ExFreePoolWithTag(core->ArenaMdl, 0);
+            core->ArenaMdl = NULL;
+            RKNPU_LOG("SUBMIT: core %u's copy arena: 0x%08x", N, status);
+            return status;
+        }
+        core->ArenaPa.QuadPart = 0;
+    } else {
+        high.QuadPart = 0xFFFFFFFF;
+        core->Arena = (PUCHAR)MmAllocateContiguousNodeMemory(RKNPU_COPY_ARENA_BYTES, low, high, skip,
+                                                             PAGE_READWRITE | PAGE_WRITECOMBINE, MM_ANY_NODE_OK);
+        if (!core->Arena) {
+            RKNPU_LOG("SUBMIT: no contiguous %u bytes below 4 GiB for core %u's copy arena",
+                      RKNPU_COPY_ARENA_BYTES, N);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        core->ArenaPa = MmGetPhysicalAddress(core->Arena);
+        if ((ULONGLONG)core->ArenaPa.QuadPart + RKNPU_COPY_ARENA_BYTES > FOURGIB) {
+            MmFreeContiguousMemory(core->Arena);
+            core->Arena = NULL;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        core->ArenaDma = (ULONG)core->ArenaPa.QuadPart;
     }
     RtlZeroMemory(core->Arena, RKNPU_COPY_ARENA_BYTES);
-    RKNPU_LOG("core %u copy arena: %u bytes at 0x%llx", N, RKNPU_COPY_ARENA_BYTES, core->ArenaPa.QuadPart);
-    NpuCrumb(Ctx, RKNPU_CRUMB_ARENA, 0, N, RKNPU_COPY_ARENA_BYTES, (ULONG)core->ArenaPa.QuadPart);
+    RKNPU_LOG("core %u copy arena: %u bytes at NPU address 0x%08x", N, RKNPU_COPY_ARENA_BYTES, core->ArenaDma);
+    NpuCrumb(Ctx, RKNPU_CRUMB_ARENA, 0, N, RKNPU_COPY_ARENA_BYTES, core->ArenaDma);
     return STATUS_SUCCESS;
+}
+
+/* Undo NpuArenaEnsure. No job may be running from it. */
+static VOID
+NpuArenaFree(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ ULONG N
+    )
+{
+    CORE_STATE *core = &Ctx->Core[N];
+
+    if (!core->Arena)
+        return;
+    if (core->ArenaMdl) {
+        WdfWaitLockAcquire(Ctx->BoLock, NULL);
+        NpuMmuUnmapLocked(Ctx, core->ArenaDma, RKNPU_COPY_ARENA_BYTES);
+        WdfWaitLockRelease(Ctx->BoLock);
+        MmUnmapLockedPages(core->Arena, core->ArenaMdl);
+        MmFreePagesFromMdl(core->ArenaMdl);
+        ExFreePoolWithTag(core->ArenaMdl, 0);
+        core->ArenaMdl = NULL;
+    } else {
+        MmFreeContiguousMemory(core->Arena);
+    }
+    core->Arena = NULL;
+    core->ArenaDma = 0;
 }
 
 /*
@@ -716,12 +891,12 @@ NpuCopyStreamsLocked(
         if (bytes > RKNPU_COPY_ARENA_BYTES - at)
             return STATUS_INVALID_BUFFER_SIZE;
         /* at stays a multiple of 16 (fetched is even), as the PC wants */
-        RtlCopyMemory(core->Arena + at, (PUCHAR)bo->Kva + (t->regcmd - (ULONG)bo->Pa.QuadPart), bytes);
+        RtlCopyMemory(core->Arena + at, (PUCHAR)bo->Kva + (t->regcmd - bo->Dma), bytes);
         status = NpuCheckEntriesLocked(Ctx, &l, (const ULONGLONG *)(core->Arena + at), fetched,
                                        t->regcmd, N);
         if (!NT_SUCCESS(status))
             return status;
-        t->regcmd = (ULONG)core->ArenaPa.QuadPart + at;
+        t->regcmd = core->ArenaDma + at;
         at += bytes;
     }
     return STATUS_SUCCESS;
@@ -754,21 +929,51 @@ BoUnmap(
     return TRUE;
 }
 
-/* Already off the list. PASSIVE_LEVEL. */
+/*
+ * Take a buffer out of every lookup: the list, the handle hash, the counts
+ * and (M6) the NPU address space, so nothing can reach it any more. No job
+ * of its owner may be running. BoLock held.
+ */
+static VOID
+BoReleaseLocked(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ PNPU_BO Bo
+    )
+{
+    RemoveEntryList(&Bo->Link);
+    RemoveEntryList(&Bo->HashLink);
+    InitializeListHead(&Bo->HashLink);
+    Ctx->BoCount--;
+    Ctx->BoBytes -= Bo->Size;
+    if (Bo->IovaMapped) {
+        NpuMmuUnmapLocked(Ctx, Bo->Dma, Bo->Size);
+        Bo->IovaMapped = FALSE;
+    }
+}
+
+/* Released already (or never entered). PASSIVE_LEVEL. */
 static VOID
 BoDestroy(
     _In_ PNPU_BO Bo
     )
 {
     if (!BoUnmap(Bo)) {
-        RKNPU_LOG("buffer %u (0x%llx + 0x%Ix) is still mapped in another process; leaking it",
-                  Bo->Handle, Bo->Pa.QuadPart, Bo->Size);
+        RKNPU_LOG("buffer %u (NPU 0x%08x + 0x%Ix) is still mapped in another process; leaking it",
+                  Bo->Handle, Bo->Dma, Bo->Size);
         return;
     }
-    if (Bo->Mdl)
-        IoFreeMdl(Bo->Mdl);
-    if (Bo->Kva)
-        MmFreeContiguousMemory(Bo->Kva);
+    if (Bo->PagesMdl) {
+        /* M6: MmAllocatePagesForMdlEx pages, mapped once into the kernel */
+        if (Bo->Kva)
+            MmUnmapLockedPages(Bo->Kva, Bo->Mdl);
+        MmFreePagesFromMdl(Bo->Mdl);
+        ExFreePoolWithTag(Bo->Mdl, 0);
+    } else {
+        if (Bo->Mdl)
+            IoFreeMdl(Bo->Mdl);
+        if (Bo->Kva)
+            MmFreeContiguousMemory(Bo->Kva);
+    }
     ExFreePoolWithTag(Bo, RKNPU_POOL_TAG);
 }
 
@@ -795,6 +1000,7 @@ NpuBoCreate(
     PNPU_BO bo;
     SIZE_T size;
     NTSTATUS status;
+    MEMORY_CACHING_TYPE ct;
 
     status = WdfRequestRetrieveInputBuffer(Request, sizeof(*io), (PVOID *)&io, NULL);
     if (!NT_SUCCESS(status))
@@ -809,7 +1015,7 @@ NpuBoCreate(
 
     /* reserved now, so two callers cannot both pass the check */
     WdfWaitLockAcquire(Ctx->BoLock, NULL);
-    if (Ctx->BoBytes + size > RKNPU_BO_MAX_TOTAL) {
+    if (Ctx->BoBytes + size > Ctx->BoMaxTotal) {
         WdfWaitLockRelease(Ctx->BoLock);
         return STATUS_QUOTA_EXCEEDED;
     }
@@ -821,42 +1027,83 @@ NpuBoCreate(
         NpuBoUnreserve(Ctx, size);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    low.QuadPart = 0;
-    high.QuadPart = 0xFFFFFFFF;
-    skip.QuadPart = 0;
-    bo->Kva = MmAllocateContiguousNodeMemory(size, low, high, skip,
-                                             PAGE_READWRITE | PAGE_WRITECOMBINE, MM_ANY_NODE_OK);
-    if (!bo->Kva) {
-        ExFreePoolWithTag(bo, RKNPU_POOL_TAG);
-        NpuBoUnreserve(Ctx, size);
-        RKNPU_LOG("CREATE_BO: no contiguous %Iu bytes below 4 GiB", size);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    RtlZeroMemory(bo->Kva, size);
+    InitializeListHead(&bo->HashLink);
     bo->Size = size;
-    bo->Pa = MmGetPhysicalAddress(bo->Kva);
-    if (bo->Pa.QuadPart == 0 || (ULONGLONG)bo->Pa.QuadPart + size > FOURGIB) {
-        /* cannot happen with high = 4 GiB - 1; a stream address is 32 bits */
-        RKNPU_LOG("CREATE_BO: got PA 0x%llx + 0x%Ix, not usable", bo->Pa.QuadPart, size);
-        BoDestroy(bo);
-        NpuBoUnreserve(Ctx, size);
-        return STATUS_INSUFFICIENT_RESOURCES;
+    bo->Cached = Ctx->CachedBos;
+    ct = bo->Cached ? MmCached : MmWriteCombined;
+    low.QuadPart = 0;
+    skip.QuadPart = 0;
+    if (Ctx->Mmu.On) {
+        /* M6: any pages below 2^40 (the v2 entries' reach), zeroed by Mm */
+        high.QuadPart = 0xFFFFFFFFFFll;
+        bo->Mdl = MmAllocatePagesForMdlEx(low, high, skip, size, ct, MM_ALLOCATE_FULLY_REQUIRED);
+        if (!bo->Mdl) {
+            ExFreePoolWithTag(bo, RKNPU_POOL_TAG);
+            NpuBoUnreserve(Ctx, size);
+            RKNPU_LOG("CREATE_BO: no %Iu bytes of pages", size);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        bo->PagesMdl = TRUE;
+        bo->Kva = MmMapLockedPagesSpecifyCache(bo->Mdl, KernelMode, ct, NULL, FALSE,
+                                               NormalPagePriority | MdlMappingNoExecute);
+        if (!bo->Kva) {
+            BoDestroy(bo);
+            NpuBoUnreserve(Ctx, size);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    } else {
+        high.QuadPart = 0xFFFFFFFF;
+        bo->Kva = MmAllocateContiguousNodeMemory(size, low, high, skip,
+                                                 PAGE_READWRITE | (bo->Cached ? 0 : PAGE_WRITECOMBINE),
+                                                 MM_ANY_NODE_OK);
+        if (!bo->Kva) {
+            ExFreePoolWithTag(bo, RKNPU_POOL_TAG);
+            NpuBoUnreserve(Ctx, size);
+            RKNPU_LOG("CREATE_BO: no contiguous %Iu bytes below 4 GiB", size);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(bo->Kva, size);
+        bo->Pa = MmGetPhysicalAddress(bo->Kva);
+        if (bo->Pa.QuadPart == 0 || (ULONGLONG)bo->Pa.QuadPart + size > FOURGIB) {
+            /* cannot happen with high = 4 GiB - 1; a stream address is 32 bits */
+            RKNPU_LOG("CREATE_BO: got PA 0x%llx + 0x%Ix, not usable", bo->Pa.QuadPart, size);
+            BoDestroy(bo);
+            NpuBoUnreserve(Ctx, size);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        bo->Dma = (ULONG)bo->Pa.QuadPart;
     }
+    /* the zeros, and nothing dirty, in memory before the NPU or another
+     * mapping sees the pages (a dirty line evicted later would land on
+     * what the NPU wrote) */
+    BoCleanInvalidate(bo, 0, size);
     bo->Owner = WdfRequestGetFileObject(Request);
 
     WdfWaitLockAcquire(Ctx->BoLock, NULL);
+    if (Ctx->Mmu.On) {
+        status = NpuMmuMapLocked(Ctx, bo->Mdl, size, TRUE, bo, &bo->Dma);
+        if (!NT_SUCCESS(status)) {
+            Ctx->BoBytes -= size;
+            WdfWaitLockRelease(Ctx->BoLock);
+            RKNPU_LOG("CREATE_BO: no NPU address space for %Iu bytes (0x%08x)", size, status);
+            BoDestroy(bo);
+            return status;
+        }
+        bo->IovaMapped = TRUE;
+    }
     do {
         bo->Handle = ++Ctx->NextHandle;
     } while (bo->Handle == 0);
     InsertTailList(&Ctx->Bos, &bo->Link);
+    InsertTailList(&Ctx->BoHash[bo->Handle % RKNPU_BO_HASH], &bo->HashLink);
     Ctx->BoCount++;
     WdfWaitLockRelease(Ctx->BoLock);
 
-    NpuCrumb(Ctx, RKNPU_CRUMB_BO_CREATE, 0, 0, (ULONG)size, (ULONG)bo->Pa.QuadPart);
+    NpuCrumb(Ctx, RKNPU_CRUMB_BO_CREATE, 0, 0, (ULONG)size, bo->Dma);
     io->size = (unsigned int)size;
-    io->flags = 0;
+    io->flags = bo->Cached ? RKNPU_BO_CACHED : 0;
     io->handle = bo->Handle;
-    io->dma_address = (unsigned int)bo->Pa.QuadPart;
+    io->dma_address = bo->Dma;
     *Info = sizeof(*io);
     return STATUS_SUCCESS;
 }
@@ -900,9 +1147,10 @@ NpuBoMap(
                 MmBuildMdlForNonPagedPool(bo->Mdl);
         }
         if (bo->Mdl) {
+            /* the same attributes as the kernel's mapping of the pages */
             __try {
-                va = MmMapLockedPagesSpecifyCache(bo->Mdl, UserMode, MmWriteCombined, NULL, FALSE,
-                                                  NormalPagePriority | MdlMappingNoExecute);
+                va = MmMapLockedPagesSpecifyCache(bo->Mdl, UserMode, bo->Cached ? MmCached : MmWriteCombined,
+                                                  NULL, FALSE, NormalPagePriority | MdlMappingNoExecute);
             } __except (EXCEPTION_EXECUTE_HANDLER) {
                 va = NULL;
             }
@@ -920,7 +1168,7 @@ NpuBoMap(
     if (!NT_SUCCESS(status))
         return status;
 
-    NpuCrumb(Ctx, RKNPU_CRUMB_BO_MAP, 0, 0, handle, (ULONG)bo->Pa.QuadPart);
+    NpuCrumb(Ctx, RKNPU_CRUMB_BO_MAP, 0, 0, handle, bo->Dma);
     io->handle = handle;
     io->reserved = 0;
     io->user_va = (unsigned long long)(ULONG_PTR)va;
@@ -984,9 +1232,7 @@ NpuBoFree(
         status = STATUS_DEVICE_BUSY;
         bo = NULL;
     } else {
-        RemoveEntryList(&bo->Link);
-        Ctx->BoCount--;
-        Ctx->BoBytes -= bo->Size;
+        BoReleaseLocked(Ctx, bo);
     }
     WdfWaitLockRelease(Ctx->BoLock);
     WdfWaitLockRelease(Ctx->JobLock);
@@ -1032,11 +1278,60 @@ NpuBoCopy(
     } else if (Write && AnyUncopiedJobActive(Ctx)) {
         status = STATUS_DEVICE_BUSY;
     } else {
-        if (Write)
+        /* M6: a cached buffer is made right for the other side here */
+        if (Write) {
             RtlCopyMemory((PUCHAR)bo->Kva + req.offset, data, req.length);
-        else
+            BoClean(bo, req.offset, req.length);
+        } else {
+            BoCleanInvalidate(bo, req.offset, req.length);
             RtlCopyMemory(data, (PUCHAR)bo->Kva + req.offset, req.length);
+        }
         *Info = Write ? 0 : req.length;
+    }
+    WdfWaitLockRelease(Ctx->BoLock);
+    return status;
+}
+
+/*
+ * M6: PREP_BO (Prep) and FINI_BO, rocket's DRM_ROCKET_PREP_BO and
+ * DRM_ROCKET_FINI_BO without the fence wait (the caller has waited). FINI
+ * cleans the range so the NPU reads what the CPU wrote; PREP cleans and
+ * invalidates it so the CPU reads what the NPU wrote. A write-combined
+ * buffer needs neither. Holding BoLock keeps the buffer from being freed
+ * under the maintenance; at the 14 GB/s charsiu measures for it, a typical
+ * activation buffer takes a few microseconds.
+ */
+static NTSTATUS
+NpuBoSync(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ WDFREQUEST Request,
+    _In_ BOOLEAN Prep
+    )
+{
+    rknpu_bo_sync *in, req;
+    PNPU_BO bo;
+    SIZE_T len;
+    NTSTATUS status;
+
+    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*in), (PVOID *)&in, NULL);
+    if (!NT_SUCCESS(status))
+        return status;
+    req = *in;
+    if (req.flags != 0)
+        return STATUS_INVALID_PARAMETER;
+
+    WdfWaitLockAcquire(Ctx->BoLock, NULL);
+    bo = BoFindLocked(Ctx, req.handle, WdfRequestGetFileObject(Request));
+    if (!bo) {
+        status = STATUS_INVALID_HANDLE;
+    } else if (req.offset > bo->Size || (ULONGLONG)req.offset + req.length > bo->Size) {
+        status = STATUS_INVALID_PARAMETER;
+    } else {
+        len = req.length ? req.length : bo->Size - req.offset;
+        if (Prep)
+            BoCleanInvalidate(bo, req.offset, len);
+        else
+            BoClean(bo, req.offset, len);
     }
     WdfWaitLockRelease(Ctx->BoLock);
     return status;
@@ -1070,6 +1365,8 @@ NpuRecordLocked(
     r->TaskCount = j->TaskCount;
     r->IsrCount = j->IsrCount;
     r->HwUs = QpcToUs(Ctx, j->T1.QuadPart - j->T0.QuadPart);
+    r->FaultAddr = j->FaultAddr;
+    r->FaultStatus = j->FaultStatus;
 }
 
 static NTSTATUS
@@ -1121,9 +1418,11 @@ NpuSubmit(
         status = STATUS_DEVICE_BUSY;
         goto out_job;
     }
-    for (i = 0; i < RKNPU_MMUS_PER_CORE; i++) {
+    /* bypass mode: paging must be off, or every address would be translated
+     * through tables nobody set up (M6 turns it on in the BoLock section) */
+    for (i = 0; !Ctx->Mmu.On && i < RKNPU_MMUS_PER_CORE; i++) {
         if (NpuRd(Ctx, base + MmuInst[i] + RK_MMU_STATUS) & RK_MMU_STATUS_PAGING) {
-            RKNPU_LOG("SUBMIT: core %u IOMMU %u has paging on; M3 runs with it off", n, i);
+            RKNPU_LOG("SUBMIT: core %u IOMMU %u has paging on; bypass mode runs with it off", n, i);
             status = STATUS_DEVICE_CONFIGURATION_ERROR;
             goto out_job;
         }
@@ -1136,6 +1435,18 @@ NpuSubmit(
     }
 
     WdfWaitLockAcquire(Ctx->BoLock, NULL);
+    /* M6: paging on with the driver's table; after a reset this turns it on again */
+    if (Ctx->Mmu.On) {
+        status = NpuMmuEnsureLocked(Ctx, n);
+        if (!NT_SUCCESS(status)) {
+            RKNPU_LOG("SUBMIT: core %u IOMMU could not be turned on: 0x%08x", n, status);
+            NpuCrumb(Ctx, RKNPU_CRUMB_IOMMU, 0, n, (ULONG)status,
+                     NpuRd(Ctx, base + NPU_MMU0_OFF + RK_MMU_STATUS) << 16 |
+                     (NpuRd(Ctx, base + NPU_MMU1_OFF + RK_MMU_STATUS) & 0xFFFF));
+            status = STATUS_DEVICE_CONFIGURATION_ERROR;
+            goto out_bo;
+        }
+    }
     /* Every stream inside one of the caller's buffers, and within the rules:
      * M4 checks the copies it will run, M3 the streams in place. */
     if (copy) {
@@ -1218,6 +1529,44 @@ NpuWait(
     if (ms > RKNPU_WAIT_MAX_MS)
         ms = RKNPU_WAIT_MAX_MS;
 
+    /*
+     * M6: wait with no lock held, so the other core's SUBMIT and WAIT go on
+     * meanwhile. The job stays the core's job until it finishes (SUBMIT
+     * refuses a busy core), so while it is found active, Done belongs to it.
+     * If another handle's job took the core between the completion and the
+     * wait, the loop finds the sequence number gone and stops. Then JobLock
+     * collects the result as before, and a job still running after the
+     * whole timeout is stopped there (a zero-length wait).
+     */
+    if (!(in.flags & RKNPU_WAIT_POLL) && in.seqno != 0) {
+        LARGE_INTEGER t0 = KeQueryPerformanceCounter(NULL), now, to;
+        LONGLONG left;
+
+        for (;;) {
+            BOOLEAN active = FALSE;
+
+            WdfWaitLockAcquire(Ctx->JobLock, NULL);
+            for (n = 0; n < RKNPU_NUM_CORES; n++)
+                if (Ctx->Core[n].Job.Seq == in.seqno && Ctx->Core[n].Job.Owner == fo)
+                    break;
+            if (n < RKNPU_NUM_CORES)
+                active = JobActive(&Ctx->Core[n].Job);
+            WdfWaitLockRelease(Ctx->JobLock);
+            if (!active)
+                break;
+            now = KeQueryPerformanceCounter(NULL);
+            left = (LONGLONG)ms * 1000 - (LONGLONG)QpcToUs(Ctx, now.QuadPart - t0.QuadPart);
+            if (left <= 0)
+                break;
+            to.QuadPart = -10 * left;
+            if (KeWaitForSingleObject(&Ctx->Core[n].Done, Executive, KernelMode, FALSE, &to) == STATUS_TIMEOUT)
+                break;
+        }
+        now = KeQueryPerformanceCounter(NULL);
+        left = (LONGLONG)ms * 1000 - (LONGLONG)QpcToUs(Ctx, now.QuadPart - t0.QuadPart);
+        ms = left > 0 ? (ULONG)((left + 999) / 1000) : 0;
+    }
+
     WdfWaitLockAcquire(Ctx->JobLock, NULL);
     for (n = 0; n < RKNPU_NUM_CORES; n++)
         if (in.seqno != 0 && Ctx->Core[n].Job.Seq == in.seqno && Ctx->Core[n].Job.Owner == fo)
@@ -1241,6 +1590,8 @@ NpuWait(
                 out->task_count = r->TaskCount;
                 out->isr_count = r->IsrCount;
                 out->hw_us = r->HwUs;
+                out->fault_addr = r->FaultAddr;
+                out->fault_status = r->FaultStatus;
                 break;
             }
         }
@@ -1362,6 +1713,12 @@ NpuM3DeviceControl(
     case IOCTL_RKNPU_RESET:
         *Status = NpuReset(Ctx, Request, Info);
         return TRUE;
+    case IOCTL_RKNPU_PREP_BO:
+        *Status = NpuBoSync(Ctx, Request, TRUE);
+        return TRUE;
+    case IOCTL_RKNPU_FINI_BO:
+        *Status = NpuBoSync(Ctx, Request, FALSE);
+        return TRUE;
     default:
         *Status = STATUS_INVALID_DEVICE_REQUEST;
         return FALSE;
@@ -1403,9 +1760,7 @@ NpuM3FileCleanup(
         PNPU_BO bo = CONTAINING_RECORD(e, NPU_BO, Link);
         next = e->Flink;
         if (bo->Owner == FileObject) {
-            RemoveEntryList(&bo->Link);
-            Ctx->BoCount--;
-            Ctx->BoBytes -= bo->Size;
+            BoReleaseLocked(Ctx, bo);
             InsertTailList(&mine, &bo->Link);
         }
     }
@@ -1445,6 +1800,15 @@ NpuM3D0Exit(
         if (wake)
             KeSetEvent(&core->Done, IO_NO_INCREMENT, FALSE);
     }
+
+    /* M6: leave the IOMMUs as the firmware left them, paging off. The
+     * buffers keep their IOVAs; the next SUBMIT turns paging on again. */
+    if (Ctx->Mmu.On && Ctx->BoLock) {
+        WdfWaitLockAcquire(Ctx->BoLock, NULL);
+        for (n = 0; n < RKNPU_NUM_CORES; n++)
+            NpuMmuDisableLocked(Ctx, n);
+        WdfWaitLockRelease(Ctx->BoLock);
+    }
 }
 
 /* Device cleanup: every handle has closed, so nothing is mapped or running. */
@@ -1460,18 +1824,18 @@ NpuM3FreeAll(
         return;
     InitializeListHead(&mine);
     WdfWaitLockAcquire(Ctx->BoLock, NULL);
-    while (!IsListEmpty(&Ctx->Bos))
-        InsertTailList(&mine, RemoveHeadList(&Ctx->Bos));
+    while (!IsListEmpty(&Ctx->Bos)) {
+        PNPU_BO bo = CONTAINING_RECORD(Ctx->Bos.Flink, NPU_BO, Link);
+
+        BoReleaseLocked(Ctx, bo);
+        InsertTailList(&mine, &bo->Link);
+    }
     Ctx->BoCount = 0;
     Ctx->BoBytes = 0;
     WdfWaitLockRelease(Ctx->BoLock);
     while (!IsListEmpty(&mine))
         BoDestroy(CONTAINING_RECORD(RemoveHeadList(&mine), NPU_BO, Link));
     /* M4: every handle has closed, so no job is running from an arena */
-    for (n = 0; n < RKNPU_NUM_CORES; n++) {
-        if (Ctx->Core[n].Arena) {
-            MmFreeContiguousMemory(Ctx->Core[n].Arena);
-            Ctx->Core[n].Arena = NULL;
-        }
-    }
+    for (n = 0; n < RKNPU_NUM_CORES; n++)
+        NpuArenaFree(Ctx, n);
 }

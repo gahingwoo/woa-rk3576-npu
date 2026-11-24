@@ -28,6 +28,11 @@
  * INT_CLEAR. Nothing writes GLOBAL_OPERATION_ENABLE (0xf008): from core 0's
  * window it hits NPU1 in single-core mode.
  *
+ * M6 (iommu.c) programs the four IOMMU instances in the same window: their
+ * page table, paging on before a job, off before a reset and at D0 exit,
+ * and the fault interrupt. It also lets more than one handle open the device
+ * and makes the queue parallel, so both cores can be driven at once.
+ *
  * M3 (m3.c) adds buffers, job submission, completion and a core reset, all
  * behind IOCTLs of their own (0x810 on). The writes above stay the only ones
  * until one of those is called; then the job registers rocket writes are
@@ -176,7 +181,7 @@ NpuEvtIsr(
     CORE_STATE *core = &ctx->Core[n];
     ULONG base = NpuCoreBase(n);
     BOOLEAN ours = FALSE;
-    ULONG st, i;
+    ULONG st;
 
     UNREFERENCED_PARAMETER(MessageID);
 
@@ -196,16 +201,9 @@ NpuEvtIsr(
         ours = TRUE;
     }
 
-    /* The core's two IOMMU instances share the line. */
-    for (i = 0; i < RKNPU_MMUS_PER_CORE; i++) {
-        ULONG ms = NpuRd(ctx, base + MmuOff[i] + RK_MMU_INT_STATUS);
-        if (!ms)
-            continue;
-        core->LastMmuIntStatus[i] = ms;
-        core->LastMmuFault[i] = NpuRd(ctx, base + MmuOff[i] + RK_MMU_PAGE_FAULT_ADDR);
-        NpuWr(ctx, base + MmuOff[i] + RK_MMU_INT_CLEAR, ms);
+    /* The core's two IOMMU instances share the line (M6: a fault stops the job). */
+    if (NpuMmuIsr(ctx, n))
         ours = TRUE;
-    }
 
     if (!ours) {
         InterlockedIncrement(&core->IsrUnclaimed);
@@ -418,6 +416,8 @@ NpuFillCore(
     O->jobs_completed = (ULONG)core->JobsCompleted;
     O->jobs_timed_out = (ULONG)core->JobsTimedOut;
     O->resets         = (ULONG)core->Resets;
+    O->mmu_faults     = (ULONG)core->MmuFaults;
+    O->mmu_enables    = (ULONG)core->MmuEnables;
 }
 
 VOID
@@ -469,7 +469,12 @@ NpuEvtIoDeviceControl(
         o->m4_version = RKNPU_M4_VERSION;
         o->copy_arena_bytes = RKNPU_COPY_ARENA_BYTES;
         o->bo_max_kib = RKNPU_BO_MAX_SIZE / 1024;
-        o->bo_max_total_kib = RKNPU_BO_MAX_TOTAL / 1024;
+        o->bo_max_total_kib = (ULONG)(ctx->BoMaxTotal / 1024);
+        o->m6_version = RKNPU_M6_VERSION;
+        o->mem_mode = ctx->Mmu.On ? RKNPU_MEM_IOMMU : RKNPU_MEM_BYPASS;
+        o->bo_cached = ctx->CachedBos ? 1 : 0;
+        o->iova_kib = ctx->Mmu.ChunksUsed << (NPU_IOVA_CHUNK_SHIFT - 10);
+        o->pt_pages = ctx->Mmu.PtPages;
         info = sizeof(*o);
         break;
     }
@@ -547,6 +552,7 @@ NpuEvtDeviceCleanup(
     )
 {
     NpuM3FreeAll(GetContext((WDFDEVICE)Object));
+    NpuMmuFree(GetContext((WDFDEVICE)Object));     /* M6: the page tables, last */
 }
 
 /* ------------------------------------------------------------- setup */
@@ -602,7 +608,9 @@ NpuEvtDeviceAdd(
     WdfDeviceInitSetFileObjectConfig(DeviceInit, &fcfg, WDF_NO_OBJECT_ATTRIBUTES);
     WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, NpuEvtIoInCallerContext);
 
-    WdfDeviceInitSetExclusive(DeviceInit, TRUE);
+    /* M6: not exclusive; charsiu opens one handle per core. Each handle
+     * owns its buffers and jobs (m3.c), as in M4. */
+    WdfDeviceInitSetExclusive(DeviceInit, FALSE);
     status = WdfDeviceInitAssignName(DeviceInit, &name);
     if (!NT_SUCCESS(status))
         return status;
@@ -634,7 +642,8 @@ NpuEvtDeviceAdd(
             return status;
     }
 
-    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&qcfg, WdfIoQueueDispatchSequential);
+    /* M6: parallel, so a WAIT that blocks does not hold up the other core */
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&qcfg, WdfIoQueueDispatchParallel);
     qcfg.EvtIoDeviceControl = NpuEvtIoDeviceControl;
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
     attr.ExecutionLevel = WdfExecutionLevelPassive;
