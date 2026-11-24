@@ -80,7 +80,7 @@ jobs:
         run: |
           set -eux
           shellcheck tools/m4/*.sh
-          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/rknpu-reinstall.ps1; do
+          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/m7/m7-bench.ps1 tools/rknpu-reinstall.ps1; do
             F="$f" pwsh -NoProfile -Command '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:F, [ref]$null, [ref]$e); if ($e) { $e; exit 1 }'
           done
       - name: M4 device layer against the in-memory driver
@@ -92,6 +92,14 @@ jobs:
           # and, with RKNPU_FAKE_M4=1, the same against the M4 driver
           make -C port check
           RKNPU_FAKE_M4=1 port/build/host/devtest
+          # M7: the M6 driver (no fused PREP / FINI), the SUBMIT threads,
+          # and the maintenance in the process, alone and together
+          RKNPU_FAKE_M6=1 port/build/host/devtest
+          CHARSIU_RKNPU_FUSE=0 port/build/host/devtest
+          CHARSIU_RKNPU_ASYNC=1 port/build/host/devtest
+          CHARSIU_RKNPU_ASYNC=1 RKNPU_FAKE_M6=1 port/build/host/devtest
+          RKNPU_FAKE_UCACHE=1 CHARSIU_RKNPU_UCACHE=1 port/build/host/devtest
+          CHARSIU_RKNPU_ASYNC=1 RKNPU_FAKE_UCACHE=1 CHARSIU_RKNPU_UCACHE=1 port/build/host/devtest
       - name: Wording
         run: |
           # No en or em dashes, and the project's wording rule for public files.
@@ -163,15 +171,16 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: charsiu-m4-linux-ref
-          path: ${{ runner.temp }}/charsiu-m6/linux
+          path: ${{ runner.temp }}/charsiu-m7/linux
       - name: Stage
         run: |
           set -eux
-          out="$RUNNER_TEMP/charsiu-m6"
+          out="$RUNNER_TEMP/charsiu-m7"
           mkdir -p "$out"
           chmod +x "$out"/linux/*
           cp port/build/win/*.exe "$out/"
-          cp docs/M4.md docs/M6.md tools/m4/*.ps1 tools/m4/*.sh tools/m6/*.ps1 external/charsiu/tests/corpus/long.txt "$out/"
+          cp docs/M4.md docs/M6.md docs/M7.md tools/m4/*.ps1 tools/m4/*.sh tools/m6/*.ps1 external/charsiu/tests/corpus/long.txt "$out/"
+          cp tools/m7/m7-bench.ps1 "$out/"
           cp LICENSE "$out/LICENSE.txt"
           cp port/libm/LICENSE.optimized-routines "$out/"
           git -C external/charsiu rev-parse HEAD > "$out/charsiu-commit.txt"
@@ -181,8 +190,8 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: charsiu-m6-arm64
-          path: ${{ runner.temp }}/charsiu-m6
+          name: charsiu-m7-arm64
+          path: ${{ runner.temp }}/charsiu-m7
           if-no-files-found: error
 
   windows:
@@ -244,7 +253,7 @@ jobs:
           $kits = 'C:\Program Files (x86)\Windows Kits\10'
           $st   = Join-Path $kits "bin\$env:WDK_VERSION\x86\signtool.exe"
           $i2c  = Join-Path $kits "bin\$env:WDK_VERSION\x86\inf2cat.exe"
-          $out  = Join-Path $env:RUNNER_TEMP 'rknpu-m6'
+          $out  = Join-Path $env:RUNNER_TEMP 'rknpu-m7'
           $drv  = Join-Path $out 'rknpu'
           New-Item -ItemType Directory -Force -Path $drv | Out-Null
 
@@ -288,7 +297,7 @@ jobs:
             if ($sig.Status -eq 'NotSigned') { throw "$($sig.Path) came out unsigned" }
           }
           Export-Certificate -Cert $cert -FilePath (Join-Path $out 'signer.cer') | Out-Null
-          Copy-Item docs\M2.md, docs\M3.md, docs\M4.md, docs\M6.md, tools\rknpu-reinstall.ps1 $out -Force
+          Copy-Item docs\M2.md, docs\M3.md, docs\M4.md, docs\M6.md, docs\M7.md, tools\rknpu-reinstall.ps1 $out -Force
           Get-ChildItem $out -Recurse -File | Select-Object FullName, Length |
             Format-Table -AutoSize | Out-String | Write-Host
           "STAGE=$out" >> $env:GITHUB_ENV
@@ -296,6 +305,6 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: rknpu-m6-arm64
+          name: rknpu-m7-arm64
           path: ${{ env.STAGE }}
           if-no-files-found: error

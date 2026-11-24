@@ -374,8 +374,8 @@ FILE *charsiu_compat_fopen(const char *path, const char *mode)
  * idle-state latency limit. On this firmware it does not need one, because
  * without the "CPU Idle States" setup option there is no _LPI and Windows
  * idles in WFI only, which is what the 100 us bound leaves Linux; the line
- * below says how many idle states Windows reports, and win-bench's
- * -IdleDisable arm (the processor idle-disable power setting) is the control.
+ * below says how many idle states Windows reports, and m7-bench's
+ * short-idle arm (the processor idle-disable power setting) is the control.
  *
  * CHARSIU_RKNPU_QOS=0 skips both (the open still succeeds, so charsiu's
  * message is the same); CHARSIU_NPU_IDLE=1 keeps charsiu from asking.
@@ -411,7 +411,7 @@ static void qos_hold(void)
 		"Windows reports %lu idle state%s past the first%s\n",
 		thr ? "off" : "unchanged (refused)", tim ? "1 ms" : "default",
 		(unsigned long)cpus.max_idle, cpus.max_idle == 1 ? "" : "s",
-		cpus.max_idle ? " (the firmware's _LPI: win-bench -IdleDisable is the control)"
+		cpus.max_idle ? " (the firmware's _LPI: m7-bench's short-idle arm is the control)"
 			      : " (WFI only, which is what Linux's 100 us bound allows)");
 }
 

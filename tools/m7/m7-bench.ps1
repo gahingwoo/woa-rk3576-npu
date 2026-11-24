@@ -1,7 +1,7 @@
-# win-bench.ps1 - M7 on the board: where a decode token goes, and what each M7 change buys
+# m7-bench.ps1 - M7 on the board: where a decode token goes, and what each M7 change buys
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File win-bench.ps1 -Model R:\npu\Llama-3.2-1B-Instruct-Q8_0.gguf [-Out R:\npu\m7-windows] [-Quick] [-SkipDriverTests] [-IdleDisable] [-KeepCache]
-#   powershell -NoProfile -ExecutionPolicy Bypass -File win-bench.ps1 -Report R:\npu\m7-windows
+#   powershell -NoProfile -ExecutionPolicy Bypass -File m7-bench.ps1 -Model R:\npu\Llama-3.2-1B-Instruct-Q8_0.gguf [-Out R:\npu\m7-windows] [-Quick] [-SkipDriverTests] [-IdleDisable] [-KeepCache]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File m7-bench.ps1 -Report R:\npu\m7-windows
 #
 # As administrator, from the unpacked charsiu-m7-arm64 artifact with
 # rknputest.exe from rknpu-m7-arm64 beside it (docs/M7.md). Each step writes
@@ -66,7 +66,7 @@ $crumbs = 'HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\RKCP3576\0\Device Parameters'
 # maximum and held out of deep idle (charsiu docs/paper-evidence.md 1.)
 $linuxTokS = 18.15
 
-function Die($m) { Write-Host "win-bench: $m" -ForegroundColor Red; exit 1 }
+function Die($m) { Write-Host "m7-bench: $m" -ForegroundColor Red; exit 1 }
 
 # ---- the arms ------------------------------------------------------------------
 
@@ -331,7 +331,7 @@ $Out = (Resolve-Path $Out).Path
 
 Get-ChildItem Env: | Where-Object { $_.Name -like 'CHARSIU_*' } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 
-Write-Host 'win-bench: checking the model (1.3 GB)'
+Write-Host 'm7-bench: checking the model (1.3 GB)'
 $got = (Get-FileHash -Algorithm SHA256 $Model).Hash.ToLower()
 if ($got -ne $sha) { Die "$Model is not Llama-3.2-1B-Instruct-Q8_0.gguf (sha256 $got)" }
 $wcache = "$Model.wcache"
@@ -395,16 +395,16 @@ Cmd "`"$run`" --version" (Join-Path $Out 'version.txt') (Join-Path $Out 'version
 
 # ---- 1. the driver -----------------------------------------------------------
 
-Write-Host 'win-bench: rknputest info'
+Write-Host 'm7-bench: rknputest info'
 Cmd "`"$rkt`" info" (Join-Path $Out 'info-before.txt') (Join-Path $Out 'info-before.err') | Out-Null
 if (-not (Select-String -Quiet -Path (Join-Path $Out 'info-before.txt') -Pattern '^m6: version .*memory IOMMU')) {
     Die "the driver is not in IOMMU mode (see $Out\info-before.txt)"
 }
 if (-not $SkipDriverTests) {
-    Write-Host 'win-bench: rknputest m3'
+    Write-Host 'm7-bench: rknputest m3'
     $rc = Cmd "`"$rkt`" m3" (Join-Path $Out 'm3.txt') (Join-Path $Out 'm3.err')
     if ($rc -ne 0) { Die "rknputest m3 failed ($rc): stop here and send $Out" }
-    Write-Host 'win-bench: rknputest m6'
+    Write-Host 'm7-bench: rknputest m6'
     $rc = Cmd "`"$rkt`" m6" (Join-Path $Out 'm6.txt') (Join-Path $Out 'm6.err')
     if ($rc -ne 0) { Die "rknputest m6 failed ($rc): stop here and send $Out" }
 }
@@ -418,12 +418,12 @@ $npu = @{ CHARSIU_NPU = '1'; CHARSIU_NPU_QUANT = '1'; CHARSIU_NPU_W4V = '1'; CHA
 $idleAll = $null
 if ($IdleDisable) {
     $idleAll = Idle-Set $true
-    Write-Host "win-bench: processor idle disabled for every arm (was $idleAll)"
+    Write-Host "m7-bench: processor idle disabled for every arm (was $idleAll)"
 }
 try {
     foreach ($a in $armList) {
         if ($Quick -and $quickArms -notcontains $a.Name) { continue }
-        Write-Host "win-bench: $($a.Name)"
+        Write-Host "m7-bench: $($a.Name)"
         $set = @{}
         foreach ($k in $npu.Keys) { $set[$k] = $npu[$k] }
         foreach ($k in $a.Env.Keys) { $set[$k] = $a.Env[$k] }
@@ -448,7 +448,7 @@ try {
 } finally {
     if ($IdleDisable) {
         Idle-Restore $idleAll
-        Write-Host "win-bench: processor idle setting restored ($idleAll)"
+        Write-Host "m7-bench: processor idle setting restored ($idleAll)"
     }
 }
 
@@ -462,4 +462,4 @@ $lines = Get-ChildItem (Join-Path $Out '*.text') | Sort-Object Name | ForEach-Ob
 [IO.File]::WriteAllText((Join-Path $Out 'text.md5'), (($lines -join "`n") + "`n"))
 Write-Tables $Out
 Compress-Archive -Force -Path $Out -DestinationPath "$Out.zip"
-Write-Host "win-bench: done, send $Out.zip"
+Write-Host "m7-bench: done, send $Out.zip"
