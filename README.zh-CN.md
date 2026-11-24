@@ -46,6 +46,14 @@ Linux 上能用 NPU 跑的模型，在 Windows 上也能跑。
 
 工作量估算和风险见研究报告。
 
+## 查看 NPU 状态
+
+Windows 11 23H2 的任务管理器没有 NPU 页面。rknpu.sys 改为提供 Windows
+性能计数器：`RK3576 NPU`（每个核心：忙碌百分比、每秒作业数和任务数、平均作业时间、
+提交到完成的延迟、超时、复位、IOMMU 错误、CBUF 等待）和 `RK3576 NPU Memory`，
+可用 perfmon、`typeperf` 和 `Get-Counter "\RK3576 NPU(*)\*"` 查看
+（[docs/PERFCOUNTERS.md](docs/PERFCOUNTERS.md)；分支 `npu-perfcounters`，尚未在板子上运行）。
+
 ## 开发板
 
 立创泰山派 3M 和 ArmSoM CM5-IO，即

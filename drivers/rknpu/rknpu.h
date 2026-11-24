@@ -186,6 +186,25 @@ typedef struct _CORE_JOB {
     rknpu_task      Tasks[RKNPU_MAX_TASKS];
 } CORE_JOB;
 
+/*
+ * The performance counters' running totals for one core (perf.c). Written
+ * only under the core's interrupt lock (ISR, DPC, SUBMIT's start of the job,
+ * the stop paths), so the writers never race each other; Seq is odd while a
+ * writer is inside, and the counter callback reads a consistent copy
+ * without taking the lock. Times are QPC ticks, converted only when read.
+ */
+typedef struct _CORE_PERF {
+    volatile LONG   Seq;
+    LONGLONG        RunStart;       /* QPC of the running job's first OPERATION_ENABLE; 0: idle */
+    LONGLONG        SubmitQpc;      /* QPC when that job's SUBMIT came in */
+    ULONGLONG       BusyTicks;      /* sum of T1 - T0 over the jobs that ended */
+    ULONGLONG       JobsEnded;      /* done, DMA error, IOMMU fault, timeout, stopped */
+    ULONGLONG       TasksDone;
+    ULONGLONG       JobsDone;       /* finished through the DPC (what a WAIT sees as completed) */
+    ULONGLONG       LatencyTicks;   /* sum of SUBMIT in to DPC, over JobsDone */
+    volatile LONG64 LastBusy100ns;  /* reader only: keeps % busy monotonic */
+} CORE_PERF;
+
 typedef struct _CORE_STATE {
     WDFINTERRUPT    Interrupt;
     ULONG           Gsiv;
@@ -215,6 +234,9 @@ typedef struct _CORE_STATE {
     volatile LONG   MmuFaults;
     volatile LONG   MmuEnables;
     volatile LONG   CbufWaits;      /* SUBMITs that waited for the other core's same-window job */
+
+    /* performance counters (perf.c) */
+    CORE_PERF       Perf;
 } CORE_STATE;
 
 /* M4: a finished job, kept so a WAIT that comes after another handle's job
@@ -311,6 +333,15 @@ BOOLEAN NpuM3DeviceControl(_In_ PDEVICE_CONTEXT Ctx, _In_ WDFREQUEST Request, _I
 VOID NpuM3FileCleanup(_In_ PDEVICE_CONTEXT Ctx, _In_ WDFFILEOBJECT FileObject);
 VOID NpuM3FreeAll(_In_ PDEVICE_CONTEXT Ctx);
 VOID NpuM3JobFaultLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N, _In_ ULONG Iova, _In_ ULONG Status);
+
+/* perf.c: the "RK3576 NPU" and "RK3576 NPU Memory" counter sets. Register
+ * failing is logged and otherwise ignored. The *Locked calls hold the
+ * core's interrupt lock. */
+VOID NpuPerfRegister(_In_ PDEVICE_CONTEXT Ctx);
+VOID NpuPerfUnregister(VOID);
+VOID NpuPerfJobStartLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N, _In_ LONGLONG SubmitQpc);
+VOID NpuPerfJobEndLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N);
+VOID NpuPerfJobDoneLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N);
 
 /* iommu.c (M6). BoLock held for everything but Init, Free and the ISR part. */
 NTSTATUS NpuMmuInit(_In_ PDEVICE_CONTEXT Ctx);

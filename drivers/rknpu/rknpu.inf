@@ -9,6 +9,13 @@
 ; only). It runs an NPU job only when asked to through the M3 IOCTLs
 ; (rknputest m3); until then it does what the M2 driver did.
 ;
+; rknpu.man, the performance counter manifest ("RK3576 NPU", "RK3576 NPU
+; Memory"), is copied into the driver store beside rknpu.sys. An INF has no
+; directive that registers a counter provider, so lodctr is run by
+; tools\rknpu-perfcounters.ps1 after the driver is bound, and unlodctr by
+; the same script with -Uninstall (docs/PERFCOUNTERS.md). Without that step
+; the driver runs the same; the counters are just not visible.
+;
 ; Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
 ; SPDX-License-Identifier: GPL-2.0-only
 ;
@@ -30,6 +37,7 @@ DefaultDestDir = 13
 
 [SourceDisksFiles]
 rknpu.sys = 1
+rknpu.man = 1
 
 [Manufacturer]
 %ProviderName% = Standard,NTARM64.10.0...16299
@@ -42,6 +50,7 @@ CopyFiles = RKNPU_CopyFiles
 
 [RKNPU_CopyFiles]
 rknpu.sys
+rknpu.man
 
 [RKNPU_Inst.NT.Services]
 AddService = rknpu,0x00000002,RKNPU_Service

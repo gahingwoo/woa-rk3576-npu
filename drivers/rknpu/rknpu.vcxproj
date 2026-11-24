@@ -61,8 +61,23 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <!-- _KERNEL_MODE is predefined by the WDK toolset; redefining it is C4117. -->
       <PreprocessorDefinitions>%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- $(IntDir): rknpuCounters.h, which ctrpp makes from rknpu.man -->
+      <AdditionalIncludeDirectories>$(ProjectDir)..\..\include;$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
+
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+
+    <!-- Performance counters (perf.c), as the WDK's kcs sample builds them:
+         RknpuRegisterNpuCore, RknpuAddNpuCore, ... and the string table -->
+    <Ctrpp>
+      <AddPrefix>Rknpu</AddPrefix>
+      <HeaderFileNameForProvider>$(IntDir)%(Filename)Counters.h</HeaderFileNameForProvider>
+      <GenerateResourceSourceFile>true</GenerateResourceSourceFile>
+      <HeaderFileNameForCounter>$(IntDir)%(Filename)_counterIds.h</HeaderFileNameForCounter>
+      <ResourceFileName>$(IntDir)%(Filename)Counters.rc</ResourceFileName>
+    </Ctrpp>
 
     <Inf>
       <SpecifyArchitecture>true</SpecifyArchitecture>
@@ -74,6 +89,14 @@
     <ClCompile Include="driver.c" />
     <ClCompile Include="m3.c" />
     <ClCompile Include="iommu.c" />
+    <ClCompile Include="perf.c" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Ctrpp Include="rknpu.man">
+      <FileType>Manifest</FileType>
+    </Ctrpp>
+    <ResourceCompile Include="rknpu.rc" />
   </ItemGroup>
 
   <!-- M6: DC CVAC / DC CIVAC, which have no compiler intrinsic (armasm64, as
@@ -84,6 +107,7 @@
 
   <ItemGroup>
     <ClInclude Include="rknpu.h" />
+    <ClInclude Include="rknpu_perf.h" />
     <ClInclude Include="..\..\include\rknpu_ioctl.h" />
     <ClInclude Include="..\..\include\rknpu_regcmd.h" />
     <ClInclude Include="..\..\include\rknpu_regcmd_allow.h" />
@@ -101,6 +125,8 @@
   -->
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
+    <!-- the counter manifest, in the driver store beside rknpu.sys, for lodctr -->
+    <FilesToPackage Include="$(ProjectDir)rknpu.man" />
     <FilesToPackage Include="@(Inf->'%(CopyOutput)')" Condition="'@(Inf)'!=''" />
   </ItemGroup>
 

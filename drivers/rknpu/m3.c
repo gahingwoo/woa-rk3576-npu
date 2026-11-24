@@ -389,6 +389,7 @@ NpuM3Isr(
     j->T1 = KeQueryPerformanceCounter(NULL);
     j->InFlight = FALSE;
     j->CompletePending = TRUE;
+    NpuPerfJobEndLocked(Ctx, N);
     return TRUE;
 }
 
@@ -406,8 +407,10 @@ NpuM3Dpc(
     done = core->Job.CompletePending;
     core->Job.CompletePending = FALSE;
     /* M7: irq_dpc_us; written while the job is still this core's */
-    if (done)
+    if (done) {
         core->Job.T2 = KeQueryPerformanceCounter(NULL);
+        NpuPerfJobDoneLocked(Ctx, N);
+    }
     WdfInterruptReleaseLock(core->Interrupt);
     if (done) {
         InterlockedIncrement(&core->JobsCompleted);
@@ -445,6 +448,7 @@ NpuM3JobFaultLocked(
     j->T1 = KeQueryPerformanceCounter(NULL);
     j->InFlight = FALSE;
     j->CompletePending = TRUE;
+    NpuPerfJobEndLocked(Ctx, N);
 }
 
 /*
@@ -475,6 +479,7 @@ NpuJobStop(
         j->CompletePending = FALSE;
         j->Result = RKNPU_JOB_TIMEOUT;
         j->T1 = KeQueryPerformanceCounter(NULL);
+        NpuPerfJobEndLocked(Ctx, N);
         stopped = TRUE;
     }
     WdfInterruptReleaseLock(core->Interrupt);
@@ -1576,6 +1581,7 @@ NpuSubmit(
     WdfInterruptAcquireLock(core->Interrupt);
     j->InFlight = TRUE;
     j->T0 = KeQueryPerformanceCounter(NULL);
+    NpuPerfJobStartLocked(Ctx, n, tIn.QuadPart);
     NpuHwSubmit(Ctx, n);
     WdfInterruptReleaseLock(core->Interrupt);
 
@@ -1927,6 +1933,8 @@ NpuM3D0Exit(
             NpuWr(Ctx, base + PC_INTERRUPT_CLEAR, PC_INTERRUPT_ALL);
             core->Job.InFlight = FALSE;
             core->Job.Result = RKNPU_JOB_TIMEOUT;
+            core->Job.T1 = KeQueryPerformanceCounter(NULL);
+            NpuPerfJobEndLocked(Ctx, n);
             wake = TRUE;
         }
         WdfInterruptReleaseLock(core->Interrupt);

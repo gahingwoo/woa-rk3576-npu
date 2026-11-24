@@ -76,11 +76,21 @@ jobs:
           # the headers alone, freestanding, as the driver and port/ see them
           printf '#include "rknpu_ioctl.h"\n#include "rknpu_regcmd.h"\n' > hdr.c
           gcc -std=c99 -ffreestanding -nostdinc -Wall -Wextra -Werror -Iinclude -c hdr.c -o /dev/null
+      - name: Performance counters (manifest and values)
+        run: |
+          set -eux
+          # rknpu.man against the structures the driver fills, and the
+          # tick conversion the counter callback uses
+          python3 tools/perfcheck/check_manifest.py drivers/rknpu/rknpu.man \
+              drivers/rknpu/rknpu_perf.h tools/rknpu-perfcounters.ps1
+          gcc -std=c99 -O2 -Wall -Wextra -Werror -pedantic -Idrivers/rknpu \
+              -o perfcheck tools/perfcheck/perfcheck.c
+          ./perfcheck
       - name: M4 board scripts parse
         run: |
           set -eux
           shellcheck tools/m4/*.sh
-          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/m7/m7-bench.ps1 tools/rknpu-reinstall.ps1; do
+          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/m7/m7-bench.ps1 tools/rknpu-reinstall.ps1 tools/rknpu-perfcounters.ps1; do
             F="$f" pwsh -NoProfile -Command '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:F, [ref]$null, [ref]$e); if ($e) { $e; exit 1 }'
           done
       - name: M4 device layer against the in-memory driver
@@ -222,7 +232,8 @@ jobs:
             "$kits\Include\wdf\kmdf\1.33\wdf.h",
             "$kits\Lib\$ver\km\arm64\ntoskrnl.lib",
             "$kits\bin\$ver\x86\inf2cat.exe",
-            "$kits\bin\$ver\x86\signtool.exe"
+            "$kits\bin\$ver\x86\signtool.exe",
+            "$kits\bin\$ver\x64\ctrpp.exe"
           )
           $missing = $need | Where-Object { -not (Test-Path $_) }
           if ($missing) {
@@ -259,7 +270,7 @@ jobs:
 
           # the stamped INF and the .sys from the package directory
           $pkg = 'drivers\rknpu\ARM64\Release\rknpu'
-          foreach ($f in 'rknpu.sys', 'rknpu.inf') {
+          foreach ($f in 'rknpu.sys', 'rknpu.inf', 'rknpu.man') {
             $p = Join-Path $pkg $f
             if (-not (Test-Path $p)) { throw "missing $p" }
             Copy-Item $p $drv -Force
@@ -297,7 +308,14 @@ jobs:
             if ($sig.Status -eq 'NotSigned') { throw "$($sig.Path) came out unsigned" }
           }
           Export-Certificate -Cert $cert -FilePath (Join-Path $out 'signer.cer') | Out-Null
-          Copy-Item docs\M2.md, docs\M3.md, docs\M4.md, docs\M6.md, docs\M7.md, tools\rknpu-reinstall.ps1 $out -Force
+          Copy-Item docs\M2.md, docs\M3.md, docs\M4.md, docs\M6.md, docs\M7.md, docs\PERFCOUNTERS.md, tools\rknpu-reinstall.ps1, tools\rknpu-perfcounters.ps1 $out -Force
+          # the counter names went into rknpu.sys, and the package's version
+          $sys = [System.IO.File]::ReadAllBytes((Join-Path $drv 'rknpu.sys'))
+          $txt = [System.Text.Encoding]::Unicode.GetString($sys)
+          if (-not $txt.Contains('RK3576 NPU')) { throw 'rknpu.sys carries no counter names (rknpuCounters.rc not linked)' }
+          $dv = Select-String -Path (Join-Path $drv 'rknpu.inf') -Pattern '^DriverVer' | Select-Object -First 1
+          Write-Host "::notice::rknpu $($dv.Line)"
+          $dv.Line | Out-File -FilePath (Join-Path $out 'DriverVer.txt') -Encoding ascii
           Get-ChildItem $out -Recurse -File | Select-Object FullName, Length |
             Format-Table -AutoSize | Out-String | Write-Host
           "STAGE=$out" >> $env:GITHUB_ENV

@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  rknpu.man - Windows performance counters of rknpu.sys (kernel-mode PCW provider)
+
+  Two counter sets:
+    "RK3576 NPU"         one instance per NPU core, core0 and core1: % busy,
+                         jobs and tasks per second, average job time and
+                         SUBMIT-to-completion latency, and the totals of
+                         submits, completions, timeouts, resets, IOMMU faults
+                         and CBUF waits;
+    "RK3576 NPU Memory"  one instance: the buffers and the NPU address space.
+
+  ctrpp turns this into rknpuCounters.h and rknpuCounters.rc (rknpu.vcxproj);
+  the .rc holds the names below and is linked into rknpu.sys, which
+  applicationIdentity names. Registering the provider (lodctr /m) is
+  tools/rknpu-perfcounters.ps1; docs/PERFCOUNTERS.md has the details.
+  Counter ids and the GUIDs are an interface: never renumber, only add.
+
+  Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
+  SPDX-License-Identifier: GPL-2.0-only
+-->
+<instrumentationManifest
+    xmlns="http://schemas.microsoft.com/win/2004/08/events"
+    xmlns:win="http://manifests.microsoft.com/win/2004/08/windows/events"
+    xmlns:xs="http://www.w3.org/2001/XMLSchema"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://schemas.microsoft.com/win/2004/08/events eventman.xsd">
+    <instrumentation>
+        <counters xmlns="http://schemas.microsoft.com/win/2005/12/counters" schemaVersion="1.1">
+            <provider callback="custom"
+                      applicationIdentity="rknpu.sys"
+                      providerType="kernelMode"
+                      providerName="rknpu"
+                      providerGuid="{6f33a325-aa80-4286-b76c-0b11e14f9f2b}">
+                <counterSet guid="{81d937ba-2ba3-4a83-b542-2caff12b0ca1}"
+                            uri="WoaRk3576.Rknpu.Core"
+                            name="RK3576 NPU"
+                            description="Rockchip RK3576 NPU (rknpu.sys), one instance per NPU core."
+                            symbol="NpuCore"
+                            instances="multiple">
+                    <structs>
+                        <struct name="NpuCoreValues" type="RKNPU_PERF_CORE"/>
+                    </structs>
+                    <counter id="1" uri="WoaRk3576.Rknpu.Core.BusyTime" name="% Busy Time" description="Share of the interval in which a job held this NPU core, from its first task's start to its last interrupt."
+                             struct="NpuCoreValues" field="BusyTime" type="perf_100nsec_timer" detailLevel="standard"/>
+                    <counter id="2" uri="WoaRk3576.Rknpu.Core.JobsCompleted" name="Jobs/sec" description="Jobs this core completed per second (a job is one SUBMIT; it may hold several tasks)."
+                             struct="NpuCoreValues" field="JobsCompleted" type="perf_counter_bulk_count" detailLevel="standard"/>
+                    <counter id="3" uri="WoaRk3576.Rknpu.Core.TasksCompleted" name="Tasks/sec" description="Tasks this core finished per second."
+                             struct="NpuCoreValues" field="TasksCompleted" type="perf_counter_bulk_count" detailLevel="standard"/>
+                    <counter id="4" uri="WoaRk3576.Rknpu.Core.JobTimeUs" name="Avg. Job Time (us)" description="Average time a job ran on the core in the interval, in microseconds: first OPERATION_ENABLE to the last interrupt."
+                             struct="NpuCoreValues" field="JobTimeUs" type="perf_average_bulk" baseID="5" detailLevel="standard"/>
+                    <counter id="5" uri="WoaRk3576.Rknpu.Core.JobTimeBase" struct="NpuCoreValues" field="JobTimeBase" type="perf_average_base" detailLevel="standard">
+                        <counterAttributes>
+                            <counterAttribute name="noDisplay"/>
+                        </counterAttributes>
+                    </counter>
+                    <counter id="6" uri="WoaRk3576.Rknpu.Core.LatencyUs" name="Avg. Submit to Complete (us)" description="Average time from a SUBMIT entering the driver to the driver's completion of that job (its DPC), in microseconds. Includes any wait for the other core on the same CBUF window."
+                             struct="NpuCoreValues" field="LatencyUs" type="perf_average_bulk" baseID="7" detailLevel="standard"/>
+                    <counter id="7" uri="WoaRk3576.Rknpu.Core.LatencyBase" struct="NpuCoreValues" field="LatencyBase" type="perf_average_base" detailLevel="standard">
+                        <counterAttributes>
+                            <counterAttribute name="noDisplay"/>
+                        </counterAttributes>
+                    </counter>
+                    <counter id="8" uri="WoaRk3576.Rknpu.Core.JobsSubmitted" name="Jobs Submitted" description="Jobs submitted to this core since the driver started."
+                             struct="NpuCoreValues" field="JobsSubmitted" type="perf_counter_large_rawcount" detailLevel="standard"/>
+                    <counter id="9" uri="WoaRk3576.Rknpu.Core.JobsCompletedTotal" name="Jobs Completed" description="Jobs this core completed since the driver started."
+                             struct="NpuCoreValues" field="JobsCompletedTotal" type="perf_counter_large_rawcount" detailLevel="standard"/>
+                    <counter id="10" uri="WoaRk3576.Rknpu.Core.Timeouts" name="Job Timeouts" description="Jobs on this core stopped by a WAIT timeout since the driver started."
+                             struct="NpuCoreValues" field="Timeouts" type="perf_counter_rawcount" detailLevel="standard"/>
+                    <counter id="11" uri="WoaRk3576.Rknpu.Core.Resets" name="Core Resets" description="Soft resets of this core since the driver started."
+                             struct="NpuCoreValues" field="Resets" type="perf_counter_rawcount" detailLevel="standard"/>
+                    <counter id="12" uri="WoaRk3576.Rknpu.Core.MmuFaults" name="IOMMU Faults" description="Page faults and bus errors raised by this core's IOMMUs since the driver started."
+                             struct="NpuCoreValues" field="MmuFaults" type="perf_counter_rawcount" detailLevel="standard"/>
+                    <counter id="13" uri="WoaRk3576.Rknpu.Core.CbufWaits" name="CBUF Waits" description="SUBMITs to this core that waited for the other core's job on the same CBUF window, since the driver started."
+                             struct="NpuCoreValues" field="CbufWaits" type="perf_counter_rawcount" detailLevel="standard"/>
+                    <counter id="14" uri="WoaRk3576.Rknpu.Core.Running" name="Job Running" description="1 while a job is on this core, 0 when it is idle."
+                             struct="NpuCoreValues" field="Running" type="perf_counter_rawcount" detailLevel="standard"/>
+                </counterSet>
+                <counterSet guid="{39cec51b-c934-4267-bfec-b40e685e76db}"
+                            uri="WoaRk3576.Rknpu.Memory"
+                            name="RK3576 NPU Memory"
+                            description="Rockchip RK3576 NPU (rknpu.sys): buffers and the NPU address space, all cores together."
+                            symbol="NpuMemory"
+                            instances="single">
+                    <structs>
+                        <struct name="NpuMemoryValues" type="RKNPU_PERF_MEMORY"/>
+                    </structs>
+                    <counter id="1" uri="WoaRk3576.Rknpu.Memory.BufferBytes" name="Buffer Bytes" description="Bytes in the NPU buffers that exist now, all handles together."
+                             struct="NpuMemoryValues" field="BufferBytes" type="perf_counter_large_rawcount" detailLevel="standard"/>
+                    <counter id="2" uri="WoaRk3576.Rknpu.Memory.Buffers" name="Buffers" description="NPU buffers that exist now."
+                             struct="NpuMemoryValues" field="Buffers" type="perf_counter_rawcount" detailLevel="standard"/>
+                    <counter id="3" uri="WoaRk3576.Rknpu.Memory.IovaBytes" name="NPU Address Space Bytes" description="Bytes of the NPU's address space mapped through its IOMMU now (0 in bypass mode)."
+                             struct="NpuMemoryValues" field="IovaBytes" type="perf_counter_large_rawcount" detailLevel="standard"/>
+                    <counter id="4" uri="WoaRk3576.Rknpu.Memory.PageTablePages" name="Page Table Pages" description="Pages of IOMMU page tables, the directory included."
+                             struct="NpuMemoryValues" field="PageTablePages" type="perf_counter_rawcount" detailLevel="standard"/>
+                </counterSet>
+            </provider>
+        </counters>
+    </instrumentation>
+</instrumentationManifest>

@@ -52,6 +52,16 @@ is [docs/M2.md](docs/M2.md).
 
 Estimates and risks are in the study.
 
+## Watching the NPU
+
+Windows 11 23H2 has no NPU page in Task Manager. rknpu.sys publishes
+Windows performance counters instead: `RK3576 NPU` (per core: % busy,
+jobs and tasks per second, average job time and submit-to-complete
+latency, timeouts, resets, IOMMU faults, CBUF waits) and `RK3576 NPU
+Memory`, for perfmon, `typeperf` and `Get-Counter "\RK3576 NPU(*)\*"`
+([docs/PERFCOUNTERS.md](docs/PERFCOUNTERS.md); branch `npu-perfcounters`,
+not run on a board).
+
 ## Boards
 
 The LCKFB TaishanPi 3M and the ArmSoM CM5-IO, the boards

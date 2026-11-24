@@ -33,6 +33,9 @@
  * and the fault interrupt. It also lets more than one handle open the device
  * and makes the queue parallel, so both cores can be driven at once.
  *
+ * perf.c publishes the job counters as Windows performance counters
+ * ("RK3576 NPU", one instance per core, and "RK3576 NPU Memory").
+ *
  * M3 (m3.c) adds buffers, job submission, completion and a core reset, all
  * behind IOCTLs of their own (0x810 on). The writes above stay the only ones
  * until one of those is called; then the job registers rocket writes are
@@ -553,6 +556,7 @@ NpuEvtDeviceCleanup(
     _In_ WDFOBJECT Object
     )
 {
+    NpuPerfUnregister();    /* first: no counter callback reads the context after this */
     NpuM3FreeAll(GetContext((WDFDEVICE)Object));
     NpuMmuFree(GetContext((WDFDEVICE)Object));     /* M6: the page tables, last */
 }
@@ -649,7 +653,13 @@ NpuEvtDeviceAdd(
     qcfg.EvtIoDeviceControl = NpuEvtIoDeviceControl;
     WDF_OBJECT_ATTRIBUTES_INIT(&attr);
     attr.ExecutionLevel = WdfExecutionLevelPassive;
-    return WdfIoQueueCreate(device, &qcfg, &attr, &ctx->Queue);
+    status = WdfIoQueueCreate(device, &qcfg, &attr, &ctx->Queue);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    /* Performance counters (perf.c): optional, the device starts without them */
+    NpuPerfRegister(ctx);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
