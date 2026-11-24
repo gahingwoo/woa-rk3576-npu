@@ -110,7 +110,9 @@
  *     largest SUBMIT is 16 streams of 148 entries, 18944 bytes.
  *   - Because a copied stream cannot change after the check, the M3 rules
  *     that kept a checked stream fixed (MAP_BO and WRITE_BO refused while a
- *     job runs) now apply only while a job submitted WITHOUT the flag runs.
+ *     job runs) now apply only while a job submitted WITHOUT the flag runs,
+ *     and (M6) only to that job's own handle: no other handle can write or
+ *     map those buffers anyway, so its WRITE_BO and MAP_BO go ahead.
  *     FREE_BO is refused only while a job of the same handle runs: a job can
  *     only reach its own handle's buffers through the registers checked.
  *   - WAIT with RKNPU_WAIT_POLL returns RKNPU_JOB_RUNNING if the job has not

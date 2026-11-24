@@ -73,9 +73,11 @@ static int dev_ioctl(DWORD code, const void *in, DWORD in_len, void *out, DWORD 
 }
 #elif defined(RKNPU_FAKE_DEVICE)
 #include "fakedev.h"
+#include <pthread.h>
 static int dev_open(void)
 {
     printf("(fakedev: no NPU, the matmul is done in C; this checks the tool, not the hardware)\n");
+    fake_open();
     return 0;
 }
 #else
@@ -894,6 +896,18 @@ static DWORD WINAPI m6_thread(LPVOID p)
     g_dev = INVALID_HANDLE_VALUE;
     return 0;
 }
+#elif defined(RKNPU_FAKE_DEVICE)
+/* the same two threads against fakedev, whose jobs overlap as the board's do */
+static void *m6_thread(void *p)
+{
+    struct m6_par *a = (struct m6_par *)p;
+
+    a->rc = 1;
+    if (dev_open())
+        return NULL;
+    a->rc = m3_run_ex(a->core, 16, 1024, 1024, a->iters, 0, 0, &a->avg_us);
+    return NULL;
+}
 #endif
 
 static int m6_scatter(unsigned int mb)
@@ -999,11 +1013,15 @@ static int cmd_m6(int argc, char **argv)
         rc = m3_run_ex(c, 1, 64, 64, iters, 0, 0, &lat[c]);
     }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(RKNPU_FAKE_DEVICE)
     if (!rc && parallel) {
         struct m6_par p[RKNPU_NUM_CORES];
+#ifdef _WIN32
         HANDLE th[RKNPU_NUM_CORES];
-        unsigned int piters = iters / 4 ? iters / 4 : 1;
+#else
+        pthread_t th[RKNPU_NUM_CORES];
+#endif
+        unsigned int piters = iters / 4 ? iters / 4 : 1, started = 0;
         double t0, seq, par;
 
         printf("one core after the other, 16x1024x1024 x %u each:\n", piters);
@@ -1018,18 +1036,31 @@ static int cmd_m6(int argc, char **argv)
             p[c].core = c;
             p[c].iters = piters;
             p[c].rc = 1;
+#ifdef _WIN32
             th[c] = CreateThread(NULL, 0, m6_thread, &p[c], 0, NULL);
             if (!th[c])
                 rc = 1;
+#else
+            if (pthread_create(&th[c], NULL, m6_thread, &p[c]))
+                rc = 1;
+#endif
+            if (!rc)
+                started++;
         }
-        if (!rc) {
-            WaitForMultipleObjects(RKNPU_NUM_CORES, th, TRUE, INFINITE);
-            for (c = 0; c < RKNPU_NUM_CORES; c++) {
-                CloseHandle(th[c]);
-                if (p[c].rc)
-                    rc = p[c].rc;
+#ifdef _WIN32
+        if (started)
+            WaitForMultipleObjects(started, th, TRUE, INFINITE);
+        for (c = 0; c < started; c++)
+            CloseHandle(th[c]);
+#else
+        for (c = 0; c < started; c++)
+            pthread_join(th[c], NULL);
+#endif
+        for (c = 0; c < started; c++)
+            if (p[c].rc) {
+                printf("  core %u's thread FAILED (%d)\n", c, p[c].rc);
+                rc = 5;
             }
-        }
         par = now_us() - t0;
         if (!rc)
             printf("PARALLEL: sequential %.0f ms, both cores %.0f ms, %.2fx\n", seq / 1e3, par / 1e3,

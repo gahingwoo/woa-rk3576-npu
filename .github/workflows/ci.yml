@@ -37,10 +37,18 @@ jobs:
           # buffers, relocations and checks, not the NPU
           gcc -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -Wall -Wextra -Werror -pedantic \
               -Iinclude -DRKNPU_FAKE_DEVICE -o rknputest-fake \
-              tools/rknputest/main.c tools/rknputest/fakedev.c
+              tools/rknputest/main.c tools/rknputest/fakedev.c -lpthread
           ./rknputest-fake m3 --iters 2 --map
           # M6: scatter, ladder and latency against the stand-in (no MMU there)
-          ./rknputest-fake m6 --iters 3 --mb 128
+          # and two handles on two threads at once, each with its own
+          # buffers, whose jobs overlap: the case the first M6 board run
+          # failed (a second handle's WRITE_BO refused as busy)
+          ./rknputest-fake m6 --iters 8 --mb 128
+          # the test must catch the old device-wide rule
+          if FAKE_GLOBAL_BUSY=1 ./rknputest-fake m6 --iters 8 --mb 0 > old-rule.txt 2>&1; then
+            cat old-rule.txt; echo "the parallel test passed under the old rule"; exit 1
+          fi
+          grep -q "WRITE_BO refused, busy\|MAP_BO refused, busy" old-rule.txt
       - name: M3 streams and packing against charsiu
         run: |
           set -eux

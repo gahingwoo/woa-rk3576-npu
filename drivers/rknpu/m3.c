@@ -272,17 +272,26 @@ JobActive(
     return J->InFlight || J->CompletePending;
 }
 
-/* A job whose streams are in the caller's buffers (M3, no RKNPU_SUBMIT_COPY):
- * while one runs, nothing may make those streams writable. */
+/*
+ * A job of Owner's whose streams are in Owner's buffers (M3, no
+ * RKNPU_SUBMIT_COPY): while one runs, nothing may make those streams
+ * writable. Only Owner can write or map its own buffers (every buffer call
+ * looks the handle up with its owner), so another handle's WRITE_BO or
+ * MAP_BO cannot touch them and is not held up. M3 and M4 asked "any job of
+ * any handle", which refused the second handle's WRITE_BO with
+ * ERROR_BUSY the moment two handles ran at once (M6 board run, rknputest
+ * m6, 2026-11-24).
+ */
 static BOOLEAN
-AnyUncopiedJobActive(
-    _In_ PDEVICE_CONTEXT Ctx
+OwnerUncopiedJobActive(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ WDFFILEOBJECT Owner
     )
 {
     ULONG n;
 
     for (n = 0; n < RKNPU_NUM_CORES; n++)
-        if (JobActive(&Ctx->Core[n].Job) && !Ctx->Core[n].Job.Copied)
+        if (JobActive(&Ctx->Core[n].Job) && !Ctx->Core[n].Job.Copied && Ctx->Core[n].Job.Owner == Owner)
             return TRUE;
     return FALSE;
 }
@@ -1137,7 +1146,7 @@ NpuBoMap(
         status = STATUS_INVALID_HANDLE;
     } else if (bo->UserVa) {
         status = STATUS_INVALID_DEVICE_STATE;
-    } else if (AnyUncopiedJobActive(Ctx)) {
+    } else if (OwnerUncopiedJobActive(Ctx, bo->Owner)) {
         /* an M3 job's stream could be rewritten after SUBMIT checked it */
         status = STATUS_DEVICE_BUSY;
     } else {
@@ -1275,7 +1284,7 @@ NpuBoCopy(
         status = STATUS_INVALID_HANDLE;
     } else if ((ULONGLONG)req.offset + req.length > bo->Size) {
         status = STATUS_INVALID_PARAMETER;
-    } else if (Write && AnyUncopiedJobActive(Ctx)) {
+    } else if (Write && OwnerUncopiedJobActive(Ctx, bo->Owner)) {
         status = STATUS_DEVICE_BUSY;
     } else {
         /* M6: a cached buffer is made right for the other side here */
