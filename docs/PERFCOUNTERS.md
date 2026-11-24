@@ -64,6 +64,18 @@ rknpu.sys as the file the names come from, so after reinstalling a new
 package (a new driver store folder) run the script again. `-Uninstall` only
 runs the unlodctr. Its log is `%SystemRoot%\Temp\rknpu-perfcounters.log`.
 
+### With the RK3576 tools bundle
+
+woa-rk3576 builds a bundle, the CI artifact `rk3576-tools-arm64`, with
+rk-monitor, this repository's `rknputest.exe`, `charsiu_run.exe` and
+`rknpu-perfcounters.ps1` (woa-rk3576 `tools/rk3576-tools/README.md`). Its
+`install.cmd` puts them into `%ProgramFiles%\RK3576` and registers these
+counters and maliwddm's on its own, from the manifests in the driver store,
+with a SYSTEM task at every start that registers them again when a driver
+update moved them. With the bundle installed, the manual step above is not
+needed. The bundle is built from the commit of this repository that
+woa-rk3576's `NPU_REF` names.
+
 ## Viewing
 
 **perfmon**: `perfmon /sys`, the green plus, then `RK3576 NPU`, all
