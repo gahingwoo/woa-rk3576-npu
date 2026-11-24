@@ -206,7 +206,7 @@ function Install-Charsiu {
     # ---- 2. the NPU and its driver ---------------------------------------
     Step 'the NPU'
     $dev = $null
-    try { $dev = Get-CimInstance Win32_PnPEntity -Filter "DeviceID LIKE 'ACPI\\\\RKCP3576%'" | Select-Object -First 1 } catch { }
+    try { $dev = Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $_.DeviceID -like 'ACPI\RKCP3576\*' } | Select-Object -First 1 } catch { }
     # for CI only: a dry run that pretends the NPU and an administrator are
     # here, so the steps that need both can be checked off the board
     if ($o.DryRun -and $env:CHARSIU_INSTALL_FAKE_NPU -eq '1') {
@@ -221,7 +221,7 @@ function Install-Charsiu {
     } elseif ([int]$dev.ConfigManagerErrorCode -eq 0 -and $dev.Status -eq 'OK') {
         $npuStarted = $true
         $drv = $null
-        try { $drv = Get-CimInstance Win32_PnPSignedDriver -Filter "DeviceID LIKE 'ACPI\\\\RKCP3576%'" | Select-Object -First 1 } catch { }
+        try { $drv = Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.DeviceID -like 'ACPI\RKCP3576\*' } | Select-Object -First 1 } catch { }
         $ver = ''; if ($drv) { $ver = " $($drv.DriverVersion)" }
         Ok "ACPI\RKCP3576 is started (rknpu.sys$ver)"
     } else {

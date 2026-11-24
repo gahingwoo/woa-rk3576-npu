@@ -272,7 +272,7 @@ function Test-Admin {
 function Get-NpuDevice {
     $r = [pscustomobject]@{ Present = $false; Started = $false; Problem = 0; Status = ''; Driver = ''; UserAccess = $false; Iommu = $true }
     try {
-        $d = Get-CimInstance Win32_PnPEntity -Filter "DeviceID LIKE 'ACPI\\\\RKCP3576%'" -ErrorAction Stop | Select-Object -First 1
+        $d = Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $_.DeviceID -like 'ACPI\RKCP3576\*' } -ErrorAction Stop | Select-Object -First 1
     } catch { return $r }
     if (-not $d) { return $r }
     $r.Present = $true
@@ -280,7 +280,7 @@ function Get-NpuDevice {
     $r.Started = ($r.Problem -eq 0 -and $d.Status -eq 'OK')
     $r.Status = $d.Status
     try {
-        $s = Get-CimInstance Win32_PnPSignedDriver -Filter "DeviceID LIKE 'ACPI\\\\RKCP3576%'" -ErrorAction Stop | Select-Object -First 1
+        $s = Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.DeviceID -like 'ACPI\RKCP3576\*' } -ErrorAction Stop | Select-Object -First 1
         if ($s) { $r.Driver = "$($s.DriverVersion)  $($s.InfName)" }
     } catch { }
     $k = "HKLM:\SYSTEM\CurrentControlSet\Enum\$NpuInstance\Device Parameters"

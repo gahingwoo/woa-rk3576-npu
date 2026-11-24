@@ -38,6 +38,14 @@ sh "$HERE/zoo.sh" "$CHARSIU_SRC/scripts/charsiu-get" > "$T/bin/zoo.txt"
 echo frontdoor-test > "$T/bin/VERSION"
 [ "$(wc -l < "$T/bin/zoo.txt")" -gt 10 ] || fail "zoo.txt has $(wc -l < "$T/bin/zoo.txt") rows"
 
+# THE NPU IS FOUND BY ITS INSTANCE ID, never by a WQL LIKE: PowerShell does
+# not escape backslashes, so 'ACPI\\\\RKCP3576%' asked WMI for two literal
+# backslashes and the board's started NPU was reported missing (2026-11-24).
+if grep -n "RKCP3576%" "$HERE"/*.ps1; then fail "a WQL LIKE for the NPU (match DeviceID -like 'ACPI\\RKCP3576\\*')"; fi
+for f in charsiu.ps1 charsiu-install.ps1; do
+	grep -qF "DeviceID -like 'ACPI\RKCP3576\*'" "$HERE/$f" || fail "$f: the NPU instance-id match is gone"
+done
+
 cs() { CHARSIU_HOME="$T/home" "$PW" -NoProfile -File "$T/bin/charsiu.ps1" "$@"; }
 
 # ---- the zoo, as data and as a table
