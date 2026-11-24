@@ -41,7 +41,7 @@ Linux 上能用 NPU 跑的模型，在 Windows 上也能跑。
 | M3 | 缓冲区、提交、中断 | GEMM 结果和 CPU 完全一致 | 已在泰山派 3M 上完成（2026-11-22）：`rknputest m3` 两个核心都逐位一致，最大到 16x1024x1024（NPU 1.9 ms，CPU 24.7 ms），没有超时（[docs/M3.md](docs/M3.md)） |
 | M4 | 移植 charsiu | Llama-3.2-1B 输出的文字和 Linux 上一样 | 代码已完成，尚未在板子上运行：charsiu 在 CI 里编译为 ARM64 Windows 程序，经 rknpu.sys 运行（[port](port)、[docs/M4.md](docs/M4.md)） |
 | M5 | 性能 | 每秒 token 数和 Linux 的差距在给定范围内 | 未开始 |
-| M6 | 驱动自己管理 NPU 的 IOMMU | 用分散的、4 GiB 以上的内存再跑一遍 M4 | 未开始 |
+| M6 | 驱动自己管理 NPU 的 IOMMU | 用分散的、4 GiB 以上的内存再跑一遍 M4 | 代码已完成（分支 `m6-iommu`），尚未在板子上运行（[docs/M6.md](docs/M6.md)） |
 | M7 | 安装脚本、`charsiu serve` | 另一台机器能拿到回答 | 未开始 |
 
 工作量估算和风险见研究报告。
