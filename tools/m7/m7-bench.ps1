@@ -4,7 +4,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File m7-bench.ps1 -Report R:\npu\m7-windows
 #
 # As administrator, from the unpacked charsiu-m7-arm64 artifact with
-# rknputest.exe from rknpu-m7-arm64 beside it (docs/M7.md). Each step writes
+# rknputest.exe from rknpu-m7-arm64 beside it (docs/dev/testing.md). Each step writes
 # its own files under -Out, so a run that dies part way still says how far
 # it got. -Report only rebuilds the tables from a finished -Out.
 #
