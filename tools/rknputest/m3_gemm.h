@@ -88,6 +88,23 @@ RKNPU_RC_INLINE const struct m3_shape *m3_find_shape(unsigned int k, unsigned in
             return &m3_shapes[i];
     return NULL;
 }
+
+/*
+ * M6: the same shape in CBUF window win (0 or 1). The two cores share the
+ * CBUF, so two jobs running at once must use different windows; rknputest
+ * gives core c window c, as charsiu gives device d window d.
+ */
+RKNPU_RC_INLINE const struct m3_shape *m3_find_shape_w(unsigned int k, unsigned int n, unsigned int win)
+{
+    unsigned int i;
+
+    if (!win)
+        return m3_find_shape(k, n);
+    for (i = 0; i < sizeof(m3_shapes_w1) / sizeof(m3_shapes_w1[0]); i++)
+        if (m3_shapes_w1[i].k == k && m3_shapes_w1[i].n == n)
+            return &m3_shapes_w1[i];
+    return NULL;
+}
 #endif
 
 RKNPU_RC_INLINE size_t m3_weight_bytes(unsigned int k, unsigned int n)

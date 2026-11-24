@@ -37,6 +37,7 @@ void rkx_fake_counts(unsigned long long *submits, unsigned long long *busy,
 		     unsigned long long *refused, unsigned long long *max_tasks);
 void rkx_fake_sync_counts(unsigned long long *preps, unsigned long long *finis,
 			  unsigned long long *unfinished);
+void rkx_fake_cbuf_counts(unsigned long long *overlaps, unsigned long long *waits);
 
 static int failures;
 
@@ -180,6 +181,34 @@ int main(void)
 	CHECK(submit_n(d2, &c, 1, 4096, 0) == 0, "device 2 again");
 	CHECK(charsiu_bo_prep(d0, &a.out, 1000000000) == 0, "device 0's WAIT after its core was retaken");
 	CHECK(charsiu_bo_prep(d2, &c.out, 1000000000) == 0, "device 2's second job");
+
+	/* M6, the shared CBUF: device 0 on window 0 and device 1 on window 1
+	 * overlap without a wait; the same window waits */
+	{
+		struct mm w1;
+		unsigned long long ov0, wt0, ov1, wt1;
+
+		CHECK(!mm_init(d1, &w1, CHARSIU_INT8, CHARSIU_INT8, 1), "a window 1 job");
+		w1.job.cbuf_window = 1;
+		charsiu_emit_job(&w1.job, (uint64_t *)w1.reg.map, 4096 / 8);
+		charsiu_bo_fini(d1, &w1.reg);
+		rkx_fake_cbuf_counts(&ov0, &wt0);
+		CHECK(submit_n(d0, &a, 1, 4096, 0) == 0, "window 0 on device 0");
+		CHECK(submit_n(d1, &w1, 1, 4096, 0) == 0, "window 1 on device 1, at once");
+		rkx_fake_cbuf_counts(&ov1, &wt1);
+		CHECK(ov1 == ov0 + 1 && wt1 == wt0, "two windows overlap with no wait (%llu, %llu)",
+		      ov1 - ov0, wt1 - wt0);
+		charsiu_bo_prep(d0, &a.out, 1000000000);
+		charsiu_bo_prep(d1, &w1.out, 1000000000);
+		CHECK(submit_n(d0, &a, 1, 4096, 0) == 0, "window 0 on device 0 again");
+		/* device 1's w4a16 job is window 0 too (charsiu_emit_job's default) */
+		CHECK(submit_n(d1, &b, 1, 4096, 0) == 0, "window 0 on device 1, at once");
+		rkx_fake_cbuf_counts(&ov0, &wt0);
+		CHECK(wt0 == wt1 + 1, "the same window waited (%llu)", wt0 - wt1);
+		charsiu_bo_prep(d0, &a.out, 1000000000);
+		charsiu_bo_prep(d1, &b.out, 1000000000);
+		mm_free(d1, &w1);
+	}
 
 	/* device 1's w4a16 stream, the default for Llama */
 	CHECK(submit_n(d1, &b, 16, 4096, 0) == 0, "w4a16 tasks");

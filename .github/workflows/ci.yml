@@ -49,6 +49,18 @@ jobs:
             cat old-rule.txt; echo "the parallel test passed under the old rule"; exit 1
           fi
           grep -q "WRITE_BO refused, busy\|MAP_BO refused, busy" old-rule.txt
+          # the shared CBUF (second M6 board run): core c uses window c and
+          # both cores overlap; with --collide (both on window 0) the driver
+          # must make the jobs wait for each other and stay exact ...
+          ./rknputest-fake m6 --iters 8 --mb 0 --collide | tee collide.txt
+          grep -q "RKNPU M6: PASS" collide.txt
+          waits=$(grep "^core . totals" collide.txt | sed 's/.* \([0-9]*\) CBUF waits.*/\1/' | paste -sd+ | bc)
+          test "$waits" -gt 0
+          # ... and without that wait the model corrupts both, as the board did
+          if FAKE_NO_CBUF_GUARD=1 ./rknputest-fake m6 --iters 8 --mb 0 --collide > noguard.txt 2>&1; then
+            cat noguard.txt; echo "same-window jobs ran together and the test did not notice"; exit 1
+          fi
+          grep -q "words wrong" noguard.txt
       - name: M3 streams and packing against charsiu
         run: |
           set -eux

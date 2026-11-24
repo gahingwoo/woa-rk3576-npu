@@ -161,6 +161,11 @@
  *   - More than one handle may be open (M4 allowed one), so charsiu's two
  *     devices drive both cores at once, and the driver's queue is parallel:
  *     a WAIT on one core no longer holds up a SUBMIT on the other.
+ *   - The cores share the CBUF: a job only runs alongside the other core's
+ *     job when their streams use different CBUF windows (CNA 0x1040,
+ *     rknpu_regcmd.h); otherwise SUBMIT waits for the other job to finish
+ *     (rknpu_core_info.cbuf_waits counts those), and returns
+ *     STATUS_DEVICE_BUSY only if it does not finish in RKNPU_WAIT_MAX_MS.
  */
 #define RKNPU_M6_VERSION        1       /* rknpu_info.m6_version */
 #define RKNPU_MEM_BYPASS        0       /* rknpu_info.mem_mode: M4, physical addresses */
@@ -231,7 +236,9 @@ typedef struct rknpu_core_info {
     /* M6 (0 from an M4 driver) */
     unsigned int mmu_faults;            /* page faults and bus errors its IOMMUs raised */
     unsigned int mmu_enables;           /* times the driver turned paging on for this core */
-    unsigned int reserved[2];
+    unsigned int cbuf_waits;            /* SUBMITs that waited for the other core's job on the
+                                         * same CBUF window (rknpu_regcmd.h, the shared CBUF) */
+    unsigned int reserved[1];
 } rknpu_core_info;
 
 /*

@@ -168,6 +168,7 @@ typedef struct _CORE_JOB {
     BOOLEAN         NoCrumbs;       /* RKNPU_SUBMIT_NO_CRUMBS */
     BOOLEAN         Copied;         /* M4: RKNPU_SUBMIT_COPY, the streams are in the arena */
     BOOLEAN         FaultReset;     /* M6: the core was reset after this job's IOMMU fault */
+    ULONG           CbufKey;        /* M6: rknpu_rc_cbuf_key() of its streams (the shared CBUF) */
     ULONG           Result;         /* RKNPU_JOB_* once finished */
     ULONGLONG       Seq;            /* 0: never used */
     WDFFILEOBJECT   Owner;
@@ -212,6 +213,7 @@ typedef struct _CORE_STATE {
     /* M6 */
     volatile LONG   MmuFaults;
     volatile LONG   MmuEnables;
+    volatile LONG   CbufWaits;      /* SUBMITs that waited for the other core's same-window job */
 } CORE_STATE;
 
 /* M4: a finished job, kept so a WAIT that comes after another handle's job

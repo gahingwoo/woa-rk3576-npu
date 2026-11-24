@@ -178,4 +178,40 @@ RKNPU_RC_INLINE int rknpu_rc_check_stream(const unsigned long long *ent, unsigne
     return rknpu_rc_check_stream_ex(ent, n, flags, in_bo, ctx, bad, 0);
 }
 
+/*
+ * M6: THE SHARED CBUF. The two NPU cores share one CBUF, and two jobs that run
+ * at the same time corrupt each other when their streams use the same part
+ * of it and are exact when they use different parts (charsiu src/job.c,
+ * rounds 362 and 363; charsiu_job.cbuf_window). Which part a stream uses is
+ * CNA 0x1040: 0x10000000 for window 0, 0x2c001c00 for window 1 (the vendor's
+ * two copies of every op differ in six registers, and this one carries both
+ * the data and the weight start). The driver never lets two jobs with the
+ * same key run together (m3.c), and treats a stream with no 0x1040, or a job
+ * whose tasks disagree, as colliding with everything.
+ */
+#define RKNPU_RC_CNA_CBUF_CON1      0x1040u
+#define RKNPU_RC_CBUF_ANY           0xFFFFFFFFu     /* unknown: collides with every job */
+
+/* the stream's last CNA 0x1040 value, or RKNPU_RC_CBUF_ANY */
+RKNPU_RC_INLINE unsigned int rknpu_rc_cbuf_key(const unsigned long long *ent, unsigned int n)
+{
+    unsigned int i, key = RKNPU_RC_CBUF_ANY;
+
+    for (i = 0; i < n; i++)
+        if (RKNPU_RC_TARGET(ent[i]) == RKNPU_RC_CNA && RKNPU_RC_REG(ent[i]) == RKNPU_RC_CNA_CBUF_CON1)
+            key = RKNPU_RC_VALUE(ent[i]);
+    return key;
+}
+
+/* a job's key from its tasks' keys: first is 1 for the first task */
+RKNPU_RC_INLINE unsigned int rknpu_rc_cbuf_merge(unsigned int acc, unsigned int key, int first)
+{
+    return first ? key : (acc == key ? acc : RKNPU_RC_CBUF_ANY);
+}
+
+RKNPU_RC_INLINE int rknpu_rc_cbuf_collide(unsigned int a, unsigned int b)
+{
+    return a == RKNPU_RC_CBUF_ANY || b == RKNPU_RC_CBUF_ANY || a == b;
+}
+
 #endif /* RKNPU_REGCMD_H */

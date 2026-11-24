@@ -418,6 +418,7 @@ NpuFillCore(
     O->resets         = (ULONG)core->Resets;
     O->mmu_faults     = (ULONG)core->MmuFaults;
     O->mmu_enables    = (ULONG)core->MmuEnables;
+    O->cbuf_waits     = (ULONG)core->CbufWaits;
 }
 
 VOID

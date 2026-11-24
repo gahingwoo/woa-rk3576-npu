@@ -757,17 +757,20 @@ NpuCheckStreamLocked(
     _In_ PDEVICE_CONTEXT Ctx,
     _In_ WDFFILEOBJECT Owner,
     _In_ const rknpu_task *T,
-    _In_ ULONG Core
+    _In_ ULONG Core,
+    _Out_ ULONG *Key
     )
 {
     ULONG fetched = ((T->regcmd_count + 1) / 2) * 2;
     PNPU_BO bo = BoFindRangeLocked(Ctx, Owner, T->regcmd, fetched * 8);
     BO_LOOKUP l;
 
+    *Key = RKNPU_RC_CBUF_ANY;
     if (!bo)
         return STATUS_INVALID_PARAMETER;
     if (bo->UserVa)
         return STATUS_INVALID_DEVICE_STATE;
+    *Key = rknpu_rc_cbuf_key((const unsigned long long *)((PUCHAR)bo->Kva + (T->regcmd - bo->Dma)), fetched);
     l.Ctx = Ctx;
     l.Owner = Owner;
     l.Last = NULL;
@@ -879,7 +882,8 @@ NpuCopyStreamsLocked(
     _In_ PDEVICE_CONTEXT Ctx,
     _In_ WDFFILEOBJECT Owner,
     _In_ ULONG N,
-    _Inout_ rknpu_submit_in *In
+    _Inout_ rknpu_submit_in *In,
+    _Out_ ULONG *Key
     )
 {
     CORE_STATE *core = &Ctx->Core[N];
@@ -890,6 +894,7 @@ NpuCopyStreamsLocked(
     l.Ctx = Ctx;
     l.Owner = Owner;
     l.Last = NULL;
+    *Key = RKNPU_RC_CBUF_ANY;
     for (i = 0; i < In->task_count; i++) {
         rknpu_task *t = &In->tasks[i];
         ULONG fetched = ((t->regcmd_count + 1) / 2) * 2, bytes = fetched * 8;
@@ -905,6 +910,9 @@ NpuCopyStreamsLocked(
                                        t->regcmd, N);
         if (!NT_SUCCESS(status))
             return status;
+        /* the copy, which is what runs */
+        *Key = rknpu_rc_cbuf_merge(*Key, rknpu_rc_cbuf_key((const unsigned long long *)(core->Arena + at), fetched),
+                                   i == 0);
         t->regcmd = core->ArenaDma + at;
         at += bytes;
     }
@@ -1391,10 +1399,11 @@ NpuSubmit(
     WDFFILEOBJECT fo = WdfRequestGetFileObject(Request);
     CORE_STATE *core;
     CORE_JOB *j;
-    ULONG n, i, base;
+    ULONG n, i, base, key = RKNPU_RC_CBUF_ANY, k;
     ULONGLONG seq;
     BOOLEAN copy;
     NTSTATUS status;
+    CORE_STATE *other;
 
     *Info = 0;
     status = WdfRequestRetrieveInputBuffer(Request, sizeof(in), (PVOID *)&pin, NULL);
@@ -1459,14 +1468,41 @@ NpuSubmit(
     /* Every stream inside one of the caller's buffers, and within the rules:
      * M4 checks the copies it will run, M3 the streams in place. */
     if (copy) {
-        status = NpuCopyStreamsLocked(Ctx, fo, n, &in);
+        status = NpuCopyStreamsLocked(Ctx, fo, n, &in, &key);
         if (!NT_SUCCESS(status))
             goto out_bo;
     } else {
         for (i = 0; i < in.task_count; i++) {
-            status = NpuCheckStreamLocked(Ctx, fo, &in.tasks[i], n);
+            status = NpuCheckStreamLocked(Ctx, fo, &in.tasks[i], n, &k);
             if (!NT_SUCCESS(status))
                 goto out_bo;
+            key = rknpu_rc_cbuf_merge(key, k, i == 0);
+        }
+    }
+
+    /*
+     * M6: the shared CBUF (rknpu_regcmd.h). A job whose CBUF window the other
+     * core's running job also uses would corrupt both, silently, so it waits
+     * for that job here (charsiu's two devices use two windows and never
+     * wait). Neither lock the other job needs to finish is held: the ISR and
+     * the DPC take none, and nothing can start a job on either core while
+     * this holds JobLock. The streams are already in this core's arena or,
+     * without the copy flag, frozen (their handle is the one waiting here).
+     */
+    other = &Ctx->Core[n ^ 1];
+    if (JobActive(&other->Job) && rknpu_rc_cbuf_collide(key, other->Job.CbufKey)) {
+        LARGE_INTEGER to;
+
+        WdfWaitLockRelease(Ctx->BoLock);
+        InterlockedIncrement(&core->CbufWaits);
+        to.QuadPart = -10000LL * RKNPU_WAIT_MAX_MS;
+        (VOID)KeWaitForSingleObject(&other->Done, Executive, KernelMode, FALSE, &to);
+        WdfWaitLockAcquire(Ctx->BoLock, NULL);
+        if (JobActive(&other->Job)) {
+            RKNPU_LOG("SUBMIT: core %u waited %u ms for core %u's job on the same CBUF window 0x%08x",
+                      n, RKNPU_WAIT_MAX_MS, n ^ 1, key);
+            status = STATUS_DEVICE_BUSY;
+            goto out_bo;
         }
     }
 
@@ -1478,6 +1514,7 @@ NpuSubmit(
     j->TaskCount = in.task_count;
     j->NoCrumbs = (in.flags & RKNPU_SUBMIT_NO_CRUMBS) ? TRUE : FALSE;
     j->Copied = copy;
+    j->CbufKey = key;
     RtlCopyMemory(j->Tasks, in.tasks, in.task_count * sizeof(rknpu_task));
     KeClearEvent(&core->Done);
     InterlockedIncrement(&core->JobsSubmitted);

@@ -35,6 +35,12 @@
  * stale data on the board. "Written" is approximated: a buffer is dirty from
  * MAP_BO and from every PREP_BO until its next FINI_BO.
  *
+ * M6, the shared CBUF: a SUBMIT while the other core's job is still running
+ * counts as an overlap; if the two jobs' CBUF keys (rknpu_regcmd.h) collide
+ * it is counted as a CBUF wait and the other job is finished first, as the
+ * driver does. charsiu gives its two devices two windows, so a real run is
+ * expected to overlap with no CBUF waits.
+ *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -70,6 +76,7 @@ struct fjob {
 	const struct rkx *owner;
 	int active, polled, age;
 	unsigned tasks;
+	unsigned key;           /* M6: rknpu_rc_cbuf_key() over its streams */
 };
 
 static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
@@ -85,7 +92,7 @@ static unsigned char arena[RKNPU_COPY_ARENA_BYTES];
 /* statistics */
 static unsigned long long n_submit, n_tasks, n_entries, max_tasks, max_entries, max_arena;
 static unsigned long long n_busy, n_refused, n_wait, n_poll;
-static unsigned long long n_prep, n_fini, n_unfini;
+static unsigned long long n_prep, n_fini, n_unfini, n_overlap, n_cbuf_wait;
 static int m4;
 
 /* the scan: (target << 16 | reg) -> count, for values inside a buffer */
@@ -189,7 +196,7 @@ static void retire(unsigned c)
 
 static int do_submit(struct rkx *x, const rknpu_submit_in *in, rknpu_submit_out *out)
 {
-	unsigned i, at = 0;
+	unsigned i, at = 0, key = RKNPU_RC_CBUF_ANY, other = in->core ^ 1u;
 	struct fjob *j;
 
 	if (in->core >= RKNPU_NUM_CORES || !in->task_count || in->task_count > RKNPU_MAX_TASKS ||
@@ -228,6 +235,7 @@ static int do_submit(struct rkx *x, const rknpu_submit_in *in, rknpu_submit_out 
 		dst = (uint64_t *)(arena + at);
 		memcpy(dst, src, fetched * 8);
 		why = rknpu_rc_check_stream((const unsigned long long *)dst, fetched, 0, in_bo, x, &bad);
+		key = rknpu_rc_cbuf_merge(key, rknpu_rc_cbuf_key((const unsigned long long *)dst, fetched), i == 0);
 		if (why) {
 			n_refused++;
 			fprintf(stderr, "rknpu-fake: SUBMIT refused, stream 0x%08x entry %u "
@@ -264,12 +272,20 @@ static int do_submit(struct rkx *x, const rknpu_submit_in *in, rknpu_submit_out 
 		if (in->tasks[i].regcmd_count > max_entries)
 			max_entries = in->tasks[i].regcmd_count;
 	}
+	if (core_job[other].active) {
+		n_overlap++;
+		if (rknpu_rc_cbuf_collide(key, core_job[other].key)) {
+			n_cbuf_wait++;
+			core_job[other].active = 0;     /* the driver waits for it */
+		}
+	}
 	retire(in->core);
 	memset(j, 0, sizeof(*j));
 	j->seq = ++seqno;
 	j->owner = x;
 	j->active = 1;
 	j->tasks = in->task_count;
+	j->key = key;
 	n_submit++;
 	n_tasks += in->task_count;
 	if (in->task_count > max_tasks)
@@ -545,6 +561,14 @@ void charsiu_port_crash_handler_install(void)
 }
 
 /* for port/test/devtest.c (M6) */
+void rkx_fake_cbuf_counts(unsigned long long *overlaps, unsigned long long *waits)
+{
+	pthread_mutex_lock(&lk);
+	*overlaps = n_overlap;
+	*waits = n_cbuf_wait;
+	pthread_mutex_unlock(&lk);
+}
+
 void rkx_fake_sync_counts(unsigned long long *preps, unsigned long long *finis,
 			  unsigned long long *unfinished)
 {
@@ -608,8 +632,9 @@ static void report(void)
 			"%llu entries (max %llu a stream), arena peak %llu bytes, %llu busy, "
 			"%llu refused, %llu waits (%llu polled RUNNING); buffers peak %llu "
 			"(%.1f MiB), largest %.1f MiB; %llu PREP_BO, %llu FINI_BO, %llu jobs "
-			"from unflushed streams\n",
+			"from unflushed streams; %llu SUBMITs overlapped the other core's job, "
+			"%llu of them on the same CBUF window (waited)\n",
 			n_submit, n_tasks, max_tasks, n_entries, max_entries, max_arena, n_busy,
 			n_refused, n_wait, n_poll, nbo_peak, total_peak / 1048576.0,
-			bo_max_seen / 1048576.0, n_prep, n_fini, n_unfini);
+			bo_max_seen / 1048576.0, n_prep, n_fini, n_unfini, n_overlap, n_cbuf_wait);
 }

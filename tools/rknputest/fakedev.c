@@ -19,6 +19,13 @@
  * where the M3/M4 rule ("any handle's job") refused the second handle.
  * FAKE_GLOBAL_BUSY=1 brings that old rule back, to see the test catch it.
  *
+ * And the shared CBUF, which the second M6 board run met: the two cores
+ * share it, so two jobs that run at once with the same CBUF window (CNA
+ * 0x1040, rknpu_regcmd.h) both come out wrong on the hardware; here each
+ * gets every output word changed. The driver makes such a job wait for the
+ * other (m3.c), and so does this; FAKE_NO_CBUF_GUARD=1 drops the driver's
+ * wait, to see the corruption the test must catch.
+ *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
  */
@@ -49,9 +56,11 @@ static _Thread_local unsigned int cur;          /* this thread's handle; 0 = the
 
 static struct {
     unsigned long long seq;
-    unsigned int owner, copied, active;
+    unsigned int owner, copied, active, key, nout;
     double end_us;
+    unsigned int out_addr[RKNPU_MAX_TASKS], out_n[RKNPU_MAX_TASKS];
 } job[RKNPU_NUM_CORES];
+static unsigned int cbuf_waits[RKNPU_NUM_CORES];
 
 static double fake_now_us(void)
 {
@@ -68,13 +77,19 @@ void fake_open(void)
     pthread_mutex_unlock(&lk);
 }
 
+/* the hardware still has the job: SUBMIT was less than FAKE_JOB_US ago */
+static int running(int c)
+{
+    return job[c].active && fake_now_us() < job[c].end_us;
+}
+
 /* the driver's OwnerUncopiedJobActive(), or M3/M4's rule with FAKE_GLOBAL_BUSY */
 static int writes_frozen(void)
 {
     int c, global = getenv("FAKE_GLOBAL_BUSY") != NULL;
 
     for (c = 0; c < RKNPU_NUM_CORES; c++)
-        if (job[c].active && !job[c].copied && (global || job[c].owner == cur))
+        if (running(c) && !job[c].copied && (global || job[c].owner == cur))
             return 1;
     return 0;
 }
@@ -98,6 +113,8 @@ static int find(unsigned int handle)
             return i;
     return -1;
 }
+
+static unsigned int last_out_addr, last_out_n;
 
 static int run_task(const rknpu_task *t)
 {
@@ -128,6 +145,8 @@ static int run_task(const rknpu_task *t)
         fprintf(stderr, "fakedev: stream addresses or shape not found\n");
         return -1;
     }
+    last_out_addr = out;
+    last_out_n = n;
     for (c = 0; c < n; c++) {
         int acc = 0;
         unsigned int c0 = c / 32 * 32, tn = n - c0 < 32 ? n - c0 : 32;
@@ -178,6 +197,8 @@ static int fake_ioctl_locked(unsigned int code, const void *inb, unsigned int in
          * either way, and the buffers are not cached (no PREP/FINI needed) */
         o->m6_version = RKNPU_M6_VERSION;
         o->mem_mode = RKNPU_MEM_IOMMU;
+        for (i = 0; i < RKNPU_NUM_CORES; i++)
+            o->core[i].cbuf_waits = cbuf_waits[i];
         for (i = 0; i < FAKE_MAX_BO; i++)
             if (bo[i].handle) {
                 o->bo_count++;
@@ -257,13 +278,66 @@ static int fake_ioctl_locked(unsigned int code, const void *inb, unsigned int in
 
         if (s->core >= RKNPU_NUM_CORES || s->task_count == 0 || s->task_count > RKNPU_MAX_TASKS)
             return -1;
-        if (job[s->core].active) {
+        unsigned int key = RKNPU_RC_CBUF_ANY, other = s->core ^ 1u, collided = 0;
+
+        if (running((int)s->core)) {
             fprintf(stderr, "fakedev: SUBMIT refused, core %u busy\n", s->core);
             return -1;
         }
-        for (t = 0; t < s->task_count; t++)
+        for (t = 0; t < s->task_count; t++) {
+            const unsigned char *st = at(s->tasks[t].regcmd, s->tasks[t].regcmd_count * 8u);
+
+            if (!st)
+                return -1;
+            key = rknpu_rc_cbuf_merge(key, rknpu_rc_cbuf_key((const unsigned long long *)st,
+                                                             s->tasks[t].regcmd_count), t == 0);
+        }
+        /* the shared CBUF: the driver's wait, or the hardware's corruption */
+        if (running((int)other) && rknpu_rc_cbuf_collide(key, job[other].key)) {
+            if (getenv("FAKE_NO_CBUF_GUARD")) {
+                collided = 1;
+            } else {
+                cbuf_waits[s->core]++;
+                while (running((int)other)) {
+                    struct timespec ts = { 0, 200000 };
+
+                    pthread_mutex_unlock(&lk);
+                    nanosleep(&ts, NULL);
+                    pthread_mutex_lock(&lk);
+                }
+                if (running((int)s->core))
+                    return -1;
+            }
+        }
+        job[s->core].nout = 0;
+        for (t = 0; t < s->task_count; t++) {
             if (run_task(&s->tasks[t]))
                 return -1;
+            job[s->core].out_addr[t] = last_out_addr;
+            job[s->core].out_n[t] = last_out_n;
+            job[s->core].nout = t + 1;
+        }
+        if (collided) {
+            unsigned int q, w, owner = cur;
+
+            /* both jobs' outputs, as the board's 10039 and 8350 wrong words */
+            for (q = 0; q < 2; q++) {
+                unsigned int cj = q ? other : s->core;
+
+                cur = job[cj].owner;
+                if (q == 0)
+                    cur = owner;
+                for (t = 0; t < (q ? job[cj].nout : s->task_count); t++) {
+                    unsigned int oa = q ? job[cj].out_addr[t] : job[s->core].out_addr[t];
+                    unsigned int on = q ? job[cj].out_n[t] : job[s->core].out_n[t];
+                    unsigned char *o = at(oa, on * 4);
+
+                    for (w = 0; o && w < on; w++)
+                        o[w * 4] ^= 0x5A;
+                }
+            }
+            cur = owner;
+        }
         memset(&o, 0, sizeof(o));
         o.seqno = ++seq;
         o.core = s->core;
@@ -271,6 +345,7 @@ static int fake_ioctl_locked(unsigned int code, const void *inb, unsigned int in
         job[s->core].owner = cur;
         job[s->core].copied = (s->flags & RKNPU_SUBMIT_COPY) != 0;
         job[s->core].active = 1;
+        job[s->core].key = key;
         job[s->core].end_us = fake_now_us() + FAKE_JOB_US;
         memcpy(outb, &o, sizeof(o));
         return 0;

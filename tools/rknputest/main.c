@@ -459,9 +459,9 @@ static void m3_print_wait(const rknpu_wait_out *w)
  * buffer); the IOMMU must stop it: 0 if WAIT says RKNPU_JOB_MMU_FAULT.
  */
 static int m3_run_ex(unsigned int core, unsigned int m, unsigned int k, unsigned int n, unsigned int iters, int map,
-                     int fault, double *rt_min_out)
+                     int fault, double *rt_min_out, unsigned int win)
 {
-    const struct m3_shape *s = m3_find_shape(k, n);
+    const struct m3_shape *s = m3_find_shape_w(k, n, win);
     unsigned int rc_slot, in_slot, out_slot, r, i, it;
     size_t wsz, csz, in_total, out_total, rc_total;
     unsigned char *A = NULL, *B = NULL, *wbuf = NULL, *cbuf = NULL, *ibuf = NULL, *obuf = NULL;
@@ -481,7 +481,8 @@ static int m3_run_ex(unsigned int core, unsigned int m, unsigned int k, unsigned
         fprintf(stderr, ")\n");
         return 1;
     }
-    printf("core %u: M=%u K=%u N=%u, %u task%s of %u entries\n", core, m, k, n, m, m > 1 ? "s" : "", s->count);
+    printf("core %u: M=%u K=%u N=%u, %u task%s of %u entries, CBUF window %u\n", core, m, k, n, m,
+           m > 1 ? "s" : "", s->count, win);
     fflush(stdout);
 
     rc_slot = M3_ALIGN((s->count + 1) * 8u, 256u);
@@ -734,7 +735,8 @@ out:
 
 static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned int n, unsigned int iters, int map)
 {
-    return m3_run_ex(core, m, k, n, iters, map, 0, NULL);
+    /* core c uses CBUF window c, as charsiu's device d uses window d */
+    return m3_run_ex(core, m, k, n, iters, map, 0, NULL, core);
 }
 
 static int m3_reset(unsigned int core)
@@ -872,13 +874,17 @@ done:
  *   4. both cores at once: 16x1024x1024 on core 0 and core 1 from two
  *      threads with a handle each, against the same work one core after the
  *      other. A ratio near 2 says the driver no longer serialises the cores.
+ *      The cores share the CBUF, so core c's streams use CBUF window c
+ *      (charsiu's device d uses window d); with --collide both use window 0,
+ *      which corrupts both on the hardware unless the driver makes the two
+ *      jobs wait for each other (it must: exact, ratio near 1, CBUF waits).
  *   5. --fault: a job whose output runs into a buffer's guard page must end
  *      in RKNPU_JOB_MMU_FAULT, and the core must then run the 1x64x64 job
  *      exactly again (the recovery path).
  */
 
 struct m6_par {
-    unsigned int core, iters;
+    unsigned int core, iters, win;
     int rc;
     double avg_us;
 };
@@ -891,7 +897,7 @@ static DWORD WINAPI m6_thread(LPVOID p)
     a->rc = 1;
     if (dev_open())
         return 0;
-    a->rc = m3_run_ex(a->core, 16, 1024, 1024, a->iters, 0, 0, &a->avg_us);
+    a->rc = m3_run_ex(a->core, 16, 1024, 1024, a->iters, 0, 0, &a->avg_us, a->win);
     CloseHandle(g_dev);
     g_dev = INVALID_HANDLE_VALUE;
     return 0;
@@ -905,7 +911,7 @@ static void *m6_thread(void *p)
     a->rc = 1;
     if (dev_open())
         return NULL;
-    a->rc = m3_run_ex(a->core, 16, 1024, 1024, a->iters, 0, 0, &a->avg_us);
+    a->rc = m3_run_ex(a->core, 16, 1024, 1024, a->iters, 0, 0, &a->avg_us, a->win);
     return NULL;
 }
 #endif
@@ -968,7 +974,7 @@ static int m6_scatter(unsigned int mb)
 static int cmd_m6(int argc, char **argv)
 {
     unsigned int mb = 768, iters = 200, c, i;
-    int fault = 0, parallel = 1, a, rc = 0, r;
+    int fault = 0, parallel = 1, collide = 0, a, rc = 0, r;
     double lat[RKNPU_NUM_CORES] = { 0, 0 };
     rknpu_info info;
 
@@ -987,6 +993,8 @@ static int cmd_m6(int argc, char **argv)
             fault = 1;
         } else if (!strcmp(argv[a], "--no-parallel")) {
             parallel = 0;
+        } else if (!strcmp(argv[a], "--collide")) {
+            collide = 1;
         } else {
             fprintf(stderr, "m6: unknown option %s\n", argv[a]);
             return 1;
@@ -1010,7 +1018,7 @@ static int cmd_m6(int argc, char **argv)
 
     for (c = 0; c < RKNPU_NUM_CORES && !rc; c++) {
         printf("latency, core %u:\n", c);
-        rc = m3_run_ex(c, 1, 64, 64, iters, 0, 0, &lat[c]);
+        rc = m3_run_ex(c, 1, 64, 64, iters, 0, 0, &lat[c], c);
     }
 
 #if defined(_WIN32) || defined(RKNPU_FAKE_DEVICE)
@@ -1027,14 +1035,17 @@ static int cmd_m6(int argc, char **argv)
         printf("one core after the other, 16x1024x1024 x %u each:\n", piters);
         t0 = now_us();
         for (c = 0; c < RKNPU_NUM_CORES && !rc; c++)
-            rc = m3_run_ex(c, 16, 1024, 1024, piters, 0, 0, NULL);
+            rc = m3_run_ex(c, 16, 1024, 1024, piters, 0, 0, NULL, c);
         seq = now_us() - t0;
-        printf("both cores at once, two handles:\n");
+        printf("both cores at once, two handles, CBUF windows %s:\n", collide ? "0 and 0 (--collide)" : "0 and 1");
         fflush(stdout);
         t0 = now_us();
         for (c = 0; c < RKNPU_NUM_CORES && !rc; c++) {
             p[c].core = c;
             p[c].iters = piters;
+            /* --collide: both on window 0, the arrangement that corrupts on
+             * the hardware; the driver must make the two wait for each other */
+            p[c].win = collide ? 0 : c;
             p[c].rc = 1;
 #ifdef _WIN32
             th[c] = CreateThread(NULL, 0, m6_thread, &p[c], 0, NULL);
@@ -1063,16 +1074,17 @@ static int cmd_m6(int argc, char **argv)
             }
         par = now_us() - t0;
         if (!rc)
-            printf("PARALLEL: sequential %.0f ms, both cores %.0f ms, %.2fx\n", seq / 1e3, par / 1e3,
-                   par > 0 ? seq / par : 0.0);
+            printf("PARALLEL%s: sequential %.0f ms, both cores %.0f ms, %.2fx\n", collide ? " (same window)" : "",
+                   seq / 1e3, par / 1e3, par > 0 ? seq / par : 0.0);
     }
 #else
     (void)parallel;
+    (void)collide;
 #endif
 
     if (!rc && fault) {
         printf("fault: a job that writes into a guard page, on core 0\n");
-        rc = m3_run_ex(0, 1, 64, 64, 1, 0, 1, NULL);
+        rc = m3_run_ex(0, 1, 64, 64, 1, 0, 1, NULL, 0);
         if (!rc) {
             printf("  and the same core again, normally:\n");
             rc = m3_run(0, 1, 64, 64, 3, 0);
@@ -1082,10 +1094,10 @@ static int cmd_m6(int argc, char **argv)
     if (dev_info(&info) == 0) {
         for (c = 0; c < RKNPU_NUM_CORES; c++)
             printf("core %u totals: %u submitted, %u completed, %u timed out, %u resets, %u IOMMU enables, "
-                   "%u faults, isr %u unclaimed %u\n", c, info.core[c].jobs_submitted,
+                   "%u faults, %u CBUF waits, isr %u unclaimed %u\n", c, info.core[c].jobs_submitted,
                    info.core[c].jobs_completed, info.core[c].jobs_timed_out, info.core[c].resets,
-                   info.core[c].mmu_enables, info.core[c].mmu_faults, info.core[c].isr_count,
-                   info.core[c].isr_unclaimed);
+                   info.core[c].mmu_enables, info.core[c].mmu_faults, info.core[c].cbuf_waits,
+                   info.core[c].isr_count, info.core[c].isr_unclaimed);
         if (!rc && !fault && (info.core[0].mmu_faults || info.core[1].mmu_faults)) {
             printf("an IOMMU fault was counted with no --fault run\n");
             rc = 5;
@@ -1120,8 +1132,9 @@ static int m3_selftest(void)
     base[M3_BUF_WEIGHT] = bos[1].addr;
     base[M3_BUF_OUTPUT] = bos[2].addr + 0x2000;
     base[M3_BUF_COEF] = bos[3].addr;
-    for (i = 0; i < sizeof(m3_shapes) / sizeof(m3_shapes[0]); i++) {
-        const struct m3_shape *s = &m3_shapes[i];
+    for (i = 0; i < 2 * sizeof(m3_shapes) / sizeof(m3_shapes[0]); i++) {
+        const unsigned int ns = sizeof(m3_shapes) / sizeof(m3_shapes[0]);
+        const struct m3_shape *s = i < ns ? &m3_shapes[i] : &m3_shapes_w1[i - ns];
         unsigned int seen = 0;
 
         if (s->count + 1 > sizeof(e) / sizeof(e[0]) || s->count > RKNPU_MAX_REGCMD) {
@@ -1153,7 +1166,21 @@ static int m3_selftest(void)
             bad = 1;
         }
     }
-    printf("m3: %u captured shapes checked\n", (unsigned)(sizeof(m3_shapes) / sizeof(m3_shapes[0])));
+    /* M6: the two windows' streams carry different CBUF keys, so the driver
+     * lets them run together, and the same window collides */
+    for (i = 0; i < sizeof(m3_shapes) / sizeof(m3_shapes[0]); i++) {
+        unsigned int k0 = rknpu_rc_cbuf_key(m3_shapes[i].entries, m3_shapes[i].count);
+        unsigned int k1 = rknpu_rc_cbuf_key(m3_shapes_w1[i].entries, m3_shapes_w1[i].count);
+
+        if (k0 == RKNPU_RC_CBUF_ANY || k1 == RKNPU_RC_CBUF_ANY || rknpu_rc_cbuf_collide(k0, k1) ||
+            !rknpu_rc_cbuf_collide(k0, k0)) {
+            printf("  m3 shape %ux%u: CBUF keys 0x%08x / 0x%08x do not separate the windows\n",
+                   m3_shapes[i].k, m3_shapes[i].n, k0, k1);
+            bad = 1;
+        }
+    }
+    printf("m3: %u captured shapes checked, in both CBUF windows\n",
+           (unsigned)(sizeof(m3_shapes) / sizeof(m3_shapes[0])));
     return bad;
 }
 
@@ -1197,7 +1224,7 @@ static void usage(void)
             "       rknputest regs <offset> <count>\n"
             "       rknputest selftest\n"
             "       rknputest m3 [--core 0|1|both] [--iters N] [--shape M K N] [--map] [--no-reset]\n"
-            "       rknputest m6 [--mb N] [--iters N] [--fault] [--no-parallel]\n");
+            "       rknputest m6 [--mb N] [--iters N] [--fault] [--no-parallel] [--collide]\n");
 }
 
 int main(int argc, char **argv)

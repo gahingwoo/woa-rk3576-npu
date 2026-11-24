@@ -58,10 +58,14 @@ static const unsigned int gen_shapes[][2] = {
 
 #define MAXREG 4096
 
+/* M6: which CBUF window the streams use; m3_streams.h carries both, since the
+ * two cores share the CBUF and two jobs in flight together need two windows */
+static unsigned int g_win;
+
 static void job_init(struct charsiu_job *job, unsigned int k, unsigned int n, const unsigned int base[M3_NBUF])
 {
     memset(job, 0, sizeof(*job));
-    job->cbuf_window = (unsigned)charsiu_cbuf_window();
+    job->cbuf_window = g_win;
     job->mm.m = 1;
     job->mm.k = k;
     job->mm.n = n;
@@ -187,7 +191,7 @@ static int check_rules(unsigned int k, unsigned int n, const struct capture *c)
 #ifndef M3_NO_STREAMS
 static int check_stream(unsigned int k, unsigned int n)
 {
-    const struct m3_shape *s = m3_find_shape(k, n);
+    const struct m3_shape *s = m3_find_shape_w(k, n, g_win);
     static uint64_t want[MAXREG];
     static unsigned long long got[MAXREG];
     unsigned int t, base[M3_NBUF], b;
@@ -526,27 +530,39 @@ static int cmd_header(void)
            " * relocation; m3_build_stream() adds the buffer's NPU address.\n"
            " * SPDX-License-Identifier: GPL-2.0-only\n */\n\n", CHARSIU_COMMIT);
     printf("#ifndef M3_STREAMS_H\n#define M3_STREAMS_H\n\n");
-    for (s = 0; s < NGEN; s++) {
-        unsigned int k = gen_shapes[s][0], n = gen_shapes[s][1];
+    for (g_win = 0; g_win < 2; g_win++) {
+        const char *w = g_win ? "_w1" : "";
 
-        if (capture(k, n, &c) || check_rules(k, n, &c))
-            return 1;
-        printf("static const unsigned long long m3_k%u_n%u_entries[%u] = {", k, n, c.count);
-        for (i = 0; i < c.count; i++)
-            printf("%s0x%016llxull,", i % 3 ? " " : "\n    ", (unsigned long long)c.e[i]);
-        printf("\n};\n\nstatic const struct m3_reloc m3_k%u_n%u_rel[%u] = {\n", k, n, c.nrel);
-        for (i = 0; i < c.nrel; i++)
-            printf("    { %u, %u, 0x%x },\n", c.rel[i].index, c.rel[i].buf, c.rel[i].offset);
+        for (s = 0; s < NGEN; s++) {
+            unsigned int k = gen_shapes[s][0], n = gen_shapes[s][1];
+
+            if (capture(k, n, &c) || check_rules(k, n, &c))
+                return 1;
+            printf("static const unsigned long long m3_k%u_n%u%s_entries[%u] = {", k, n, w, c.count);
+            for (i = 0; i < c.count; i++)
+                printf("%s0x%016llxull,", i % 3 ? " " : "\n    ", (unsigned long long)c.e[i]);
+            printf("\n};\n\nstatic const struct m3_reloc m3_k%u_n%u%s_rel[%u] = {\n", k, n, w, c.nrel);
+            for (i = 0; i < c.nrel; i++)
+                printf("    { %u, %u, 0x%x },\n", c.rel[i].index, c.rel[i].buf, c.rel[i].offset);
+            printf("};\n\n");
+        }
+    }
+    for (g_win = 0; g_win < 2; g_win++) {
+        const char *w = g_win ? "_w1" : "";
+
+        printf("/* CBUF window %u%s */\n", g_win, g_win ? " (charsiu's second device)" : "");
+        printf("static const struct m3_shape m3_shapes%s[%u] = {\n", w, (unsigned)NGEN);
+        for (s = 0; s < NGEN; s++) {
+            unsigned int k = gen_shapes[s][0], n = gen_shapes[s][1];
+
+            capture(k, n, &c);
+            printf("    { %u, %u, %u, m3_k%u_n%u%s_entries, %u, m3_k%u_n%u%s_rel },\n", k, n, c.count, k, n, w,
+                   c.nrel, k, n, w);
+        }
         printf("};\n\n");
     }
-    printf("static const struct m3_shape m3_shapes[%u] = {\n", (unsigned)NGEN);
-    for (s = 0; s < NGEN; s++) {
-        unsigned int k = gen_shapes[s][0], n = gen_shapes[s][1];
-
-        capture(k, n, &c);
-        printf("    { %u, %u, %u, m3_k%u_n%u_entries, %u, m3_k%u_n%u_rel },\n", k, n, c.count, k, n, c.nrel, k, n);
-    }
-    printf("};\n\n#endif /* M3_STREAMS_H */\n");
+    g_win = 0;
+    printf("#endif /* M3_STREAMS_H */\n");
     return 0;
 }
 
@@ -566,7 +582,9 @@ static int cmd_check(void)
         if (capture(gen_shapes[s][0], gen_shapes[s][1], &c) || check_rules(gen_shapes[s][0], gen_shapes[s][1], &c))
             bad = 1;
 #ifndef M3_NO_STREAMS
-        bad |= check_stream(gen_shapes[s][0], gen_shapes[s][1]);
+        for (g_win = 0; g_win < 2; g_win++)
+            bad |= check_stream(gen_shapes[s][0], gen_shapes[s][1]);
+        g_win = 0;
 #endif
         bad |= check_pack(gen_shapes[s][0], gen_shapes[s][1]);
     }
