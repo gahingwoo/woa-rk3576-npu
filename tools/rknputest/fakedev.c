@@ -197,6 +197,9 @@ static int fake_ioctl_locked(unsigned int code, const void *inb, unsigned int in
          * either way, and the buffers are not cached (no PREP/FINI needed) */
         o->m6_version = RKNPU_M6_VERSION;
         o->mem_mode = RKNPU_MEM_IOMMU;
+        /* M7 and M8: the counters exist, and say nothing here */
+        o->m7_version = RKNPU_M7_VERSION;
+        o->m8_version = RKNPU_M8_VERSION;
         for (i = 0; i < RKNPU_NUM_CORES; i++)
             o->core[i].cbuf_waits = cbuf_waits[i];
         for (i = 0; i < FAKE_MAX_BO; i++)
@@ -377,6 +380,16 @@ static int fake_ioctl_locked(unsigned int code, const void *inb, unsigned int in
         o.result = found ? RKNPU_JOB_DONE : RKNPU_JOB_UNKNOWN;
         o.hw_us = 1;
         memcpy(outb, &o, sizeof(o));
+        return 0;
+    }
+    case IOCTL_RKNPU_SUBMIT_STATS: {
+        rknpu_submit_stats *o = (rknpu_submit_stats *)outb;
+
+        if (out_len < sizeof(*o))
+            return -1;
+        memset(o, 0, sizeof(*o));
+        o->version = RKNPU_M8_VERSION;
+        o->phases = RKNPU_SUBMIT_PHASES;
         return 0;
     }
     case IOCTL_RKNPU_RESET: {

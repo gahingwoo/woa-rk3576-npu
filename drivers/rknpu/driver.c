@@ -171,6 +171,32 @@ NpuSafeToRead(
     return NpuDomainsOn(&c);
 }
 
+/*
+ * M8: the same answer from only the registers NpuDomainsOn looks at (six
+ * reads, where NpuReadClocks also reads the GPLL for the clock report). The
+ * PMU and CRU are on a slow bus and SUBMIT asks every time.
+ */
+BOOLEAN
+NpuSafeToReadFast(
+    _In_ PDEVICE_CONTEXT Ctx
+    )
+{
+    rknpu_clock_info c;
+
+    if (!Ctx->Pmu || !Ctx->Cru)
+        return TRUE;
+    RtlZeroMemory(&c, sizeof(c));
+    c.pmu_status0 = PmuRd(Ctx, PMU_STATUS0);
+    if (c.pmu_status0 & 0x1)
+        return FALSE;
+    c.pmu_repair0 = PmuRd(Ctx, PMU_REPAIR0);
+    c.cru_gate28  = CruRd(Ctx, CRU_GATE(28));
+    c.cru_gate29  = CruRd(Ctx, CRU_GATE(29));
+    c.cru_gate31  = CruRd(Ctx, CRU_GATE(31));
+    c.cru_gate32  = CruRd(Ctx, CRU_GATE(32));
+    return NpuDomainsOn(&c);
+}
+
 /* -------------------------------------------------------- interrupts */
 
 BOOLEAN
@@ -480,6 +506,7 @@ NpuEvtIoDeviceControl(
         o->iova_kib = ctx->Mmu.ChunksUsed << (NPU_IOVA_CHUNK_SHIFT - 10);
         o->pt_pages = ctx->Mmu.PtPages;
         o->m7_version = RKNPU_M7_VERSION;
+        o->m8_version = RKNPU_M8_VERSION;
         info = sizeof(*o);
         break;
     }

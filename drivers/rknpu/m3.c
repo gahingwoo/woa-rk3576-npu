@@ -116,6 +116,32 @@ BoCleanInvalidate(
         RknpuDcCleanInvalidate((PUCHAR)Bo->Kva + Off, Len);
 }
 
+/* M8: QPC ticks to ns */
+static ULONGLONG
+QpcToNs64(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ ULONGLONG Ticks
+    )
+{
+    ULONGLONG f = (ULONGLONG)Ctx->QpcFreq.QuadPart;
+
+    if (f == 0)
+        return 0;
+    return Ticks / f * 1000000000ull + Ticks % f * 1000000000ull / f;
+}
+
+/* ... saturating at about 4 s, for one SUBMIT's phases */
+static ULONG
+QpcToNs(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ ULONGLONG Ticks
+    )
+{
+    ULONGLONG ns = QpcToNs64(Ctx, Ticks);
+
+    return ns > 0xFFFFFFFFull ? 0xFFFFFFFFu : (ULONG)ns;
+}
+
 static ULONG
 QpcToUs(
     _In_ PDEVICE_CONTEXT Ctx,
@@ -812,6 +838,10 @@ NpuArenaEnsure(
     PHYSICAL_ADDRESS low, high, skip;
     NTSTATUS status;
 
+    /* M8: the cached copy the streams are checked in; without it SUBMIT
+     * checks in the arena, as M7 did */
+    if (!core->ArenaShadow)
+        core->ArenaShadow = (PUCHAR)ExAllocatePool2(POOL_FLAG_NON_PAGED, RKNPU_COPY_ARENA_BYTES, RKNPU_POOL_TAG);
     if (core->Arena)
         return STATUS_SUCCESS;
     low.QuadPart = 0;
@@ -874,6 +904,10 @@ NpuArenaFree(
 {
     CORE_STATE *core = &Ctx->Core[N];
 
+    if (core->ArenaShadow) {
+        ExFreePoolWithTag(core->ArenaShadow, RKNPU_POOL_TAG);
+        core->ArenaShadow = NULL;
+    }
     if (!core->Arena)
         return;
     if (core->ArenaMdl) {
@@ -904,12 +938,24 @@ NpuCopyStreamsLocked(
     _In_ WDFFILEOBJECT Owner,
     _In_ ULONG N,
     _Inout_ rknpu_submit_in *In,
-    _Out_ ULONG *Key
+    _Out_ ULONG *Key,
+    _In_ BOOLEAN InArena,
+    _Inout_ ULONGLONG *CopyTicks,
+    _Inout_ ULONGLONG *CheckTicks
     )
 {
     CORE_STATE *core = &Ctx->Core[N];
+    /*
+     * M8: check a cached copy only the driver can see, then write it to the
+     * arena in one go. The arena is write-combined (Normal non-cacheable),
+     * so checking it in place read every entry from DRAM, and the CBUF key
+     * read them all again. Either way what runs is what was checked: nothing
+     * outside the driver can write the shadow or the arena.
+     */
+    PUCHAR work = (!InArena && core->ArenaShadow) ? core->ArenaShadow : core->Arena;
     BO_LOOKUP l;
     ULONG i, at = 0;
+    LARGE_INTEGER t0, t1, t2;
     NTSTATUS status;
 
     l.Ctx = Ctx;
@@ -925,17 +971,28 @@ NpuCopyStreamsLocked(
             return STATUS_INVALID_PARAMETER;
         if (bytes > RKNPU_COPY_ARENA_BYTES - at)
             return STATUS_INVALID_BUFFER_SIZE;
+        t0 = KeQueryPerformanceCounter(NULL);
         /* at stays a multiple of 16 (fetched is even), as the PC wants */
-        RtlCopyMemory(core->Arena + at, (PUCHAR)bo->Kva + (t->regcmd - bo->Dma), bytes);
-        status = NpuCheckEntriesLocked(Ctx, &l, (const ULONGLONG *)(core->Arena + at), fetched,
+        RtlCopyMemory(work + at, (PUCHAR)bo->Kva + (t->regcmd - bo->Dma), bytes);
+        t1 = KeQueryPerformanceCounter(NULL);
+        status = NpuCheckEntriesLocked(Ctx, &l, (const ULONGLONG *)(work + at), fetched,
                                        t->regcmd, N);
         if (!NT_SUCCESS(status))
             return status;
         /* the copy, which is what runs */
-        *Key = rknpu_rc_cbuf_merge(*Key, rknpu_rc_cbuf_key((const unsigned long long *)(core->Arena + at), fetched),
+        *Key = rknpu_rc_cbuf_merge(*Key, rknpu_rc_cbuf_key((const unsigned long long *)(work + at), fetched),
                                    i == 0);
+        t2 = KeQueryPerformanceCounter(NULL);
+        *CopyTicks += (ULONGLONG)(t1.QuadPart - t0.QuadPart);
+        *CheckTicks += (ULONGLONG)(t2.QuadPart - t1.QuadPart);
         t->regcmd = core->ArenaDma + at;
         at += bytes;
+    }
+    if (work != core->Arena) {
+        t0 = KeQueryPerformanceCounter(NULL);
+        RtlCopyMemory(core->Arena, work, at);
+        t1 = KeQueryPerformanceCounter(NULL);
+        *CopyTicks += (ULONGLONG)(t1.QuadPart - t0.QuadPart);
     }
     return STATUS_SUCCESS;
 }
@@ -1407,6 +1464,14 @@ NpuRecordLocked(
     r->FaultStatus = j->FaultStatus;
 }
 
+/* M8: the time since the last stamp goes to phase P (NpuSubmit's locals) */
+#define SUBMIT_STAMP(P)                                         \
+    do {                                                        \
+        LONGLONG now_ = KeQueryPerformanceCounter(NULL).QuadPart; \
+        ph[(P)] += (ULONGLONG)(now_ - last);                    \
+        last = now_;                                            \
+    } while (0)
+
 static NTSTATUS
 NpuSubmit(
     _In_ PDEVICE_CONTEXT Ctx,
@@ -1428,7 +1493,11 @@ NpuSubmit(
     /* M7: the buffers to FINI_BO first, and the driver's own time */
     ULONG clean[RKNPU_M7_MAX_CLEAN], nclean = 0;
     LARGE_INTEGER tIn = KeQueryPerformanceCounter(NULL), tOut;
-    size_t inLen = 0;
+    size_t inLen = 0, outLen = 0;
+    /* M8: the phases (rknpu_ioctl.h, RKNPU_SP_*), in QPC ticks */
+    ULONGLONG ph[RKNPU_SUBMIT_PHASES];
+    LONGLONG last = tIn.QuadPart;
+    BOOLEAN m7path;
 
     *Info = 0;
     status = WdfRequestRetrieveInputBuffer(Request, sizeof(in), (PVOID *)&pin, &inLen);
@@ -1443,12 +1512,14 @@ NpuSubmit(
         nclean = m7->clean_count;
         RtlCopyMemory(clean, m7->clean, nclean * sizeof(clean[0]));
     }
-    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, NULL);
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*out), (PVOID *)&out, &outLen);
     if (!NT_SUCCESS(status))
         return status;
     if (in.core >= RKNPU_NUM_CORES || in.task_count == 0 || in.task_count > RKNPU_MAX_TASKS ||
-        (in.flags & ~(RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY | RKNPU_SUBMIT_CLEAN)))
+        (in.flags & ~(RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY | RKNPU_SUBMIT_CLEAN | RKNPU_SUBMIT_M7_PATH)))
         return STATUS_INVALID_PARAMETER;
+    m7path = (in.flags & RKNPU_SUBMIT_M7_PATH) ? TRUE : FALSE;
+    RtlZeroMemory(ph, sizeof(ph));
     copy = (in.flags & RKNPU_SUBMIT_COPY) ? TRUE : FALSE;
     for (i = 0; i < in.task_count; i++)
         if ((in.tasks[i].regcmd & 0xF) || in.tasks[i].regcmd_count == 0 ||
@@ -1461,10 +1532,12 @@ NpuSubmit(
     base = NpuCoreBase(n);
 
     WdfWaitLockAcquire(Ctx->JobLock, NULL);
-    if (!Ctx->InterruptsConnected || !NpuSafeToRead(Ctx)) {
+    SUBMIT_STAMP(RKNPU_SP_ENTRY);
+    if (!Ctx->InterruptsConnected || !(m7path ? NpuSafeToRead(Ctx) : NpuSafeToReadFast(Ctx))) {
         status = STATUS_DEVICE_NOT_READY;
         goto out_job;
     }
+    SUBMIT_STAMP(RKNPU_SP_SAFE);
     if (JobActive(j) || NpuRd(Ctx, base + PC_OPERATION_ENABLE) != 0) {
         status = STATUS_DEVICE_BUSY;
         goto out_job;
@@ -1478,6 +1551,7 @@ NpuSubmit(
             goto out_job;
         }
     }
+    SUBMIT_STAMP(RKNPU_SP_IDLE);
 
     if (copy) {
         status = NpuArenaEnsure(Ctx, n);
@@ -1486,6 +1560,7 @@ NpuSubmit(
     }
 
     WdfWaitLockAcquire(Ctx->BoLock, NULL);
+    SUBMIT_STAMP(RKNPU_SP_ARENA);
     /* M6: paging on with the driver's table; after a reset this turns it on again */
     if (Ctx->Mmu.On) {
         status = NpuMmuEnsureLocked(Ctx, n);
@@ -1498,6 +1573,7 @@ NpuSubmit(
             goto out_bo;
         }
     }
+    SUBMIT_STAMP(RKNPU_SP_MMU);
     /*
      * M7: FINI_BO of what the caller deferred to this SUBMIT (the device's
      * inputs, and outputs it has finished reading), before the core can
@@ -1513,12 +1589,16 @@ NpuSubmit(
         }
         BoClean(cb, 0, cb->Size);
     }
+    SUBMIT_STAMP(RKNPU_SP_CLEAN);
     /* Every stream inside one of the caller's buffers, and within the rules:
      * M4 checks the copies it will run, M3 the streams in place. */
     if (copy) {
-        status = NpuCopyStreamsLocked(Ctx, fo, n, &in, &key);
+        status = NpuCopyStreamsLocked(Ctx, fo, n, &in, &key, m7path,
+                                      &ph[RKNPU_SP_COPY], &ph[RKNPU_SP_CHECK]);
         if (!NT_SUCCESS(status))
             goto out_bo;
+        /* the copy and check stamps are in ph already; restart the clock */
+        last = KeQueryPerformanceCounter(NULL).QuadPart;
     } else {
         for (i = 0; i < in.task_count; i++) {
             status = NpuCheckStreamLocked(Ctx, fo, &in.tasks[i], n, &k);
@@ -1526,6 +1606,7 @@ NpuSubmit(
                 goto out_bo;
             key = rknpu_rc_cbuf_merge(key, k, i == 0);
         }
+        SUBMIT_STAMP(RKNPU_SP_CHECK);
     }
 
     /*
@@ -1553,6 +1634,7 @@ NpuSubmit(
             goto out_bo;
         }
     }
+    SUBMIT_STAMP(RKNPU_SP_CBUF);
 
     NpuRecordLocked(Ctx, n);
     seq = ++Ctx->NextSeq;
@@ -1577,6 +1659,7 @@ NpuSubmit(
 #if defined(_M_ARM64)
     __dsb(_ARM64_BARRIER_SY);
 #endif
+    SUBMIT_STAMP(RKNPU_SP_BOOK);
 
     WdfInterruptAcquireLock(core->Interrupt);
     j->InFlight = TRUE;
@@ -1586,17 +1669,78 @@ NpuSubmit(
     WdfInterruptReleaseLock(core->Interrupt);
 
     tOut = KeQueryPerformanceCounter(NULL);
-    RtlZeroMemory(out, sizeof(*out));
+    ph[RKNPU_SP_START] += (ULONGLONG)(tOut.QuadPart - last);
+    ph[RKNPU_SP_TOTAL] = (ULONGLONG)(tOut.QuadPart - tIn.QuadPart);
+    /* M8: the sums for SUBMIT_STATS (JobLock held) */
+    core->SubmitCount++;
+    for (i = 0; i < RKNPU_SUBMIT_PHASES; i++)
+        core->SubmitTicks[i] += ph[i];
+    /* METHOD_BUFFERED: the output overwrites the input, which is copied */
+    if (outLen >= sizeof(rknpu_submit_m8_out)) {
+        rknpu_submit_m8_out *o8 = (rknpu_submit_m8_out *)out;
+
+        RtlZeroMemory(o8, sizeof(*o8));
+        for (i = 0; i < RKNPU_SUBMIT_PHASES; i++)
+            o8->phase_ns[i] = QpcToNs(Ctx, ph[i]);
+        *Info = sizeof(*o8);
+    } else {
+        RtlZeroMemory(out, sizeof(*out));
+        *Info = sizeof(*out);
+    }
     out->seqno = seq;
     out->core = n;
     out->drv_us = QpcToUs(Ctx, tOut.QuadPart - tIn.QuadPart);
-    *Info = sizeof(*out);
     status = STATUS_SUCCESS;
 out_bo:
     WdfWaitLockRelease(Ctx->BoLock);
 out_job:
     WdfWaitLockRelease(Ctx->JobLock);
     return status;
+}
+
+/*
+ * M8: SUBMIT_STATS, the per-core sums of NpuSubmit's phases (rknpu_ioctl.h),
+ * and with RKNPU_STATS_RESET zeroed after the read, so a benchmark can take
+ * its own window. Reads and writes nothing but the counters.
+ */
+static NTSTATUS
+NpuSubmitStats(
+    _In_ PDEVICE_CONTEXT Ctx,
+    _In_ WDFREQUEST Request,
+    _Out_ ULONG_PTR *Info
+    )
+{
+    rknpu_submit_stats_in *pin;
+    rknpu_submit_stats *o;
+    ULONG flags = 0, n, p;
+    NTSTATUS status;
+
+    *Info = 0;
+    if (NT_SUCCESS(WdfRequestRetrieveInputBuffer(Request, sizeof(*pin), (PVOID *)&pin, NULL)))
+        flags = pin->flags;
+    if (flags & ~RKNPU_STATS_RESET)
+        return STATUS_INVALID_PARAMETER;
+    status = WdfRequestRetrieveOutputBuffer(Request, sizeof(*o), (PVOID *)&o, NULL);
+    if (!NT_SUCCESS(status))
+        return status;
+    RtlZeroMemory(o, sizeof(*o));
+    o->version = RKNPU_M8_VERSION;
+    o->phases = RKNPU_SUBMIT_PHASES;
+    WdfWaitLockAcquire(Ctx->JobLock, NULL);
+    for (n = 0; n < RKNPU_NUM_CORES; n++) {
+        CORE_STATE *core = &Ctx->Core[n];
+
+        o->core[n].submits = core->SubmitCount;
+        for (p = 0; p < RKNPU_SUBMIT_PHASES; p++)
+            o->core[n].phase_ns[p] = QpcToNs64(Ctx, core->SubmitTicks[p]);
+        if (flags & RKNPU_STATS_RESET) {
+            core->SubmitCount = 0;
+            RtlZeroMemory(core->SubmitTicks, sizeof(core->SubmitTicks));
+        }
+    }
+    WdfWaitLockRelease(Ctx->JobLock);
+    *Info = sizeof(*o);
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -1848,6 +1992,9 @@ NpuM3DeviceControl(
         return TRUE;
     case IOCTL_RKNPU_WAIT:
         *Status = NpuWait(Ctx, Request, Info);
+        return TRUE;
+    case IOCTL_RKNPU_SUBMIT_STATS:
+        *Status = NpuSubmitStats(Ctx, Request, Info);
         return TRUE;
     case IOCTL_RKNPU_RESET:
         *Status = NpuReset(Ctx, Request, Info);

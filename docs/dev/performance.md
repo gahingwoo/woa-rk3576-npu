@@ -43,6 +43,40 @@ check measured 0.83 us a stream on the host, so most of the driver's time is
 somewhere else in `NpuSubmit`: the next thing to instrument. The interrupt
 reaches the DPC in 3 to 4 us and the DPC wakes the waiter in about 9 us.
 
+### Inside SUBMIT (M8)
+
+The driver now splits each SUBMIT into the phases in `rknpu_ioctl.h`
+(`RKNPU_SP_*`): the entry and JobLock wait, the power and clock check, the
+idle check, the arena and BoLock, the IOMMU check, the fused cleans, the
+stream copy, the stream check (rules and CBUF key), the shared-CBUF wait,
+the bookkeeping, and the start registers. Each SUBMIT returns its own split
+when the caller passes an `rknpu_submit_m8_out`; charsiu sums them and
+prints `charsiu rknpu dev N submit phases: ...` with `CHARSIU_RKNPU_STATS=1`,
+and `m7-bench.ps1` puts them in `decode.txt`. `rknputest submit-stats
+[--reset]` (and `rknputest info`) prints the driver's per-core sums.
+
+What M8 changed in SUBMIT, from reading the code, before any board number:
+
+- **The stream check read the write-combined arena.** M7 copied each stream
+  into the copy arena (Normal non-cacheable on ARM64) and then checked it
+  there, and computed the CBUF key from it in a second pass: every entry was
+  read from DRAM twice, about 150 entries a task and 2 to 3 tasks a SUBMIT.
+  M8 copies into a cached shadow only the driver can see, checks the shadow,
+  and writes it to the arena in one go. What runs is still exactly what was
+  checked.
+- **The power and clock check read the PLL too.** `NpuSafeToRead` reads the
+  PMU, five CRU registers and the three GPLL registers for the clock
+  report; SUBMIT now reads only the six its answer depends on.
+- Not changed, and why: SUBMIT allocates nothing (the arena and shadow are
+  made once per core); the IOMMU is never zapped per SUBMIT (only buffer
+  map and unmap touch the tables), but its check is six register reads,
+  which the `mmu` phase will price before anything trusts a cached state;
+  the stream copy is a few KiB from a cached mapping.
+
+`CHARSIU_RKNPU_M7SUBMIT=1` asks an M8 driver for M7's way of both, so the
+`short-m7submit` bench arm against the defaults is the before and after on
+one driver, and its phase rows say which phase moved.
+
 Run 1 also measured the weight cache: staging 77.2 s without it, 20.5 s the
 first time it is read and about 4 to 5 s after that.
 

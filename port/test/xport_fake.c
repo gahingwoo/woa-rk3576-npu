@@ -97,7 +97,7 @@ static unsigned long long n_busy, n_refused, n_wait, n_poll;
 static unsigned long long n_prep, n_fini, n_unfini, n_overlap, n_cbuf_wait;
 static unsigned long long n_clean, n_wprep;     /* M7: FINIs a SUBMIT did, PREPs a WAIT did */
 static unsigned long long n_ufini, n_uprep;     /* M7: the same done by the caller (UCACHE) */
-static int m4, m6;
+static int m4, m6, m7;          /* m7: answer as the M7 driver (no M8) */
 
 /* the scan: (target << 16 | reg) -> count, for values inside a buffer */
 #define SCAN_SLOTS 4096
@@ -125,6 +125,7 @@ static void init(void)
 	regs_path = getenv("RKNPU_FAKE_REGS");
 	m4 = getenv("RKNPU_FAKE_M4") != NULL;
 	m6 = m4 || getenv("RKNPU_FAKE_M6") != NULL;
+	m7 = m6 || getenv("RKNPU_FAKE_M7") != NULL;
 	atexit(report);
 }
 
@@ -199,11 +200,24 @@ static void retire(unsigned c)
 	hist[hist_at++ % RKNPU_JOB_HISTORY] = core_job[c];
 }
 
+static unsigned long long fake_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+/* M8: this host's copy and check time, as the driver's phases would say it */
+static unsigned long long f_copy_ns, f_check_ns;
+
 static int do_submit(struct rkx *x, const rknpu_submit_in *in, unsigned inlen, rknpu_submit_out *out)
 {
+	unsigned long long t0 = fake_ns(), tc = 0, tk = 0, ta, tb;
 	unsigned i, at = 0, key = RKNPU_RC_CBUF_ANY, other = in->core ^ 1u;
 	struct fjob *j;
-	unsigned allowed = RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY | (m6 ? 0 : RKNPU_SUBMIT_CLEAN);
+	unsigned allowed = RKNPU_SUBMIT_NO_CRUMBS | RKNPU_SUBMIT_COPY | (m6 ? 0 : RKNPU_SUBMIT_CLEAN) |
+			   (m7 ? 0 : RKNPU_SUBMIT_M7_PATH);
 
 	if (in->core >= RKNPU_NUM_CORES || !in->task_count || in->task_count > RKNPU_MAX_TASKS ||
 	    (in->flags & ~allowed))
@@ -255,9 +269,13 @@ static int do_submit(struct rkx *x, const rknpu_submit_in *in, unsigned inlen, r
 			return -E2BIG;
 		src = (const uint64_t *)((unsigned char *)b->mem + (in->tasks[i].regcmd - b->addr));
 		dst = (uint64_t *)(arena + at);
+		ta = fake_ns();
 		memcpy(dst, src, fetched * 8);
+		tb = fake_ns();
 		why = rknpu_rc_check_stream((const unsigned long long *)dst, fetched, 0, in_bo, x, &bad);
 		key = rknpu_rc_cbuf_merge(key, rknpu_rc_cbuf_key((const unsigned long long *)dst, fetched), i == 0);
+		tc += tb - ta;
+		tk += fake_ns() - tb;
 		if (why) {
 			n_refused++;
 			fprintf(stderr, "rknpu-fake: SUBMIT refused, stream 0x%08x entry %u "
@@ -317,6 +335,9 @@ static int do_submit(struct rkx *x, const rknpu_submit_in *in, unsigned inlen, r
 	memset(out, 0, sizeof(*out));
 	out->seqno = j->seq;
 	out->core = in->core;
+	out->drv_us = (unsigned)((fake_ns() - t0) / 1000);
+	f_copy_ns = tc;
+	f_check_ns = tk;
 	return 0;
 }
 
@@ -457,6 +478,8 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 		}
 		if (!m6)
 			i->m7_version = RKNPU_M7_VERSION;
+		if (!m7)
+			i->m8_version = RKNPU_M8_VERSION;
 		*got = sizeof(*i);
 		break;
 	}
@@ -564,6 +587,16 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 		r = do_submit(x, in, inlen, out);
 		if (!r)
 			*got = sizeof(rknpu_submit_out);
+		/* M8: the phase split, when the caller asks for it */
+		if (!r && !m7 && outlen >= sizeof(rknpu_submit_m8_out)) {
+			rknpu_submit_m8_out *o8 = out;
+
+			memset(o8->phase_ns, 0, sizeof(o8->phase_ns));
+			o8->phase_ns[RKNPU_SP_COPY] = (unsigned)f_copy_ns;
+			o8->phase_ns[RKNPU_SP_CHECK] = (unsigned)f_check_ns;
+			o8->phase_ns[RKNPU_SP_TOTAL] = o8->base.drv_us * 1000u;
+			*got = sizeof(*o8);
+		}
 		break;
 	case IOCTL_RKNPU_WAIT:
 		if (inlen < sizeof(rknpu_wait_in) || outlen < sizeof(rknpu_wait_out)) {

@@ -57,6 +57,11 @@
  *                         and the PREP_BO after a job rides on its WAIT
  *                         (RKNPU_WAIT_PREP), so a decode call is four IOCTLs
  *                         instead of ten; 0 is M6's one IOCTL each
+ *   CHARSIU_RKNPU_M7SUBMIT M8, default 0: 1 asks an M8 driver for M7's SUBMIT
+ *                         checks (the full clock read, the streams checked
+ *                         in the write-combined arena): the control for
+ *                         what M8 changed. With CHARSIU_RKNPU_STATS=1 the
+ *                         close prints the driver's split of a SUBMIT
  *   CHARSIU_RKNPU_ASYNC   M7, default 0: 1 makes each device's SUBMIT IOCTL on
  *                         a thread of its own, so a call's two SUBMITs
  *                         overlap (see async_main)
@@ -122,6 +127,9 @@ struct charsiu_device {
 
 	/* M7 */
 	int m7;                         /* the driver has RKNPU_SUBMIT_CLEAN and RKNPU_WAIT_PREP */
+	int m8;                         /* the driver splits SUBMIT's time (rknpu_submit_m8_out) */
+	int m7path;                     /* CHARSIU_RKNPU_M7SUBMIT: ask for M7's SUBMIT checks */
+	unsigned long long sub_phase_ns[RKNPU_SUBMIT_PHASES];
 	int fuse;                       /* and they are used (CHARSIU_RKNPU_FUSE) */
 	int ucache;                     /* PREP / FINI done here (CHARSIU_RKNPU_UCACHE) */
 	unsigned defer[RKNPU_M7_MAX_CLEAN];     /* FINI_BOs for the next SUBMIT; lock */
@@ -386,6 +394,9 @@ struct charsiu_device *charsiu_open(const char *path)
 	dev->cached = info.m6_version && info.bo_cached;
 	/* M7: an M6 driver leaves m7_version 0 and refuses the new flags */
 	dev->m7 = info.m6_version && info.m7_version >= RKNPU_M7_VERSION;
+	/* M8: an M7 driver leaves m8_version 0 and would refuse the flag */
+	dev->m8 = dev->m7 && info.m8_version >= RKNPU_M8_VERSION;
+	dev->m7path = dev->m8 && env_long("CHARSIU_RKNPU_M7SUBMIT", 0) != 0;
 	dev->fuse = dev->m7 && dev->cached && env_long("CHARSIU_RKNPU_FUSE", 1) != 0;
 	dev->ucache = dev->cached && env_long("CHARSIU_RKNPU_UCACHE", 1) != 0 && rkx_dc_usable();
 	pthread_mutex_init(&dev->lock, NULL);
@@ -449,6 +460,19 @@ void charsiu_close(struct charsiu_device *dev)
 				(double)dev->late_us / (dev->wait_timed - dev->wait_slept) : 0.0,
 			dev->deferred, dev->cleaned_by_submit, dev->defer_full, dev->prepped_by_wait,
 			dev->uc_ops, dev->uc_us / 1e3, dev->async_n);
+	if (env_long("CHARSIU_RKNPU_STATS", 0) && dev->m8 && dev->sub_n) {
+		static const char *const nm[RKNPU_SUBMIT_PHASES] = {
+			"entry", "safe", "idle", "arena", "mmu", "clean", "copy", "check",
+			"cbuf", "book", "start", "total" };
+		char buf[512];
+		int at = 0;
+
+		for (unsigned p = 0; p < RKNPU_SUBMIT_PHASES && at < (int)sizeof(buf); p++)
+			at += snprintf(buf + at, sizeof(buf) - at, "%s%s %.2f", p ? ", " : "", nm[p],
+				       dev->sub_phase_ns[p] / 1e3 / dev->sub_n);
+		fprintf(stderr, "charsiu rknpu dev %u submit phases: us a SUBMIT, %s%s\n", dev->index, buf,
+			dev->m7path ? " (CHARSIU_RKNPU_M7SUBMIT: M7's checks)" : "");
+	}
 	/* closing the handle frees every buffer it still holds (NpuM3FileCleanup) */
 	rkx_close(dev->x);
 	pthread_mutex_destroy(&dev->lock);
@@ -673,24 +697,29 @@ static int submit_chunk(struct charsiu_device *dev, rknpu_submit_m7_in *m7)
 	rknpu_submit_in *in = &m7->base;
 	unsigned long long t0 = 0, ts;
 	unsigned try = 0, got = 0, inlen = sizeof(*in), i;
-	rknpu_submit_out out;
+	rknpu_submit_m8_out o8;         /* M8: the phases; an older driver fills only .base */
+	rknpu_submit_out *const outp = &o8.base;
 	int r;
 
 	/* M7: m7->clean_count FINI_BOs ride on this SUBMIT (take_defer) */
-	in->flags = RKNPU_SUBMIT_COPY | crumb_flags(dev);
+	in->flags = RKNPU_SUBMIT_COPY | crumb_flags(dev) | (dev->m7path ? RKNPU_SUBMIT_M7_PATH : 0);
 	if (m7->clean_count) {
 		in->flags |= RKNPU_SUBMIT_CLEAN;
 		inlen = sizeof(*m7);
 	}
 	for (;;) {
 		in->core = (dev->index + try) % RKNPU_NUM_CORES;
-		memset(&out, 0, sizeof(out));
+		memset(&o8, 0, sizeof(o8));
 		ts = rkx_now_us();
-		r = rkx_ioctl(dev->x, IOCTL_RKNPU_SUBMIT, m7, inlen, &out, sizeof(out), &got);
+		r = rkx_ioctl(dev->x, IOCTL_RKNPU_SUBMIT, m7, inlen, &o8,
+			      dev->m8 ? (unsigned)sizeof(o8) : (unsigned)sizeof(o8.base), &got);
 		if (!r) {
 			dev->sub_n++;
 			dev->sub_wall_us += rkx_now_us() - ts;
-			dev->sub_drv_us += out.drv_us;
+			dev->sub_drv_us += outp->drv_us;
+			if (got >= sizeof(o8))
+				for (i = 0; i < RKNPU_SUBMIT_PHASES; i++)
+					dev->sub_phase_ns[i] += o8.phase_ns[i];
 		}
 		if (r != -EBUSY)
 			break;
@@ -732,8 +761,8 @@ static int submit_chunk(struct charsiu_device *dev, rknpu_submit_m7_in *m7)
 		return r;
 	}
 	dev->pending = 1;
-	dev->seq = out.seqno;
-	dev->core = out.core;
+	dev->seq = outp->seqno;
+	dev->core = outp->core;
 	dev->chunks++;
 	dev->tasks += in->task_count;
 	return 0;

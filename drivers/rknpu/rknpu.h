@@ -229,6 +229,11 @@ typedef struct _CORE_STATE {
     PHYSICAL_ADDRESS ArenaPa;
     ULONG           ArenaDma;       /* M6: its NPU address (= ArenaPa in bypass mode) */
     PMDL            ArenaMdl;       /* M6, IOMMU mode: its pages */
+    PUCHAR          ArenaShadow;    /* M8: a cached, driver-only copy where the streams are checked */
+
+    /* M8: where SUBMIT's time goes (QPC ticks, JobLock) */
+    ULONGLONG       SubmitCount;
+    ULONGLONG       SubmitTicks[RKNPU_SUBMIT_PHASES];
 
     /* M6 */
     volatile LONG   MmuFaults;
@@ -320,6 +325,7 @@ static __forceinline ULONG NpuCoreBase(ULONG core)
 
 /* driver.c */
 BOOLEAN NpuSafeToRead(_In_ PDEVICE_CONTEXT Ctx);
+BOOLEAN NpuSafeToReadFast(_In_ PDEVICE_CONTEXT Ctx);
 
 /* m3.c */
 NTSTATUS NpuM3DeviceInit(_In_ PDEVICE_CONTEXT Ctx);

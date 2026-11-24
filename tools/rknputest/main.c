@@ -135,6 +135,55 @@ static void check(int ok, const char *what)
         g_fail = 1;
 }
 
+static int m3_call(unsigned int code, const void *in, unsigned int in_len, void *out, unsigned int out_len);
+
+/* M8: where the driver's SUBMIT spends its time, per core (IOCTL_RKNPU_SUBMIT_STATS) */
+static void print_submit_stats(int reset)
+{
+    static const char *const nm[RKNPU_SUBMIT_PHASES] = {
+        "entry", "safe", "idle", "arena", "mmu", "clean", "copy", "check",
+        "cbuf", "book", "start", "total" };
+    rknpu_submit_stats_in si;
+    rknpu_submit_stats st;
+    unsigned int c, p;
+
+    memset(&si, 0, sizeof(si));
+    si.flags = reset ? RKNPU_STATS_RESET : 0;
+    memset(&st, 0, sizeof(st));
+    if (m3_call(IOCTL_RKNPU_SUBMIT_STATS, &si, sizeof(si), &st, sizeof(st))) {
+        printf("m8: SUBMIT_STATS failed\n");
+        return;
+    }
+    for (c = 0; c < RKNPU_NUM_CORES; c++) {
+        const rknpu_submit_core_stats *k = &st.core[c];
+
+        printf("core %u submit phases over %llu SUBMITs, us a SUBMIT:", c, k->submits);
+        for (p = 0; p < RKNPU_SUBMIT_PHASES; p++)
+            printf("%s %s %.2f", p ? "," : "", nm[p],
+                   k->submits ? (double)k->phase_ns[p] / 1e3 / (double)k->submits : 0.0);
+        printf("\n");
+    }
+    if (reset)
+        printf("m8: the sums are zero again\n");
+}
+
+static int cmd_submit_stats(int argc, char **argv)
+{
+    rknpu_info in;
+    int reset = argc >= 1 && !strcmp(argv[0], "--reset");
+
+    if (dev_open())
+        return 1;
+    if (dev_info(&in))
+        return 1;
+    if (!in.m8_version) {
+        printf("m8: not in this driver (an M7 or older build)\n");
+        return 1;
+    }
+    print_submit_stats(reset);
+    return 0;
+}
+
 static int cmd_info(void)
 {
     rknpu_info in;
@@ -189,6 +238,11 @@ static int cmd_info(void)
                in.bo_cached ? "cached (PREP_BO/FINI_BO)" : "write-combined", in.iova_kib, in.pt_pages);
     else if (in.m4_version)
         printf("m6: not in this driver (an M4 build)\n");
+    if (in.m6_version)
+        printf("m7: %s; m8: %s\n", in.m7_version ? "fused PREP/FINI, timing" : "not in this driver",
+               in.m8_version ? "SUBMIT phases" : "not in this driver");
+    if (in.m8_version)
+        print_submit_stats(0);
 
     if (in.flags & RKNPU_INFO_CLOCKS_VALID) {
         const rknpu_clock_info *k = &in.clocks;
@@ -1224,7 +1278,8 @@ static void usage(void)
             "       rknputest regs <offset> <count>\n"
             "       rknputest selftest\n"
             "       rknputest m3 [--core 0|1|both] [--iters N] [--shape M K N] [--map] [--no-reset]\n"
-            "       rknputest m6 [--mb N] [--iters N] [--fault] [--no-parallel] [--collide]\n");
+            "       rknputest m6 [--mb N] [--iters N] [--fault] [--no-parallel] [--collide]\n"
+            "       rknputest submit-stats [--reset]\n");
 }
 
 int main(int argc, char **argv)
@@ -1241,6 +1296,8 @@ int main(int argc, char **argv)
         rc = cmd_m3(argc - 2, argv + 2);
     else if (argc >= 2 && !strcmp(argv[1], "m6"))
         rc = cmd_m6(argc - 2, argv + 2);
+    else if (argc >= 2 && !strcmp(argv[1], "submit-stats"))
+        rc = cmd_submit_stats(argc - 2, argv + 2);
     else {
         usage();
         return 1;
