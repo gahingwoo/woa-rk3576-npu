@@ -13,7 +13,15 @@
  *   - a stream with an address outside the device's buffers, one that
  *     writes the PC block and one that writes a register charsiu never
  *     writes are each refused, and the device keeps working afterwards;
- *   - a buffer of another device is outside this one's buffers.
+ *   - a buffer of another device is outside this one's buffers;
+ *   - M7: FINI_BO rides on the next SUBMIT and PREP_BO on the WAIT (the
+ *     model refuses a stream whose clean never arrived), or, with
+ *     CHARSIU_RKNPU_UCACHE=1 and RKNPU_FAKE_UCACHE=1, both happen in the
+ *     caller; RKNPU_FAKE_M6=1 is the M6 driver, one IOCTL each;
+ *   - M7, CHARSIU_RKNPU_ASYNC=1: the same work through the SUBMIT threads,
+ *     and a refused stream fails the next PREP and every later SUBMIT
+ *     (the busy-core, refusal and shared-CBUF steps above need a
+ *     synchronous SUBMIT and are skipped).
  *
  * Nothing computes; see xport_fake.c.
  *
@@ -38,6 +46,8 @@ void rkx_fake_counts(unsigned long long *submits, unsigned long long *busy,
 void rkx_fake_sync_counts(unsigned long long *preps, unsigned long long *finis,
 			  unsigned long long *unfinished);
 void rkx_fake_cbuf_counts(unsigned long long *overlaps, unsigned long long *waits);
+void rkx_fake_m7_counts(unsigned long long *cleans, unsigned long long *wait_preps,
+			unsigned long long *ufinis, unsigned long long *upreps);
 
 static int failures;
 
@@ -138,6 +148,7 @@ int main(void)
 	uint64_t saved;
 	unsigned i;
 	int r;
+	int async = getenv("CHARSIU_RKNPU_ASYNC") && atoi(getenv("CHARSIU_RKNPU_ASYNC"));
 
 	d0 = charsiu_open(NULL);
 	d1 = charsiu_open(NULL);
@@ -170,6 +181,7 @@ int main(void)
 	mm_free(d0, &big);
 
 	/* device 2 prefers core 0, which device 0 holds: it takes core 1 */
+	if (!async) {
 	rkx_fake_counts(&s0, &busy0, &ref0, &maxt);
 	CHECK(submit_n(d0, &a, 1, 4096, 0) == 0, "device 0 on core 0");
 	CHECK(submit_n(d2, &c, 1, 4096, 0) == 0, "device 2 while core 0 is busy");
@@ -181,10 +193,12 @@ int main(void)
 	CHECK(submit_n(d2, &c, 1, 4096, 0) == 0, "device 2 again");
 	CHECK(charsiu_bo_prep(d0, &a.out, 1000000000) == 0, "device 0's WAIT after its core was retaken");
 	CHECK(charsiu_bo_prep(d2, &c.out, 1000000000) == 0, "device 2's second job");
+	}
 
 	/* M6, the shared CBUF: device 0 on window 0 and device 1 on window 1
-	 * overlap without a wait; the same window waits */
-	{
+	 * overlap without a wait; the same window waits (counted at SUBMIT,
+	 * so not with CHARSIU_RKNPU_ASYNC) */
+	if (!async) {
 		struct mm w1;
 		unsigned long long ov0, wt0, ov1, wt1;
 
@@ -218,6 +232,7 @@ int main(void)
 	i = find_reg(&a, RKNPU_RC_DPU_DST_ADDR);
 	saved = ((uint64_t *)a.reg.map)[i];
 	CHECK(i, "the stream has a DPU destination");
+	if (!async) {
 	poke(d0, &a, i, RKNPU_RC_ENTRY(RKNPU_RC_DPU, RKNPU_RC_DPU_DST_ADDR, 0xF0000000u));
 	rkx_fake_counts(&s0, &busy0, &ref0, &maxt);
 	CHECK(submit_n(d0, &a, 1, 4096, 0) == -EACCES, "output outside every buffer is refused");
@@ -236,22 +251,59 @@ int main(void)
 	poke(d0, &a, i, saved);
 	CHECK(submit_n(d0, &a, 2, 4096, 0) == 0, "after the refusals");
 	CHECK(charsiu_bo_prep(d0, &a.out, 1000000000) == 0, "after the refusals, wait");
+	}
 
 	/* M6: cached buffers. charsiu's own prep/fini reached the driver ... */
 	{
 		unsigned long long p0, f0, u0, p1, f1, u1;
 
+		unsigned long long cl, wp, uf, up;
+		int m6 = getenv("RKNPU_FAKE_M6") || getenv("RKNPU_FAKE_M4");
+		int uc = getenv("RKNPU_FAKE_UCACHE") && getenv("CHARSIU_RKNPU_UCACHE") &&
+			 atoi(getenv("CHARSIU_RKNPU_UCACHE"));
+		int fuse = !m6 && !uc && !(getenv("CHARSIU_RKNPU_FUSE") &&
+					   !atoi(getenv("CHARSIU_RKNPU_FUSE")));
+
 		rkx_fake_sync_counts(&p0, &f0, &u0);
-		CHECK(getenv("RKNPU_FAKE_M4") || (p0 > 0 && f0 > 0 && u0 == 0),
+		rkx_fake_m7_counts(&cl, &wp, &uf, &up);
+		CHECK(getenv("RKNPU_FAKE_M4") || (p0 + up > 0 && f0 + cl + uf > 0 && u0 == 0),
 		      "PREP_BO %llu, FINI_BO %llu, unflushed jobs %llu", p0, f0, u0);
+		/* M7: which path did the work */
+		if (fuse)
+			CHECK(cl > 0 && wp > 0 && wp <= p0 && uf == 0 && up == 0,
+			      "fused: %llu FINIs by SUBMIT, %llu PREPs by WAIT, %llu FINI_BO IOCTLs",
+			      cl, wp, f0);
+		else if (uc && !getenv("RKNPU_FAKE_M4"))
+			CHECK(uf > 0 && up > 0 && cl == 0 && wp == 0 && f0 == 0,
+			      "in the caller: %llu cleans, %llu invalidates (%llu, %llu by the driver)",
+			      uf, up, cl, wp);
+		else if (!getenv("RKNPU_FAKE_M4"))
+			CHECK(cl == 0 && wp == 0 && f0 > 0, "M6: %llu FINI_BO, %llu cleans by SUBMIT",
+			      f0, cl);
 		/* ... and a stream written after its FINI is caught by the model */
 		((uint64_t *)a.reg.map)[0] = ((uint64_t *)a.reg.map)[0];
 		charsiu_bo_prep(d0, &a.reg, 1000000000);
 		r = submit_n(d0, &a, 1, 4096, 0);
+		if (async && !r)
+			r = charsiu_bo_prep(d0, &a.out, 1000000000);
 		rkx_fake_sync_counts(&p1, &f1, &u1);
 		CHECK(getenv("RKNPU_FAKE_M4") ? r == 0 : (r == -EIO && u1 == u0 + 1),
 		      "a stream not flushed since the CPU touched it: %d", r);
-		charsiu_bo_prep(d0, &a.out, 1000000000);
+		if (!async)
+			charsiu_bo_prep(d0, &a.out, 1000000000);
+	}
+
+	/* M7 async: a refused stream fails the next PREP, then every SUBMIT
+	 * (device 2, which nothing else uses from here) */
+	if (async) {
+		unsigned j = find_reg(&c, RKNPU_RC_DPU_DST_ADDR);
+
+		poke(d2, &c, j, RKNPU_RC_ENTRY(RKNPU_RC_DPU, RKNPU_RC_DPU_DST_ADDR, 0xF0000000u));
+		CHECK(submit_n(d2, &c, 1, 4096, 0) == 0, "async: the refused SUBMIT is accepted for now");
+		r = charsiu_bo_prep(d2, &c.out, 1000000000);
+		CHECK(r == -EACCES, "async: the PREP after it fails (%d)", r);
+		r = submit_n(d2, &c, 1, 4096, 0);
+		CHECK(r == -EACCES, "async: and so does the next SUBMIT (%d)", r);
 	}
 
 	mm_free(d0, &a);

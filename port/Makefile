@@ -62,7 +62,7 @@ $(B)/win/libm/%.o: libm/%.c | $(B)/win
 	$(WCC) $(CFLAGS_M) -Ilibm -c $< -o $@
 
 # 16 MiB of stack for every thread, as near Linux's 8 MiB default as matters
-WLDFLAGS := -static -Wl,--stack,16777216 -lpthread
+WLDFLAGS := -static -Wl,--stack,16777216 -lpthread -lpowrprof
 WDEFS    = -Icompat $(CPPFLAGS_C) -DCHARSIU_BUILD=\"$(COMMIT)-win-$(PORTREV)\"
 
 $(B)/win/charsiu_run.exe: $(CHARSIU)/tools/charsiu_run.c $(CHARSIU)/src/vision.c $(CHARSIU)/src/image.c \
