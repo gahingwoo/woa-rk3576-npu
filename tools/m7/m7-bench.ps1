@@ -1,6 +1,7 @@
 # m7-bench.ps1 - M7 on the board: where a decode token goes, and what each M7 change buys
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File m7-bench.ps1 -Model R:\npu\Llama-3.2-1B-Instruct-Q8_0.gguf [-Out R:\npu\m7-windows] [-Quick] [-SkipDriverTests] [-IdleDisable] [-KeepCache]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File m7-bench.ps1 -RestoreIdle   (processor idle back on)
 #   powershell -NoProfile -ExecutionPolicy Bypass -File m7-bench.ps1 -Report R:\npu\m7-windows
 #
 # As administrator, from the unpacked charsiu-m7-arm64 artifact with
@@ -54,7 +55,8 @@ param(
     [switch]$Quick,
     [switch]$SkipDriverTests,
     [switch]$IdleDisable,
-    [switch]$KeepCache
+    [switch]$KeepCache,
+    [switch]$RestoreIdle
 )
 
 $ErrorActionPreference = 'Stop'
@@ -315,13 +317,75 @@ if ($Report) {
 
 # ---- the run ---------------------------------------------------------------------
 
-if (-not $Model) { Die 'give -Model (or -Report on a finished run)' }
+if (-not $Model -and -not $RestoreIdle) { Die 'give -Model (or -Report on a finished run)' }
 $run = Join-Path $here 'charsiu_run.exe'
 $long = Join-Path $here 'long.txt'
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Die 'run as administrator (\\.\RKNPU is administrators-only)'
 }
+
+# THE IDLE-DISABLE SETTING MUST NEVER OUTLIVE THE BENCH. Left at 1 the cores
+# never idle: Task Manager reads 100% and the board runs 10 to 15 C hotter.
+# It was left set by an interrupted run, so there are three layers now:
+#   - the value before is written to a file before the setting is touched,
+#     and restored in a finally (Ctrl+C runs it) and on PowerShell's exit;
+#   - a SYSTEM task at startup puts it back to 0, for a run that was killed
+#     or a board that lost power, and is deleted when the bench restores it;
+#   - a value that could not be read (powercfg's output is localised) is
+#     restored as 0, Windows' default, rather than not restored at all.
+# `m7-bench.ps1 -RestoreIdle` does the restore by hand.
+$idleMark = Join-Path $env:ProgramData 'woa-rk3576-npu\idle-restore.txt'
+$idleTask = 'woa-rk3576-npu-idle-restore'
+function Idle-Get {
+    $q = powercfg /query SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE | Select-String ':\s*(0x[0-9a-fA-F]{8})\s*$'
+    # the first index is AC, the second DC; the words around them are localised
+    if ($q) { return $q[0].Matches[0].Groups[1].Value }
+    return '0x00000000'
+}
+function Idle-Write($v) {
+    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE $v | Out-Null
+    powercfg /setactive SCHEME_CURRENT | Out-Null
+}
+function Idle-Set($on) {
+    $old = Idle-Get
+    if ($old -ne '0x00000000') {
+        # disabled already: almost certainly a run from before this fix that
+        # never put it back, so the value to return to is Windows' default
+        Write-Host "m7-bench: processor idle was already disabled ($old); it will be restored to enabled"
+        $old = '0x00000000'
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $idleMark) | Out-Null
+    $old | Out-File -Encoding ascii $idleMark
+    schtasks /create /tn $idleTask /sc onstart /ru SYSTEM /rl HIGHEST /f /tr `
+        "cmd /c powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE $old & powercfg /setactive SCHEME_CURRENT" 2>&1 | Out-Null
+    Idle-Write $(if ($on) { 1 } else { 0 })
+    return $old
+}
+function Idle-Restore($old) {
+    if ($null -eq $old -or $old -eq '') { $old = '0x00000000' }
+    Idle-Write $old
+    Remove-Item -LiteralPath $idleMark -Force -ErrorAction SilentlyContinue
+    schtasks /delete /tn $idleTask /f 2>&1 | Out-Null
+}
+# a run that died before restoring: put it back before anything else
+if (Test-Path -LiteralPath $idleMark) {
+    $stale = (Get-Content -LiteralPath $idleMark -TotalCount 1).Trim()
+    Idle-Restore $stale
+    Write-Host "m7-bench: a previous run left processor idle disabled; restored ($stale)"
+}
+if ($RestoreIdle) { Idle-Restore '0x00000000'; Write-Host 'm7-bench: processor idle enabled'; exit 0 }
+# self-contained: an event action does not see this script's functions
+[void](Register-EngineEvent -SourceIdentifier PowerShell.Exiting -MessageData $idleMark -Action {
+    $m = $event.MessageData
+    if (Test-Path -LiteralPath $m) {
+        $v = (Get-Content -LiteralPath $m -TotalCount 1).Trim()
+        powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE $v | Out-Null
+        powercfg /setactive SCHEME_CURRENT | Out-Null
+        Remove-Item -LiteralPath $m -Force
+    }
+})
+
 foreach ($f in $run, $long) { if (-not (Test-Path $f)) { Die "missing ${f}: run from the unpacked artifact" } }
 $rkt = Join-Path $here 'rknputest.exe'
 if (-not (Test-Path $rkt)) { $rkt = (Get-Command rknputest.exe -ErrorAction SilentlyContinue).Source }
@@ -363,19 +427,6 @@ function Write-Text($src, $dst) {
         }
     }
     [IO.File]::WriteAllBytes($dst, $o.ToArray())
-}
-
-function Idle-Set($on) {
-    $q = powercfg /query SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE | Select-String 'Current AC Power Setting Index: (0x[0-9a-f]+)'
-    $old = if ($q) { $q.Matches[0].Groups[1].Value } else { $null }
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE $(if ($on) { 1 } else { 0 }) | Out-Null
-    powercfg /setactive SCHEME_CURRENT | Out-Null
-    return $old
-}
-function Idle-Restore($old) {
-    if ($null -eq $old) { return }
-    powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR IDLEDISABLE $old | Out-Null
-    powercfg /setactive SCHEME_CURRENT | Out-Null
 }
 
 & {
