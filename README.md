@@ -22,6 +22,13 @@ artifacts.
 
 How to use it: [docs/use.md](docs/use.md).
 
+![Device Manager with Neural processors, Rockchip RK3576 NPU working properly; an NPU Chat console running Llama-3.2-1B on the NPU; a monitor widget](docs/imgs/tspi3m-2026-11-24-npu-chat.webp)
+
+*TaishanPi 3M, Windows 11 23H2, 2026-11-24. Device Manager lists the NPU
+under "Neural processors" and reports it working; the console chats with
+Llama-3.2-1B on the NPU; the widget at the top right shows CPU, GPU and NPU
+load and temperatures.*
+
 ## Milestones
 
 | # | What | Result |

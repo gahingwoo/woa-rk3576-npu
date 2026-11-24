@@ -12,6 +12,10 @@
 
 使用方法：[docs/zh-CN/use.md](docs/zh-CN/use.md)。
 
+![设备管理器的"Neural processors"下 Rockchip RK3576 NPU 工作正常；NPU Chat 控制台在 NPU 上运行 Llama-3.2-1B；监视小组件](docs/imgs/tspi3m-2026-11-24-npu-chat.webp)
+
+*泰山派 3M，Windows 11 23H2，2026-11-24。设备管理器在"Neural processors"下列出 NPU 并显示工作正常；控制台在 NPU 上用 Llama-3.2-1B 对话；右上角的小组件显示 CPU、GPU、NPU 的负载和温度。*
+
 ## 里程碑
 
 | # | 内容 | 结果 |
