@@ -22,7 +22,7 @@
 #include "rknpu_regcmd.h"
 #include "fakedev.h"
 
-#define FAKE_MAX_BO 32
+#define FAKE_MAX_BO 512
 
 static struct {
     unsigned int handle, addr, size;
@@ -112,6 +112,15 @@ int fake_ioctl(unsigned int code, const void *inb, unsigned int in_len, void *ou
         o->flags = RKNPU_INFO_INTERRUPTS_CONNECTED | RKNPU_INFO_DOMAINS_ON;
         o->core_count = RKNPU_NUM_CORES;
         o->m3_version = RKNPU_M3_VERSION;
+        /* M6: answers as IOMMU mode, so `m6` runs; the addresses are made up
+         * either way, and the buffers are not cached (no PREP/FINI needed) */
+        o->m6_version = RKNPU_M6_VERSION;
+        o->mem_mode = RKNPU_MEM_IOMMU;
+        for (i = 0; i < FAKE_MAX_BO; i++)
+            if (bo[i].handle) {
+                o->bo_count++;
+                o->bo_kib += bo[i].size >> 10;
+            }
         return 0;
     }
     case IOCTL_RKNPU_CREATE_BO: {
@@ -165,6 +174,9 @@ int fake_ioctl(unsigned int code, const void *inb, unsigned int in_len, void *ou
         m->user_va = (unsigned long long)(size_t)bo[i].mem;
         return 0;
     }
+    case IOCTL_RKNPU_PREP_BO:
+    case IOCTL_RKNPU_FINI_BO:
+        return find(((const rknpu_bo_sync *)inb)->handle) < 0 ? -1 : 0;
     case IOCTL_RKNPU_UNMAP_BO:
         return find(((const rknpu_bo_handle *)inb)->handle) < 0 ? -1 : 0;
     case IOCTL_RKNPU_SUBMIT: {
