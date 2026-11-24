@@ -12,6 +12,10 @@ env:
   # Pinned so a runner-image refresh cannot silently change the headers the
   # driver is checked against (same pin and runner as woa-rk3576's ci.yml).
   WDK_VERSION: '10.0.26100.0'
+  # charsiu for Windows on Arm is built with llvm-mingw (clang, UCRT); pinned
+  # by release and by the digest GitHub publishes for the asset.
+  LLVM_MINGW_TAG: '20261020'
+  LLVM_MINGW_SHA256: '55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335'
 
 jobs:
   host:
@@ -33,8 +37,30 @@ jobs:
           # buffers, relocations and checks, not the NPU
           gcc -std=c11 -D_POSIX_C_SOURCE=200809L -O2 -Wall -Wextra -Werror -pedantic \
               -Iinclude -DRKNPU_FAKE_DEVICE -o rknputest-fake \
-              tools/rknputest/main.c tools/rknputest/fakedev.c
+              tools/rknputest/main.c tools/rknputest/fakedev.c -lpthread
           ./rknputest-fake m3 --iters 2 --map
+          # M6: scatter, ladder and latency against the stand-in (no MMU there)
+          # and two handles on two threads at once, each with its own
+          # buffers, whose jobs overlap: the case the first M6 board run
+          # failed (a second handle's WRITE_BO refused as busy)
+          ./rknputest-fake m6 --iters 8 --mb 128
+          # the test must catch the old device-wide rule
+          if FAKE_GLOBAL_BUSY=1 ./rknputest-fake m6 --iters 8 --mb 0 > old-rule.txt 2>&1; then
+            cat old-rule.txt; echo "the parallel test passed under the old rule"; exit 1
+          fi
+          grep -q "WRITE_BO refused, busy\|MAP_BO refused, busy" old-rule.txt
+          # the shared CBUF (second M6 board run): core c uses window c and
+          # both cores overlap; with --collide (both on window 0) the driver
+          # must make the jobs wait for each other and stay exact ...
+          ./rknputest-fake m6 --iters 8 --mb 0 --collide | tee collide.txt
+          grep -q "RKNPU M6: PASS" collide.txt
+          waits=$(grep "^core . totals" collide.txt | sed 's/.* \([0-9]*\) CBUF waits.*/\1/' | paste -sd+ | bc)
+          test "$waits" -gt 0
+          # ... and without that wait the model corrupts both, as the board did
+          if FAKE_NO_CBUF_GUARD=1 ./rknputest-fake m6 --iters 8 --mb 0 --collide > noguard.txt 2>&1; then
+            cat noguard.txt; echo "same-window jobs ran together and the test did not notice"; exit 1
+          fi
+          grep -q "words wrong" noguard.txt
       - name: M3 streams and packing against charsiu
         run: |
           set -eux
@@ -42,10 +68,30 @@ jobs:
           # packing in m3_gemm.h byte-identical to charsiu's
           make -C tools/m3gen header
           git diff --exit-code tools/rknputest/m3_streams.h
+          # M4: the register list SUBMIT enforces is every register charsiu
+          # writes, regenerated from charsiu on every push
+          make -C tools/m3gen regs
+          git diff --exit-code include/rknpu_regcmd_allow.h
           make -C tools/m3gen check
-          # the header alone, freestanding, as charsiu's device_win.c will see it
-          printf '#include "rknpu_ioctl.h"\n' > hdr.c
+          # the headers alone, freestanding, as the driver and port/ see them
+          printf '#include "rknpu_ioctl.h"\n#include "rknpu_regcmd.h"\n' > hdr.c
           gcc -std=c99 -ffreestanding -nostdinc -Wall -Wextra -Werror -Iinclude -c hdr.c -o /dev/null
+      - name: M4 board scripts parse
+        run: |
+          set -eux
+          shellcheck tools/m4/*.sh
+          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/rknpu-reinstall.ps1; do
+            F="$f" pwsh -NoProfile -Command '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:F, [ref]$null, [ref]$e); if ($e) { $e; exit 1 }'
+          done
+      - name: M4 device layer against the in-memory driver
+        run: |
+          set -eux
+          # port/device_rknpu.c on test/xport_fake.c, which runs the driver's
+          # own stream check: chunking, the copy arena, busy cores, the job
+          # history, and the three refusals; M6 (cached buffers, PREP/FINI)
+          # and, with RKNPU_FAKE_M4=1, the same against the M4 driver
+          make -C port check
+          RKNPU_FAKE_M4=1 port/build/host/devtest
       - name: Wording
         run: |
           # No en or em dashes, and the project's wording rule for public files.
@@ -54,6 +100,90 @@ jobs:
           if git grep -nP '\x{2013}|\x{2014}' -- . ':!LICENSE'; then bad=1; fi
           if git grep -niE 'reverse[- ]?engineer' -- . ':!.github/workflows/ci.yml'; then bad=1; fi
           exit $bad
+
+  linux-arm64:
+    name: Float math against glibc, and the Linux reference build (aarch64)
+    # The Windows charsiu carries glibc's expf, sinf, cosf and powf (ARM
+    # optimized-routines, port/libm) so its greedy text cannot differ from the
+    # Linux run's by a last bit in a softmax. Checked here on every float
+    # input, with clang as the Windows build uses, against arm64 glibc.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true      # external/charsiu, for the Linux reference
+      - name: Every input
+        run: |
+          set -eux
+          command -v clang || { sudo apt-get update && sudo apt-get install -y clang; }
+          clang --version | head -1
+          ldd --version | head -1
+          make -C port libm-check CC=clang
+      - name: Linux reference binaries
+        run: |
+          set -eux
+          # charsiu_run and charsiu_matmul for the board's Armbian, static,
+          # from the same charsiu commit, with charsiu's own rocket device.c
+          make -C port linux-ref CC=gcc
+          file port/build/linux/*
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: charsiu-m4-linux-ref
+          path: port/build/linux/charsiu_*
+          if-no-files-found: error
+
+  charsiu:
+    name: charsiu for Windows on Arm (llvm-mingw)
+    needs: linux-arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true      # external/charsiu, compiled unchanged
+      - name: llvm-mingw
+        run: |
+          set -eux
+          f=llvm-mingw-${LLVM_MINGW_TAG}-ucrt-ubuntu-22.04-x86_64.tar.xz
+          curl -fsSL -o "$RUNNER_TEMP/$f" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_TAG}/$f"
+          echo "${LLVM_MINGW_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -C "$RUNNER_TEMP" -xf "$RUNNER_TEMP/$f"
+          echo "LLVM_MINGW=$RUNNER_TEMP/${f%.tar.xz}" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          set -eux
+          "$LLVM_MINGW/bin/aarch64-w64-mingw32-clang" --version | head -1
+          make -C port win LLVM_MINGW="$LLVM_MINGW"
+          for e in port/build/win/*.exe; do
+            "$LLVM_MINGW/bin/llvm-objdump" -f "$e" | grep -q 'file format coff-arm64' \
+              || { echo "$e is not ARM64"; exit 1; }
+            "$LLVM_MINGW/bin/llvm-objdump" -p "$e" | grep 'DLL Name'
+          done
+      - uses: actions/download-artifact@v4
+        with:
+          name: charsiu-m4-linux-ref
+          path: ${{ runner.temp }}/charsiu-m6/linux
+      - name: Stage
+        run: |
+          set -eux
+          out="$RUNNER_TEMP/charsiu-m6"
+          mkdir -p "$out"
+          chmod +x "$out"/linux/*
+          cp port/build/win/*.exe "$out/"
+          cp docs/M4.md docs/M6.md tools/m4/*.ps1 tools/m4/*.sh tools/m6/*.ps1 external/charsiu/tests/corpus/long.txt "$out/"
+          cp LICENSE "$out/LICENSE.txt"
+          cp port/libm/LICENSE.optimized-routines "$out/"
+          git -C external/charsiu rev-parse HEAD > "$out/charsiu-commit.txt"
+          git rev-parse HEAD > "$out/woa-rk3576-npu-commit.txt"
+          (cd "$out" && sha256sum ./*.exe linux/* > SHA256SUMS)
+          ls -la "$out"
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: charsiu-m6-arm64
+          path: ${{ runner.temp }}/charsiu-m6
+          if-no-files-found: error
 
   windows:
     name: WDK build, test-signed (ARM64)
@@ -114,7 +244,7 @@ jobs:
           $kits = 'C:\Program Files (x86)\Windows Kits\10'
           $st   = Join-Path $kits "bin\$env:WDK_VERSION\x86\signtool.exe"
           $i2c  = Join-Path $kits "bin\$env:WDK_VERSION\x86\inf2cat.exe"
-          $out  = Join-Path $env:RUNNER_TEMP 'rknpu-m3'
+          $out  = Join-Path $env:RUNNER_TEMP 'rknpu-m6'
           $drv  = Join-Path $out 'rknpu'
           New-Item -ItemType Directory -Force -Path $drv | Out-Null
 
@@ -158,7 +288,7 @@ jobs:
             if ($sig.Status -eq 'NotSigned') { throw "$($sig.Path) came out unsigned" }
           }
           Export-Certificate -Cert $cert -FilePath (Join-Path $out 'signer.cer') | Out-Null
-          Copy-Item docs\M2.md, docs\M3.md, tools\rknpu-reinstall.ps1 $out -Force
+          Copy-Item docs\M2.md, docs\M3.md, docs\M4.md, docs\M6.md, tools\rknpu-reinstall.ps1 $out -Force
           Get-ChildItem $out -Recurse -File | Select-Object FullName, Length |
             Format-Table -AutoSize | Out-String | Write-Host
           "STAGE=$out" >> $env:GITHUB_ENV
@@ -166,6 +296,6 @@ jobs:
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: rknpu-m3-arm64
+          name: rknpu-m6-arm64
           path: ${{ env.STAGE }}
           if-no-files-found: error

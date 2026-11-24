@@ -9,9 +9,15 @@
  *                               Linux)
  *   rknputest m3 [options]      M3: int8 matmuls on the NPU, compared bit for
  *                               bit with the CPU (see cmd_m3 and docs/M3.md)
+ *   rknputest m6 [options]      M6: the driver's IOMMU: scattered buffers far
+ *                               past M4's contiguous limit, the M3 ladder
+ *                               through the page table, per-job latency, both
+ *                               cores at once, and optionally a deliberate
+ *                               page fault (see cmd_m6 and docs/M6.md)
  *
  * Exit status: 0 ok, 1 usage or device error, 2 a check in `info` failed,
- * 3 an m3 result was wrong, 4 an m3 job did not complete.
+ * 3 an m3 result was wrong, 4 an m3 job did not complete, 5 an m6 check
+ * failed.
  *
  * Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
  * SPDX-License-Identifier: GPL-2.0-only
@@ -38,7 +44,9 @@ static const unsigned int expect_gsiv[RKNPU_NUM_CORES] = { 279, 280 };
 /* ------------------------------------------------------------ device */
 
 #ifdef _WIN32
-static HANDLE g_dev = INVALID_HANDLE_VALUE;
+/* per thread: `m6` drives both cores from two threads, each with its own
+ * handle (an M6 driver lets more than one be open) */
+static __declspec(thread) HANDLE g_dev = INVALID_HANDLE_VALUE;
 
 static int dev_open(void)
 {
@@ -65,9 +73,11 @@ static int dev_ioctl(DWORD code, const void *in, DWORD in_len, void *out, DWORD 
 }
 #elif defined(RKNPU_FAKE_DEVICE)
 #include "fakedev.h"
+#include <pthread.h>
 static int dev_open(void)
 {
     printf("(fakedev: no NPU, the matmul is done in C; this checks the tool, not the hardware)\n");
+    fake_open();
     return 0;
 }
 #else
@@ -161,11 +171,24 @@ static int cmd_info(void)
         if (in.m3_version)
             printf("  m3: jobs %u submitted, %u completed, %u timed out, %u resets\n",
                    c->jobs_submitted, c->jobs_completed, c->jobs_timed_out, c->resets);
+        if (in.m6_version)
+            printf("  m6: iommu enabled %u times, %u faults\n", c->mmu_enables, c->mmu_faults);
     }
     if (in.m3_version)
         printf("m3: version %u, %u buffers, %u KiB\n", in.m3_version, in.bo_count, in.bo_kib);
     else
         printf("m3: not in this driver (an M2 build)\n");
+    if (in.m4_version)
+        printf("m4: version %u, copy arena %u KiB a core, buffers up to %u KiB each and %u MiB in all\n",
+               in.m4_version, in.copy_arena_bytes / 1024, in.bo_max_kib, in.bo_max_total_kib / 1024);
+    else if (in.m3_version)
+        printf("m4: not in this driver (an M3 build)\n");
+    if (in.m6_version)
+        printf("m6: version %u, memory %s, buffers %s, NPU address space %u KiB in use, %u page-table pages\n",
+               in.m6_version, in.mem_mode == RKNPU_MEM_IOMMU ? "IOMMU (driver page table)" : "bypass (M4)",
+               in.bo_cached ? "cached (PREP_BO/FINI_BO)" : "write-combined", in.iova_kib, in.pt_pages);
+    else if (in.m4_version)
+        printf("m6: not in this driver (an M4 build)\n");
 
     if (in.flags & RKNPU_INFO_CLOCKS_VALID) {
         const rknpu_clock_info *k = &in.clocks;
@@ -187,8 +210,15 @@ static int cmd_info(void)
         const rknpu_core_info *c = &in.core[n];
         snprintf(line, sizeof(line), "core %u version register reads a value (not 0, not all ones)", n);
         check(c->pc_version != 0 && c->pc_version != 0xFFFFFFFFu, line);
-        snprintf(line, sizeof(line), "core %u IOMMUs have paging off", n);
-        check(!(c->mmu_status[0] & 1) && !(c->mmu_status[1] & 1), line);
+        if (in.m6_version && in.mem_mode == RKNPU_MEM_IOMMU) {
+            /* paging is on once a job has run, off before the first and after a reset */
+            snprintf(line, sizeof(line), "core %u IOMMUs agree (paging %s), no fault", n,
+                     (c->mmu_status[0] & 1) ? "on" : "off");
+            check((c->mmu_status[0] & 1) == (c->mmu_status[1] & 1) && c->mmu_faults == 0, line);
+        } else {
+            snprintf(line, sizeof(line), "core %u IOMMUs have paging off", n);
+            check(!(c->mmu_status[0] & 1) && !(c->mmu_status[1] & 1), line);
+        }
         snprintf(line, sizeof(line), "core %u interrupt is GSIV %u", n, expect_gsiv[n]);
         check(c->gsiv == expect_gsiv[n], line);
         if (c->jobs_submitted == 0) {
@@ -303,7 +333,7 @@ static double now_us(void)
 }
 
 struct m3_bo {
-    unsigned int handle, addr, size;
+    unsigned int handle, addr, size, flags;     /* flags: RKNPU_BO_* from CREATE_BO (M6) */
 };
 
 static int m3_call(unsigned int code, const void *in, unsigned int in_len, void *out, unsigned int out_len)
@@ -334,7 +364,20 @@ static int bo_create(unsigned int size, struct m3_bo *b)
     b->handle = c.handle;
     b->addr = c.dma_address;
     b->size = c.size;
+    b->flags = c.flags;
     return 0;
+}
+
+/* M6: PREP_BO / FINI_BO on a cached buffer; nothing to do on a write-combined one */
+static int bo_sync(unsigned int code, const struct m3_bo *b)
+{
+    rknpu_bo_sync s;
+
+    if (!(b->flags & RKNPU_BO_CACHED))
+        return 0;
+    memset(&s, 0, sizeof(s));
+    s.handle = b->handle;
+    return m3_call(code, &s, sizeof(s), NULL, 0);
 }
 
 static void bo_free(struct m3_bo *b)
@@ -409,9 +452,16 @@ static void m3_print_wait(const rknpu_wait_out *w)
 }
 
 /* 0 exact, 1 setup error, 3 wrong, 4 the job did not complete */
-static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned int n, unsigned int iters, int map)
+/*
+ * fault (M6, IOMMU mode, m = 1): the output buffer is one page and the DPU
+ * destination is 128 bytes before its end, so the NPU's write runs into the
+ * unmapped guard page after it. SUBMIT accepts it (the address is inside the
+ * buffer); the IOMMU must stop it: 0 if WAIT says RKNPU_JOB_MMU_FAULT.
+ */
+static int m3_run_ex(unsigned int core, unsigned int m, unsigned int k, unsigned int n, unsigned int iters, int map,
+                     int fault, double *rt_min_out, unsigned int win)
 {
-    const struct m3_shape *s = m3_find_shape(k, n);
+    const struct m3_shape *s = m3_find_shape_w(k, n, win);
     unsigned int rc_slot, in_slot, out_slot, r, i, it;
     size_t wsz, csz, in_total, out_total, rc_total;
     unsigned char *A = NULL, *B = NULL, *wbuf = NULL, *cbuf = NULL, *ibuf = NULL, *obuf = NULL;
@@ -431,12 +481,18 @@ static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned in
         fprintf(stderr, ")\n");
         return 1;
     }
-    printf("core %u: M=%u K=%u N=%u, %u task%s of %u entries\n", core, m, k, n, m, m > 1 ? "s" : "", s->count);
+    printf("core %u: M=%u K=%u N=%u, %u task%s of %u entries, CBUF window %u\n", core, m, k, n, m,
+           m > 1 ? "s" : "", s->count, win);
     fflush(stdout);
 
     rc_slot = M3_ALIGN((s->count + 1) * 8u, 256u);
     in_slot = (unsigned int)M3_ALIGN(m3_input_row_bytes(k) + 4096u, 4096u);
     out_slot = M3_ALIGN(n * 4u, 4096u) + 4096u;
+    if (fault) {
+        if (m != 1)
+            return 1;
+        out_slot = 4096u;
+    }
     wsz = m3_weight_bytes(k, n) + 4096u;
     csz = m3_coef_bytes(n) + 4096u;
     rc_total = (size_t)rc_slot * m;
@@ -474,7 +530,8 @@ static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned in
         fprintf(stderr, "m3: CREATE_BO failed\n");
         goto out;
     }
-    printf("  buffers (NPU = physical): regcmd 0x%08x input 0x%08x weights 0x%08x coefs 0x%08x output 0x%08x\n",
+    printf("  buffers (NPU addresses%s): regcmd 0x%08x input 0x%08x weights 0x%08x coefs 0x%08x output 0x%08x\n",
+           (bo[4].flags & RKNPU_BO_CACHED) ? ", cached" : "",
            bo[0].addr, bo[1].addr, bo[2].addr, bo[3].addr, bo[4].addr);
 
     memset(wbuf, 0, wsz);
@@ -488,7 +545,7 @@ static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned in
 
         base[M3_BUF_INPUT] = bo[1].addr + r * in_slot;
         base[M3_BUF_WEIGHT] = bo[2].addr;
-        base[M3_BUF_OUTPUT] = bo[4].addr + r * out_slot;
+        base[M3_BUF_OUTPUT] = fault ? bo[4].addr + 4096u - 128u : bo[4].addr + r * out_slot;
         base[M3_BUF_COEF] = bo[3].addr;
         m3_build_stream(s, base, rcbuf + (size_t)r * rc_slot / 8);
         if (!m3_stream_ok(rcbuf + (size_t)r * rc_slot / 8, s->count, bo, 5)) {
@@ -543,10 +600,27 @@ static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned in
             goto out;
         }
         rt = now_us() - t0;
+        if (fault) {
+            if (wo.result == RKNPU_JOB_MMU_FAULT) {
+                printf("  IOMMU FAULT as intended: NPU address 0x%08x (the guard page after 0x%08x + 4 KiB), "
+                       "status 0x%08x, core reset 0x%08x\n", wo.fault_addr, bo[4].addr, wo.fault_status,
+                       wo.reset_status);
+                ret = 0;
+            } else {
+                printf("  no fault: result %u (the NPU did not write past the buffer, or the IOMMU let it)\n",
+                       wo.result);
+                m3_print_wait(&wo);
+                ret = 3;
+            }
+            goto out;
+        }
         if (wo.result != RKNPU_JOB_DONE) {
             printf("  job %llu did not complete (%s)\n", so.seqno,
                    wo.result == RKNPU_JOB_TIMEOUT ? "timed out, the core was reset" :
-                   wo.result == RKNPU_JOB_DMA_ERROR ? "DMA error" : "unknown job");
+                   wo.result == RKNPU_JOB_DMA_ERROR ? "DMA error" :
+                   wo.result == RKNPU_JOB_MMU_FAULT ? "IOMMU fault, the core was reset" : "unknown job");
+            if (wo.result == RKNPU_JOB_MMU_FAULT)
+                printf("    fault at NPU address 0x%08x, status 0x%08x\n", wo.fault_addr, wo.fault_status);
             m3_print_wait(&wo);
             m3_crumb_hint();
             ret = 4;
@@ -563,6 +637,11 @@ static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned in
             mb.handle = bo[4].handle;
             if (m3_call(IOCTL_RKNPU_MAP_BO, &mb, sizeof(mb), &mb, sizeof(mb))) {
                 fprintf(stderr, "m3: MAP_BO failed\n");
+                goto out;
+            }
+            /* M6: a cached mapping shows what the NPU wrote only after PREP_BO */
+            if (bo_sync(IOCTL_RKNPU_PREP_BO, &bo[4])) {
+                fprintf(stderr, "m3: PREP_BO failed\n");
                 goto out;
             }
             memcpy(obuf, (const void *)(size_t)mb.user_va, out_total);
@@ -643,6 +722,8 @@ static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned in
                m, n, iters, iters > 1 ? "s" : "", hw_min, hw_sum / iters, (double)hw_min / m,
                rt_min, rt_sum / iters, cpu_us, hw_min ? macs / hw_min / 1e3 : 0.0);
     }
+    if (rt_min_out)
+        *rt_min_out = rt_sum / iters;
     ret = 0;
 out:
     for (i = 0; i < 5; i++)
@@ -650,6 +731,12 @@ out:
     free(A); free(B); free(wbuf); free(cbuf); free(ibuf); free(obuf); free(rcbuf); free(want);
     fflush(stdout);
     return ret;
+}
+
+static int m3_run(unsigned int core, unsigned int m, unsigned int k, unsigned int n, unsigned int iters, int map)
+{
+    /* core c uses CBUF window c, as charsiu's device d uses window d */
+    return m3_run_ex(core, m, k, n, iters, map, 0, NULL, core);
 }
 
 static int m3_reset(unsigned int core)
@@ -727,11 +814,14 @@ static int cmd_m3(int argc, char **argv)
         fprintf(stderr, "m3: interrupts not connected or NPU domains off; run `rknputest info`\n");
         return 1;
     }
-    for (c = 0; c < ncores; c++)
+    for (c = 0; c < ncores && !(info.m6_version && info.mem_mode == RKNPU_MEM_IOMMU); c++)
         if ((info.core[cores[c]].mmu_status[0] | info.core[cores[c]].mmu_status[1]) & 1) {
-            fprintf(stderr, "m3: core %u has IOMMU paging on; M3 needs it off\n", cores[c]);
+            fprintf(stderr, "m3: core %u has IOMMU paging on; bypass mode needs it off\n", cores[c]);
             return 1;
         }
+    if (info.m6_version)
+        printf("rknputest m3: memory %s, buffers %s\n", info.mem_mode == RKNPU_MEM_IOMMU ? "IOMMU" : "bypass",
+               info.bo_cached ? "cached" : "write-combined");
 
     for (c = 0; c < ncores; c++) {
         if (sm) {
@@ -767,6 +857,258 @@ done:
     return rc;
 }
 
+/* ---------------------------------------------------------------- m6 */
+
+/*
+ * rknputest m6 [--mb N] [--iters N] [--fault] [--no-parallel]
+ *
+ * M6 on the board, in the order a failure would want to be found:
+ *
+ *   1. scatter: CREATE_BO 4 MiB buffers until --mb MiB (default 768) are
+ *      held, each written at both ends and read back through the driver.
+ *      M4 failed its 4 MiB buffers from 80 to 370 MiB held ("no contiguous
+ *      memory below 4 GiB"); in IOMMU mode every one must succeed.
+ *   2. the M3 ladder on both cores, exact, through the page table.
+ *   3. latency: 1x64x64 (one task, the cheapest job) --iters times per core,
+ *      reported as SUBMIT to WAIT return: the per-job cost charsiu pays.
+ *   4. both cores at once: 16x1024x1024 on core 0 and core 1 from two
+ *      threads with a handle each, against the same work one core after the
+ *      other. A ratio near 2 says the driver no longer serialises the cores.
+ *      The cores share the CBUF, so core c's streams use CBUF window c
+ *      (charsiu's device d uses window d); with --collide both use window 0,
+ *      which corrupts both on the hardware unless the driver makes the two
+ *      jobs wait for each other (it must: exact, ratio near 1, CBUF waits).
+ *   5. --fault: a job whose output runs into a buffer's guard page must end
+ *      in RKNPU_JOB_MMU_FAULT, and the core must then run the 1x64x64 job
+ *      exactly again (the recovery path).
+ */
+
+struct m6_par {
+    unsigned int core, iters, win;
+    int rc;
+    double avg_us;
+};
+
+#ifdef _WIN32
+static DWORD WINAPI m6_thread(LPVOID p)
+{
+    struct m6_par *a = (struct m6_par *)p;
+
+    a->rc = 1;
+    if (dev_open())
+        return 0;
+    a->rc = m3_run_ex(a->core, 16, 1024, 1024, a->iters, 0, 0, &a->avg_us, a->win);
+    CloseHandle(g_dev);
+    g_dev = INVALID_HANDLE_VALUE;
+    return 0;
+}
+#elif defined(RKNPU_FAKE_DEVICE)
+/* the same two threads against fakedev, whose jobs overlap as the board's do */
+static void *m6_thread(void *p)
+{
+    struct m6_par *a = (struct m6_par *)p;
+
+    a->rc = 1;
+    if (dev_open())
+        return NULL;
+    a->rc = m3_run_ex(a->core, 16, 1024, 1024, a->iters, 0, 0, &a->avg_us, a->win);
+    return NULL;
+}
+#endif
+
+static int m6_scatter(unsigned int mb)
+{
+    unsigned int want = mb / 4, got = 0, i, fails = 0;
+    struct m3_bo *bos = (struct m3_bo *)calloc(want ? want : 1, sizeof(*bos));
+    rknpu_info info;
+    double t0, t;
+    int rc = 0;
+
+    if (!bos)
+        return 1;
+    printf("scatter: %u buffers of 4 MiB (%u MiB)\n", want, want * 4);
+    fflush(stdout);
+    t0 = now_us();
+    for (i = 0; i < want; i++) {
+        unsigned int head[4], tail[4], back[4], j;
+
+        if (bo_create(4u << 20, &bos[i])) {
+            printf("  buffer %u (%u MiB held) FAILED\n", i, i * 4);
+            rc = 5;
+            break;
+        }
+        got++;
+        for (j = 0; j < 4; j++) {
+            head[j] = 0x6D360000u + i * 16 + j;
+            tail[j] = ~head[j];
+        }
+        if (bo_io(IOCTL_RKNPU_WRITE_BO, &bos[i], 0, head, sizeof(head)) ||
+            bo_io(IOCTL_RKNPU_WRITE_BO, &bos[i], (4u << 20) - sizeof(tail), tail, sizeof(tail)) ||
+            bo_io(IOCTL_RKNPU_READ_BO, &bos[i], 0, back, sizeof(back)) || memcmp(back, head, sizeof(back)) ||
+            bo_io(IOCTL_RKNPU_READ_BO, &bos[i], (4u << 20) - sizeof(back), back, sizeof(back)) ||
+            memcmp(back, tail, sizeof(back)))
+            fails++;
+    }
+    t = now_us() - t0;
+    if (dev_info(&info) == 0)
+        printf("  %u of %u allocated in %.0f ms (%.0f us each), %u read-back mismatches; driver: %u buffers, "
+               "%u KiB, NPU address space %u KiB, %u page-table pages\n", got, want, t / 1e3,
+               got ? t / got : 0.0, fails, info.bo_count, info.bo_kib, info.iova_kib, info.pt_pages);
+    for (i = 0; i < got; i++) {
+        if (i && bos[i].addr < bos[i - 1].addr + bos[i - 1].size + 4096u && bos[i].addr > bos[i - 1].addr) {
+            printf("  buffers %u and %u have no guard page between them\n", i - 1, i);
+            rc = 5;
+        }
+    }
+    t0 = now_us();
+    for (i = 0; i < got; i++)
+        bo_free(&bos[i]);
+    printf("  freed in %.0f ms\n", (now_us() - t0) / 1e3);
+    free(bos);
+    if (fails)
+        rc = 5;
+    printf("  %s\n", rc ? "SCATTER FAILED" : "SCATTER OK");
+    return rc;
+}
+
+static int cmd_m6(int argc, char **argv)
+{
+    unsigned int mb = 768, iters = 200, c, i;
+    int fault = 0, parallel = 1, collide = 0, a, rc = 0, r;
+    double lat[RKNPU_NUM_CORES] = { 0, 0 };
+    rknpu_info info;
+
+    for (a = 0; a < argc; a++) {
+        if (!strcmp(argv[a], "--mb") && a + 1 < argc) {
+            if (parse_u32(argv[++a], &mb) || mb > 1536) {
+                fprintf(stderr, "m6: --mb 0..1536\n");
+                return 1;
+            }
+        } else if (!strcmp(argv[a], "--iters") && a + 1 < argc) {
+            if (parse_u32(argv[++a], &iters) || iters == 0 || iters > 10000) {
+                fprintf(stderr, "m6: --iters 1..10000\n");
+                return 1;
+            }
+        } else if (!strcmp(argv[a], "--fault")) {
+            fault = 1;
+        } else if (!strcmp(argv[a], "--no-parallel")) {
+            parallel = 0;
+        } else if (!strcmp(argv[a], "--collide")) {
+            collide = 1;
+        } else {
+            fprintf(stderr, "m6: unknown option %s\n", argv[a]);
+            return 1;
+        }
+    }
+    if (dev_open() || dev_info(&info))
+        return 1;
+    printf("rknputest m6: driver m6 version %u, memory %s, buffers %s\n", info.m6_version,
+           info.mem_mode == RKNPU_MEM_IOMMU ? "IOMMU" : "bypass", info.bo_cached ? "cached" : "write-combined");
+    if (!info.m6_version || info.mem_mode != RKNPU_MEM_IOMMU) {
+        fprintf(stderr, "m6: the driver is not in IOMMU mode (an M4 build, or Device Parameters\\M6Iommu = 0)\n");
+        return 1;
+    }
+
+    if (mb && (r = m6_scatter(mb)) != 0)
+        rc = r;
+
+    for (c = 0; c < RKNPU_NUM_CORES && !rc; c++)
+        for (i = 0; i < sizeof(m3_ladder) / sizeof(m3_ladder[0]) && !rc; i++)
+            rc = m3_run(c, m3_ladder[i].m, m3_ladder[i].k, m3_ladder[i].n, 3, i == 0);
+
+    for (c = 0; c < RKNPU_NUM_CORES && !rc; c++) {
+        printf("latency, core %u:\n", c);
+        rc = m3_run_ex(c, 1, 64, 64, iters, 0, 0, &lat[c], c);
+    }
+
+#if defined(_WIN32) || defined(RKNPU_FAKE_DEVICE)
+    if (!rc && parallel) {
+        struct m6_par p[RKNPU_NUM_CORES];
+#ifdef _WIN32
+        HANDLE th[RKNPU_NUM_CORES];
+#else
+        pthread_t th[RKNPU_NUM_CORES];
+#endif
+        unsigned int piters = iters / 4 ? iters / 4 : 1, started = 0;
+        double t0, seq, par;
+
+        printf("one core after the other, 16x1024x1024 x %u each:\n", piters);
+        t0 = now_us();
+        for (c = 0; c < RKNPU_NUM_CORES && !rc; c++)
+            rc = m3_run_ex(c, 16, 1024, 1024, piters, 0, 0, NULL, c);
+        seq = now_us() - t0;
+        printf("both cores at once, two handles, CBUF windows %s:\n", collide ? "0 and 0 (--collide)" : "0 and 1");
+        fflush(stdout);
+        t0 = now_us();
+        for (c = 0; c < RKNPU_NUM_CORES && !rc; c++) {
+            p[c].core = c;
+            p[c].iters = piters;
+            /* --collide: both on window 0, the arrangement that corrupts on
+             * the hardware; the driver must make the two wait for each other */
+            p[c].win = collide ? 0 : c;
+            p[c].rc = 1;
+#ifdef _WIN32
+            th[c] = CreateThread(NULL, 0, m6_thread, &p[c], 0, NULL);
+            if (!th[c])
+                rc = 1;
+#else
+            if (pthread_create(&th[c], NULL, m6_thread, &p[c]))
+                rc = 1;
+#endif
+            if (!rc)
+                started++;
+        }
+#ifdef _WIN32
+        if (started)
+            WaitForMultipleObjects(started, th, TRUE, INFINITE);
+        for (c = 0; c < started; c++)
+            CloseHandle(th[c]);
+#else
+        for (c = 0; c < started; c++)
+            pthread_join(th[c], NULL);
+#endif
+        for (c = 0; c < started; c++)
+            if (p[c].rc) {
+                printf("  core %u's thread FAILED (%d)\n", c, p[c].rc);
+                rc = 5;
+            }
+        par = now_us() - t0;
+        if (!rc)
+            printf("PARALLEL%s: sequential %.0f ms, both cores %.0f ms, %.2fx\n", collide ? " (same window)" : "",
+                   seq / 1e3, par / 1e3, par > 0 ? seq / par : 0.0);
+    }
+#else
+    (void)parallel;
+    (void)collide;
+#endif
+
+    if (!rc && fault) {
+        printf("fault: a job that writes into a guard page, on core 0\n");
+        rc = m3_run_ex(0, 1, 64, 64, 1, 0, 1, NULL, 0);
+        if (!rc) {
+            printf("  and the same core again, normally:\n");
+            rc = m3_run(0, 1, 64, 64, 3, 0);
+        }
+    }
+
+    if (dev_info(&info) == 0) {
+        for (c = 0; c < RKNPU_NUM_CORES; c++)
+            printf("core %u totals: %u submitted, %u completed, %u timed out, %u resets, %u IOMMU enables, "
+                   "%u faults, %u CBUF waits, isr %u unclaimed %u\n", c, info.core[c].jobs_submitted,
+                   info.core[c].jobs_completed, info.core[c].jobs_timed_out, info.core[c].resets,
+                   info.core[c].mmu_enables, info.core[c].mmu_faults, info.core[c].cbuf_waits,
+                   info.core[c].isr_count, info.core[c].isr_unclaimed);
+        if (!rc && !fault && (info.core[0].mmu_faults || info.core[1].mmu_faults)) {
+            printf("an IOMMU fault was counted with no --fault run\n");
+            rc = 5;
+        }
+    }
+    if (!rc)
+        printf("LATENCY: SUBMIT to WAIT return, 1x64x64, avg %.0f us core 0, %.0f us core 1\n", lat[0], lat[1]);
+    printf("%s\n", rc ? "RKNPU M6: FAILED" : "RKNPU M6: PASS");
+    return rc;
+}
+
 /* ---------------------------------------------------------- selftest */
 
 /*
@@ -780,8 +1122,8 @@ static int m3_selftest(void)
 {
     static unsigned long long e[4096];
     struct m3_bo bos[4] = {
-        { 1, 0x50000000u, 0x00100000u }, { 2, 0x50200000u, 0x00200000u },
-        { 3, 0x50400000u, 0x00010000u }, { 4, 0x50800000u, 0x00080000u },
+        { 1, 0x50000000u, 0x00100000u, 0 }, { 2, 0x50200000u, 0x00200000u, 0 },
+        { 3, 0x50400000u, 0x00010000u, 0 }, { 4, 0x50800000u, 0x00080000u, 0 },
     };
     unsigned int base[M3_NBUF], i, j;
     int bad = 0;
@@ -790,8 +1132,9 @@ static int m3_selftest(void)
     base[M3_BUF_WEIGHT] = bos[1].addr;
     base[M3_BUF_OUTPUT] = bos[2].addr + 0x2000;
     base[M3_BUF_COEF] = bos[3].addr;
-    for (i = 0; i < sizeof(m3_shapes) / sizeof(m3_shapes[0]); i++) {
-        const struct m3_shape *s = &m3_shapes[i];
+    for (i = 0; i < 2 * sizeof(m3_shapes) / sizeof(m3_shapes[0]); i++) {
+        const unsigned int ns = sizeof(m3_shapes) / sizeof(m3_shapes[0]);
+        const struct m3_shape *s = i < ns ? &m3_shapes[i] : &m3_shapes_w1[i - ns];
         unsigned int seen = 0;
 
         if (s->count + 1 > sizeof(e) / sizeof(e[0]) || s->count > RKNPU_MAX_REGCMD) {
@@ -823,7 +1166,21 @@ static int m3_selftest(void)
             bad = 1;
         }
     }
-    printf("m3: %u captured shapes checked\n", (unsigned)(sizeof(m3_shapes) / sizeof(m3_shapes[0])));
+    /* M6: the two windows' streams carry different CBUF keys, so the driver
+     * lets them run together, and the same window collides */
+    for (i = 0; i < sizeof(m3_shapes) / sizeof(m3_shapes[0]); i++) {
+        unsigned int k0 = rknpu_rc_cbuf_key(m3_shapes[i].entries, m3_shapes[i].count);
+        unsigned int k1 = rknpu_rc_cbuf_key(m3_shapes_w1[i].entries, m3_shapes_w1[i].count);
+
+        if (k0 == RKNPU_RC_CBUF_ANY || k1 == RKNPU_RC_CBUF_ANY || rknpu_rc_cbuf_collide(k0, k1) ||
+            !rknpu_rc_cbuf_collide(k0, k0)) {
+            printf("  m3 shape %ux%u: CBUF keys 0x%08x / 0x%08x do not separate the windows\n",
+                   m3_shapes[i].k, m3_shapes[i].n, k0, k1);
+            bad = 1;
+        }
+    }
+    printf("m3: %u captured shapes checked, in both CBUF windows\n",
+           (unsigned)(sizeof(m3_shapes) / sizeof(m3_shapes[0])));
     return bad;
 }
 
@@ -866,7 +1223,8 @@ static void usage(void)
             "usage: rknputest info\n"
             "       rknputest regs <offset> <count>\n"
             "       rknputest selftest\n"
-            "       rknputest m3 [--core 0|1|both] [--iters N] [--shape M K N] [--map] [--no-reset]\n");
+            "       rknputest m3 [--core 0|1|both] [--iters N] [--shape M K N] [--map] [--no-reset]\n"
+            "       rknputest m6 [--mb N] [--iters N] [--fault] [--no-parallel] [--collide]\n");
 }
 
 int main(int argc, char **argv)
@@ -881,6 +1239,8 @@ int main(int argc, char **argv)
         rc = cmd_selftest();
     else if (argc >= 2 && !strcmp(argv[1], "m3"))
         rc = cmd_m3(argc - 2, argv + 2);
+    else if (argc >= 2 && !strcmp(argv[1], "m6"))
+        rc = cmd_m6(argc - 2, argv + 2);
     else {
         usage();
         return 1;

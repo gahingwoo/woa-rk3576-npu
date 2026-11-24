@@ -73,12 +73,20 @@
   <ItemGroup>
     <ClCompile Include="driver.c" />
     <ClCompile Include="m3.c" />
+    <ClCompile Include="iommu.c" />
+  </ItemGroup>
+
+  <!-- M6: DC CVAC / DC CIVAC, which have no compiler intrinsic (armasm64, as
+       woa-rk3576's arm_smc_lib builds ArmSmc.asm) -->
+  <ItemGroup>
+    <MASM Include="cache.asm" />
   </ItemGroup>
 
   <ItemGroup>
     <ClInclude Include="rknpu.h" />
     <ClInclude Include="..\..\include\rknpu_ioctl.h" />
     <ClInclude Include="..\..\include\rknpu_regcmd.h" />
+    <ClInclude Include="..\..\include\rknpu_regcmd_allow.h" />
   </ItemGroup>
 
   <ItemGroup>

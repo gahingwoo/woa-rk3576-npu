@@ -68,11 +68,35 @@
 /* IOMMU (rockchip-iommu.c) */
 #define RK_MMU_DTE_ADDR         0x00u
 #define RK_MMU_STATUS           0x04u
+#define RK_MMU_COMMAND          0x08u   /* M6 */
 #define RK_MMU_PAGE_FAULT_ADDR  0x0Cu
+#define RK_MMU_ZAP_ONE_LINE     0x10u   /* M6 */
 #define RK_MMU_INT_RAWSTAT      0x14u
 #define RK_MMU_INT_CLEAR        0x18u
 #define RK_MMU_INT_MASK         0x1Cu
 #define RK_MMU_INT_STATUS       0x20u
+#define RK_MMU_AUTO_GATING      0x24u   /* M6 */
+
+/* M6: RK_MMU_STATUS bits, RK_MMU_COMMAND values, interrupt bits */
+#define RK_MMU_ST_PAGE_FAULT_ACTIVE 0x00000002u
+#define RK_MMU_ST_STALL_ACTIVE  0x00000004u
+#define RK_MMU_CMD_ENABLE_PAGING    0u
+#define RK_MMU_CMD_DISABLE_PAGING   1u
+#define RK_MMU_CMD_ENABLE_STALL     2u
+#define RK_MMU_CMD_DISABLE_STALL    3u
+#define RK_MMU_CMD_ZAP_CACHE        4u
+#define RK_MMU_CMD_PAGE_FAULT_DONE  5u
+#define RK_MMU_CMD_FORCE_RESET      6u
+#define RK_MMU_IRQ_PAGE_FAULT   0x01u
+#define RK_MMU_IRQ_BUS_ERROR    0x02u
+#define RK_MMU_IRQ_MASK         (RK_MMU_IRQ_PAGE_FAULT | RK_MMU_IRQ_BUS_ERROR)
+#define RK_MMU_DISABLE_FETCH_DTE_TIME_LIMIT 0x80000000u   /* AUTO_GATING bit 31 */
+
+/* M6: the NPU address space, in 64 KiB chunks (iommu.c) */
+#define NPU_IOVA_CHUNK_SHIFT    16u
+#define NPU_IOVA_CHUNKS         65536u      /* 4 GiB */
+#define NPU_IOVA_FIRST_CHUNK    16u         /* nothing below 1 MiB: no buffer at IOVA 0 */
+#define NPU_PT_ENTRIES          1024u
 
 /* PMU and CRU, one page each, read only (see rknpu_clock_info). */
 #define PMU_PAGE_PA             0x27380000ull
@@ -88,18 +112,50 @@
 
 #define RKNPU_POOL_TAG          'UPNR'
 
-/* One buffer (M3): contiguous, below 4 GiB, write-combined. */
+/*
+ * One buffer. M3/M4 (bypass): contiguous, below 4 GiB, Dma = physical. M6
+ * (IOMMU): pages from MmAllocatePagesForMdlEx, anywhere, Dma = the IOVA the
+ * driver mapped them at. Cached or write-combined (Cached), the same in
+ * every mapping of it.
+ */
 typedef struct _NPU_BO {
     LIST_ENTRY      Link;
+    LIST_ENTRY      HashLink;       /* M6: Ctx->BoHash[Handle % RKNPU_BO_HASH] */
     ULONG           Handle;
+    ULONG           Dma;            /* the NPU's address of byte 0 */
     PVOID           Kva;
-    PHYSICAL_ADDRESS Pa;
+    PHYSICAL_ADDRESS Pa;            /* bypass mode only */
     SIZE_T          Size;
-    PMDL            Mdl;            /* built on the first MAP_BO */
+    PMDL            Mdl;            /* bypass: built on the first MAP_BO; IOMMU: the pages */
+    BOOLEAN         PagesMdl;       /* M6: Mdl came from MmAllocatePagesForMdlEx */
+    BOOLEAN         Cached;         /* M6: RKNPU_BO_CACHED */
+    BOOLEAN         IovaMapped;     /* M6: in the page table (iommu.c) */
     PVOID           UserVa;         /* the caller's mapping, or NULL */
     PEPROCESS       Process;        /* referenced while UserVa is set */
     WDFFILEOBJECT   Owner;
 } NPU_BO, *PNPU_BO;
+
+#define RKNPU_BO_HASH           256u
+
+/*
+ * M6: the driver's NPU address space (iommu.c). One page directory, its page
+ * tables allocated as needed, all write-combined so the IOMMU (not coherent)
+ * sees every write after a barrier; every one of the four IOMMU instances
+ * points at it. BoLock protects all of it.
+ */
+typedef struct _NPU_MMU {
+    BOOLEAN         On;             /* IOMMU mode (Device Parameters\M6Iommu, default 1) */
+    PULONG          Dt;             /* 1024 directory entries */
+    PHYSICAL_ADDRESS DtPa;
+    PULONG          Pt[NPU_PT_ENTRIES];
+    PHYSICAL_ADDRESS PtPa[NPU_PT_ENTRIES];
+    ULONG           PtPages;        /* the directory included */
+    RTL_BITMAP      Chunks;         /* NPU_IOVA_CHUNKS bits, one per 64 KiB */
+    PULONG          ChunkBits;
+    PNPU_BO        *ChunkOwner;     /* NPU_IOVA_CHUNKS entries: the buffer, or NULL */
+    ULONG           ChunksUsed;
+    ULONG           Hint;
+} NPU_MMU;
 
 /*
  * The job on a core (M3). Written at PASSIVE_LEVEL under the interrupt lock
@@ -110,6 +166,9 @@ typedef struct _CORE_JOB {
     BOOLEAN         InFlight;       /* the hardware owns the job */
     BOOLEAN         CompletePending;/* the ISR finished it; the DPC has not run */
     BOOLEAN         NoCrumbs;       /* RKNPU_SUBMIT_NO_CRUMBS */
+    BOOLEAN         Copied;         /* M4: RKNPU_SUBMIT_COPY, the streams are in the arena */
+    BOOLEAN         FaultReset;     /* M6: the core was reset after this job's IOMMU fault */
+    ULONG           CbufKey;        /* M6: rknpu_rc_cbuf_key() of its streams (the shared CBUF) */
     ULONG           Result;         /* RKNPU_JOB_* once finished */
     ULONGLONG       Seq;            /* 0: never used */
     WDFFILEOBJECT   Owner;
@@ -119,6 +178,8 @@ typedef struct _CORE_JOB {
     ULONG           IsrCount;
     ULONG           RawStatus;
     ULONG           TaskStatus;
+    ULONG           FaultAddr;      /* M6: RKNPU_JOB_MMU_FAULT */
+    ULONG           FaultStatus;
     LARGE_INTEGER   T0;             /* QPC at the first OPERATION_ENABLE */
     LARGE_INTEGER   T1;             /* QPC at the last interrupt */
     rknpu_task      Tasks[RKNPU_MAX_TASKS];
@@ -142,7 +203,35 @@ typedef struct _CORE_STATE {
     volatile LONG   JobsCompleted;
     volatile LONG   JobsTimedOut;
     volatile LONG   Resets;
+
+    /* M4: the copy arena, allocated by the first RKNPU_SUBMIT_COPY on the core */
+    PUCHAR          Arena;
+    PHYSICAL_ADDRESS ArenaPa;
+    ULONG           ArenaDma;       /* M6: its NPU address (= ArenaPa in bypass mode) */
+    PMDL            ArenaMdl;       /* M6, IOMMU mode: its pages */
+
+    /* M6 */
+    volatile LONG   MmuFaults;
+    volatile LONG   MmuEnables;
+    volatile LONG   CbufWaits;      /* SUBMITs that waited for the other core's same-window job */
 } CORE_STATE;
+
+/* M4: a finished job, kept so a WAIT that comes after another handle's job
+ * took the core still gets its answer. */
+typedef struct _JOB_RECORD {
+    ULONGLONG       Seq;            /* 0: empty */
+    WDFFILEOBJECT   Owner;
+    ULONG           Core;
+    ULONG           Result;
+    ULONG           RawStatus;
+    ULONG           TaskStatus;
+    ULONG           TasksDone;
+    ULONG           TaskCount;
+    ULONG           IsrCount;
+    ULONG           HwUs;
+    ULONG           FaultAddr;      /* M6 */
+    ULONG           FaultStatus;
+} JOB_RECORD;
 
 typedef struct _DEVICE_CONTEXT {
     WDFDEVICE       Device;
@@ -166,6 +255,18 @@ typedef struct _DEVICE_CONTEXT {
     LONG            CrumbCounts[16];
     WDFKEY          CrumbKey;       /* Device Parameters; NULL if it would not open */
     LARGE_INTEGER   QpcFreq;
+
+    /* M4 */
+    JOB_RECORD      History[RKNPU_JOB_HISTORY];     /* JobLock */
+    ULONG           HistoryAt;
+    BOOLEAN         AllowUnlisted;  /* Device Parameters\M4AllowUnlisted, read at start */
+    volatile LONG   UnlistedLogged;
+
+    /* M6 */
+    NPU_MMU         Mmu;
+    BOOLEAN         CachedBos;      /* Device Parameters\M6CachedBos */
+    SIZE_T          BoMaxTotal;     /* RKNPU_BO_MAX_TOTAL, or _IOMMU */
+    LIST_ENTRY      BoHash[RKNPU_BO_HASH];
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetContext)
@@ -205,5 +306,21 @@ BOOLEAN NpuM3DeviceControl(_In_ PDEVICE_CONTEXT Ctx, _In_ WDFREQUEST Request, _I
                            _Out_ NTSTATUS *Status, _Out_ ULONG_PTR *Info);
 VOID NpuM3FileCleanup(_In_ PDEVICE_CONTEXT Ctx, _In_ WDFFILEOBJECT FileObject);
 VOID NpuM3FreeAll(_In_ PDEVICE_CONTEXT Ctx);
+VOID NpuM3JobFaultLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N, _In_ ULONG Iova, _In_ ULONG Status);
+
+/* iommu.c (M6). BoLock held for everything but Init, Free and the ISR part. */
+NTSTATUS NpuMmuInit(_In_ PDEVICE_CONTEXT Ctx);
+VOID NpuMmuFree(_In_ PDEVICE_CONTEXT Ctx);
+NTSTATUS NpuMmuMapLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ PMDL Mdl, _In_ SIZE_T Size, _In_ BOOLEAN Writable,
+                         _In_opt_ PNPU_BO Bo, _Out_ ULONG *Iova);
+VOID NpuMmuUnmapLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG Iova, _In_ SIZE_T Size);
+PNPU_BO NpuMmuOwnerLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG Iova);
+NTSTATUS NpuMmuEnsureLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N);
+VOID NpuMmuDisableLocked(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N);
+BOOLEAN NpuMmuIsr(_In_ PDEVICE_CONTEXT Ctx, _In_ ULONG N);
+
+/* cache.asm (M6): data cache maintenance by VA to the point of coherency, then DSB SY */
+VOID RknpuDcClean(_In_ PVOID Va, _In_ SIZE_T Length);
+VOID RknpuDcCleanInvalidate(_In_ PVOID Va, _In_ SIZE_T Length);
 
 #endif

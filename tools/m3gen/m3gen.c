@@ -3,8 +3,15 @@
  *         rknputest's packing against charsiu's
  *
  *   m3gen header    print tools/rknputest/m3_streams.h
+ *   m3gen regs      print include/rknpu_regcmd_allow.h (M4): every register
+ *                   charsiu_emit_job() writes, over the grid of job shapes
+ *                   and types below
  *   m3gen check     compare tools/rknputest/m3_gemm.h with charsiu, byte for
- *                   byte, and check the streams against include/rknpu_regcmd.h
+ *                   byte, and check the streams against include/rknpu_regcmd.h;
+ *                   then, over the grid, that every entry is on the list,
+ *                   that the entries that move with a buffer are exactly the
+ *                   address registers rknpu_regcmd.h names, and that every
+ *                   stream passes rknpu_rc_check_stream() as SUBMIT runs it
  *
  * Built on Linux with gcc against external/charsiu src/job.c and
  * src/regcmd.c (see Makefile). Run with no CHARSIU_* variable in the
@@ -51,10 +58,14 @@ static const unsigned int gen_shapes[][2] = {
 
 #define MAXREG 4096
 
+/* M6: which CBUF window the streams use; m3_streams.h carries both, since the
+ * two cores share the CBUF and two jobs in flight together need two windows */
+static unsigned int g_win;
+
 static void job_init(struct charsiu_job *job, unsigned int k, unsigned int n, const unsigned int base[M3_NBUF])
 {
     memset(job, 0, sizeof(*job));
-    job->cbuf_window = (unsigned)charsiu_cbuf_window();
+    job->cbuf_window = g_win;
     job->mm.m = 1;
     job->mm.k = k;
     job->mm.n = n;
@@ -180,7 +191,7 @@ static int check_rules(unsigned int k, unsigned int n, const struct capture *c)
 #ifndef M3_NO_STREAMS
 static int check_stream(unsigned int k, unsigned int n)
 {
-    const struct m3_shape *s = m3_find_shape(k, n);
+    const struct m3_shape *s = m3_find_shape_w(k, n, g_win);
     static uint64_t want[MAXREG];
     static unsigned long long got[MAXREG];
     unsigned int t, base[M3_NBUF], b;
@@ -272,6 +283,230 @@ static int check_pack(unsigned int k, unsigned int n)
     return bad;
 }
 
+/* ---- M4: the register list, over every kind of job charsiu emits ------- */
+
+/*
+ * The grid. Weight and activation types in every combination the emitter
+ * accepts (int8/int8 is the M3 matmul, int4/fp16 the w4a16 default, fp16/fp16
+ * the attention), rows 1 (decode) to 80 (a prefill chunk), and both CBUF
+ * windows, which the two devices take. A Llama-3.2-1B run through the host
+ * model of the driver (port/test) writes 147 registers; this grid must write
+ * the same 147, and CI says so if charsiu ever writes one more.
+ */
+static const enum charsiu_dtype grid_w[] = { CHARSIU_INT8, CHARSIU_INT4, CHARSIU_FP16 };
+static const enum charsiu_dtype grid_a[] = { CHARSIU_INT8, CHARSIU_FP16 };
+static const unsigned int grid_m[] = { 1, 2, 16, 80 };
+static const unsigned int grid_kn[][2] = {
+    { 64, 64 }, { 2048, 512 }, { 1024, 2048 }, { 1024, 8192 }, { 8192, 2048 }, { 64, 1024 },
+};
+
+#define MAXKEYS 1024
+
+struct gridjob {
+    struct charsiu_job job;
+    unsigned int base[M3_NBUF];
+};
+
+static void grid_set(struct charsiu_job *job, const unsigned int base[M3_NBUF])
+{
+    job->input_addr = base[M3_BUF_INPUT];
+    job->weight_addr = base[M3_BUF_WEIGHT];
+    job->output_addr = base[M3_BUF_OUTPUT];
+    job->coef_addr = base[M3_BUF_COEF];
+}
+
+/* the next job of the grid into *g; 0 when done */
+static int grid_next(unsigned int *at, struct charsiu_job *job)
+{
+    unsigned int nw = sizeof(grid_w) / sizeof(grid_w[0]), na = sizeof(grid_a) / sizeof(grid_a[0]);
+    unsigned int nm = sizeof(grid_m) / sizeof(grid_m[0]), nkn = sizeof(grid_kn) / sizeof(grid_kn[0]);
+    unsigned int i = *at, w, a, m, kn, win, acc;
+
+    if (i >= nw * na * nm * nkn * 2 * 2)
+        return 0;
+    (*at)++;
+    acc = i % 2; i /= 2;
+    win = i % 2; i /= 2;
+    kn = i % nkn; i /= nkn;
+    m = i % nm; i /= nm;
+    a = i % na; i /= na;
+    w = i % nw;
+    memset(job, 0, sizeof(*job));
+    job->cbuf_window = win;
+    job->mm.m = grid_m[m];
+    job->mm.k = grid_kn[kn][0];
+    job->mm.n = grid_kn[kn][1];
+    job->mm.wdtype = grid_w[w];
+    job->mm.adtype = grid_a[a];
+    job->input_zero_point = grid_a[a] == CHARSIU_INT8 ? 128 : 0;
+    job->weight_zero_point = grid_w[w] == CHARSIU_FP16 ? 0 : 128;
+    job->output_zero_point = 0;
+    job->input_scale = 1.0f;
+    job->weight_scale = 1.0f;
+    job->output_scale = 1.0f;
+    job->acc_out = (int)acc;
+    return 1;
+}
+
+static int key_cmp(const void *a, const void *b)
+{
+    unsigned int x = *(const unsigned int *)a, y = *(const unsigned int *)b;
+
+    return x < y ? -1 : x > y;
+}
+
+static void key_add(unsigned int *keys, unsigned int *n, unsigned int key)
+{
+    unsigned int i;
+
+    for (i = 0; i < *n; i++)
+        if (keys[i] == key)
+            return;
+    if (*n < MAXKEYS)
+        keys[(*n)++] = key;
+}
+
+static const unsigned int grid_base0[M3_NBUF] = { 0x41000000u, 0x52000000u, 0x63000000u, 0x74000000u };
+
+/* every (block, register) the grid writes, sorted; the count, or 0 */
+static unsigned int grid_keys(unsigned int *keys, unsigned int *jobs)
+{
+    static uint64_t e[MAXREG];
+    struct charsiu_job job;
+    unsigned int at = 0, n = 0, i;
+    size_t cnt;
+
+    *jobs = 0;
+    while (grid_next(&at, &job)) {
+        grid_set(&job, grid_base0);
+        cnt = charsiu_emit_job(&job, e, MAXREG);
+        if (cnt == 0 || cnt >= MAXREG)
+            continue;           /* a combination the emitter does not make */
+        (*jobs)++;
+        for (i = 0; i < cnt; i++)
+            if (e[i])
+                key_add(keys, &n, RKNPU_RC_TARGET(e[i]) << 16 | RKNPU_RC_REG(e[i]));
+    }
+    qsort(keys, n, sizeof(keys[0]), key_cmp);
+    return n;
+}
+
+static int cmd_regs(void)
+{
+    static unsigned int keys[MAXKEYS];
+    unsigned int n, jobs, i;
+
+    n = grid_keys(keys, &jobs);
+    if (!n)
+        return 1;
+    printf("/*\n * rknpu_regcmd_allow.h - GENERATED by tools/m3gen (`m3gen regs`); do not edit.\n *\n"
+           " * Every (block, register) charsiu_emit_job() writes, from charsiu %s\n"
+           " * (external/charsiu, GPL-2.0), over the %u jobs of m3gen's grid. Each\n"
+           " * entry is the block (RKNPU_RC_TARGET) << 16 | the register offset.\n"
+           " * SUBMIT refuses any other register (rknpu_regcmd.h). Sorted.\n"
+           " * SPDX-License-Identifier: GPL-2.0-only\n */\n\n", CHARSIU_COMMIT, jobs);
+    printf("#ifndef RKNPU_REGCMD_ALLOW_H\n#define RKNPU_REGCMD_ALLOW_H\n\n");
+    printf("#define RKNPU_RC_NALLOWED %u\n\n", n);
+    printf("static const unsigned int rknpu_rc_allowed[RKNPU_RC_NALLOWED] = {");
+    for (i = 0; i < n; i++)
+        printf("%s0x%08xu,", i % 6 ? " " : "\n    ", keys[i]);
+    printf("\n};\n\n#endif /* RKNPU_REGCMD_ALLOW_H */\n");
+    return 0;
+}
+
+#ifndef M3_NO_STREAMS
+static const unsigned int *grid_ok_base;
+
+static int grid_in_bo(void *ctx, unsigned int addr)
+{
+    unsigned int b;
+
+    (void)ctx;
+    for (b = 0; b < M3_NBUF; b++)
+        if (addr >= grid_ok_base[b] && addr < grid_ok_base[b] + 0x00800000u)
+            return 1;
+    return 0;
+}
+
+/*
+ * Over the grid: the list in the header is the list the grid writes; each
+ * buffer moved alone moves exactly the address registers; every stream
+ * passes the check SUBMIT runs, and fails it once its output is moved past
+ * every buffer.
+ */
+static int check_grid(void)
+{
+    static unsigned int keys[MAXKEYS];
+    static uint64_t e0[MAXREG], e1[MAXREG];
+    struct charsiu_job job;
+    unsigned int n, jobs, i, at = 0, b, bad = 0, why;
+    size_t cnt;
+
+    n = grid_keys(keys, &jobs);
+    if (n != RKNPU_RC_NALLOWED || memcmp(keys, rknpu_rc_allowed, n * sizeof(keys[0]))) {
+        fprintf(stderr, "grid: charsiu writes %u registers, rknpu_regcmd_allow.h lists %u "
+                "(run m3gen regs)\n", n, RKNPU_RC_NALLOWED);
+        return 1;
+    }
+    while (grid_next(&at, &job)) {
+        grid_set(&job, grid_base0);
+        cnt = charsiu_emit_job(&job, e0, MAXREG);
+        if (cnt == 0 || cnt >= MAXREG)
+            continue;
+        grid_ok_base = grid_base0;
+        if ((why = (unsigned)rknpu_rc_check_stream((const unsigned long long *)e0, (unsigned)cnt, 0,
+                                                   grid_in_bo, NULL, &i)) != RKNPU_RC_OK) {
+            fprintf(stderr, "grid: m%u k%u n%u w%d a%d: entry %u (0x%016llx) refused: %s\n",
+                    job.mm.m, job.mm.k, job.mm.n, job.mm.wdtype, job.mm.adtype, i,
+                    (unsigned long long)e0[i], rknpu_rc_why((int)why));
+            bad = 1;
+            continue;
+        }
+        for (b = 0; b < M3_NBUF; b++) {
+            unsigned int base1[M3_NBUF];
+            const unsigned int delta = 0x00350000u + b * 0x1000u;
+
+            memcpy(base1, grid_base0, sizeof(base1));
+            base1[b] += delta;
+            grid_set(&job, base1);
+            if (charsiu_emit_job(&job, e1, MAXREG) != cnt) {
+                fprintf(stderr, "grid: the entry count depends on an address\n");
+                return 1;
+            }
+            for (i = 0; i < cnt; i++) {
+                int moved = e1[i] != e0[i];
+                unsigned int reg = RKNPU_RC_REG(e0[i]);
+
+                if (moved && (RKNPU_RC_VALUE(e1[i]) - RKNPU_RC_VALUE(e0[i]) != delta ||
+                              !rknpu_rc_is_addr_reg(reg))) {
+                    fprintf(stderr, "grid: m%u k%u n%u w%d a%d: entry %u (reg 0x%04x) moves with buffer %u "
+                            "but is not an address register in rknpu_regcmd.h\n", job.mm.m, job.mm.k,
+                            job.mm.n, job.mm.wdtype, job.mm.adtype, i, reg, b);
+                    bad = 1;
+                }
+            }
+            /* the output moved past every buffer must be refused */
+            if (b == M3_BUF_OUTPUT) {
+                unsigned int far[M3_NBUF];
+
+                memcpy(far, grid_base0, sizeof(far));
+                far[M3_BUF_OUTPUT] = 0xF0000000u;
+                grid_set(&job, far);
+                charsiu_emit_job(&job, e1, MAXREG);
+                if (rknpu_rc_check_stream((const unsigned long long *)e1, (unsigned)cnt, 0,
+                                          grid_in_bo, NULL, &i) != RKNPU_RC_BAD_ADDR) {
+                    fprintf(stderr, "grid: an output outside every buffer was not refused\n");
+                    bad = 1;
+                }
+            }
+        }
+    }
+    printf("grid: %u jobs, %u registers, all on the list, the address registers exactly %s\n",
+           jobs, n, bad ? "NOT" : "rknpu_regcmd.h's");
+    return (int)bad;
+}
+#endif
+
 static int env_clean(void)
 {
     char **e;
@@ -295,27 +530,39 @@ static int cmd_header(void)
            " * relocation; m3_build_stream() adds the buffer's NPU address.\n"
            " * SPDX-License-Identifier: GPL-2.0-only\n */\n\n", CHARSIU_COMMIT);
     printf("#ifndef M3_STREAMS_H\n#define M3_STREAMS_H\n\n");
-    for (s = 0; s < NGEN; s++) {
-        unsigned int k = gen_shapes[s][0], n = gen_shapes[s][1];
+    for (g_win = 0; g_win < 2; g_win++) {
+        const char *w = g_win ? "_w1" : "";
 
-        if (capture(k, n, &c) || check_rules(k, n, &c))
-            return 1;
-        printf("static const unsigned long long m3_k%u_n%u_entries[%u] = {", k, n, c.count);
-        for (i = 0; i < c.count; i++)
-            printf("%s0x%016llxull,", i % 3 ? " " : "\n    ", (unsigned long long)c.e[i]);
-        printf("\n};\n\nstatic const struct m3_reloc m3_k%u_n%u_rel[%u] = {\n", k, n, c.nrel);
-        for (i = 0; i < c.nrel; i++)
-            printf("    { %u, %u, 0x%x },\n", c.rel[i].index, c.rel[i].buf, c.rel[i].offset);
+        for (s = 0; s < NGEN; s++) {
+            unsigned int k = gen_shapes[s][0], n = gen_shapes[s][1];
+
+            if (capture(k, n, &c) || check_rules(k, n, &c))
+                return 1;
+            printf("static const unsigned long long m3_k%u_n%u%s_entries[%u] = {", k, n, w, c.count);
+            for (i = 0; i < c.count; i++)
+                printf("%s0x%016llxull,", i % 3 ? " " : "\n    ", (unsigned long long)c.e[i]);
+            printf("\n};\n\nstatic const struct m3_reloc m3_k%u_n%u%s_rel[%u] = {\n", k, n, w, c.nrel);
+            for (i = 0; i < c.nrel; i++)
+                printf("    { %u, %u, 0x%x },\n", c.rel[i].index, c.rel[i].buf, c.rel[i].offset);
+            printf("};\n\n");
+        }
+    }
+    for (g_win = 0; g_win < 2; g_win++) {
+        const char *w = g_win ? "_w1" : "";
+
+        printf("/* CBUF window %u%s */\n", g_win, g_win ? " (charsiu's second device)" : "");
+        printf("static const struct m3_shape m3_shapes%s[%u] = {\n", w, (unsigned)NGEN);
+        for (s = 0; s < NGEN; s++) {
+            unsigned int k = gen_shapes[s][0], n = gen_shapes[s][1];
+
+            capture(k, n, &c);
+            printf("    { %u, %u, %u, m3_k%u_n%u%s_entries, %u, m3_k%u_n%u%s_rel },\n", k, n, c.count, k, n, w,
+                   c.nrel, k, n, w);
+        }
         printf("};\n\n");
     }
-    printf("static const struct m3_shape m3_shapes[%u] = {\n", (unsigned)NGEN);
-    for (s = 0; s < NGEN; s++) {
-        unsigned int k = gen_shapes[s][0], n = gen_shapes[s][1];
-
-        capture(k, n, &c);
-        printf("    { %u, %u, %u, m3_k%u_n%u_entries, %u, m3_k%u_n%u_rel },\n", k, n, c.count, k, n, c.nrel, k, n);
-    }
-    printf("};\n\n#endif /* M3_STREAMS_H */\n");
+    g_win = 0;
+    printf("#endif /* M3_STREAMS_H */\n");
     return 0;
 }
 
@@ -335,12 +582,17 @@ static int cmd_check(void)
         if (capture(gen_shapes[s][0], gen_shapes[s][1], &c) || check_rules(gen_shapes[s][0], gen_shapes[s][1], &c))
             bad = 1;
 #ifndef M3_NO_STREAMS
-        bad |= check_stream(gen_shapes[s][0], gen_shapes[s][1]);
+        for (g_win = 0; g_win < 2; g_win++)
+            bad |= check_stream(gen_shapes[s][0], gen_shapes[s][1]);
+        g_win = 0;
 #endif
         bad |= check_pack(gen_shapes[s][0], gen_shapes[s][1]);
     }
     for (s = 0; s < sizeof(extra) / sizeof(extra[0]); s++)
         bad |= check_pack(extra[s][0], extra[s][1]);
+#ifndef M3_NO_STREAMS
+    bad |= check_grid();
+#endif
     printf("%s\n", bad ? "M3GEN CHECK FAILED" : "M3GEN CHECK OK");
     return bad;
 }
@@ -351,8 +603,10 @@ int main(int argc, char **argv)
         return 2;
     if (argc == 2 && !strcmp(argv[1], "header"))
         return cmd_header();
+    if (argc == 2 && !strcmp(argv[1], "regs"))
+        return cmd_regs();
     if (argc == 2 && !strcmp(argv[1], "check"))
         return cmd_check();
-    fprintf(stderr, "usage: m3gen header | check\n");
+    fprintf(stderr, "usage: m3gen header | regs | check\n");
     return 2;
 }
