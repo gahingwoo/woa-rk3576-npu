@@ -20,8 +20,8 @@
  *     caller; RKNPU_FAKE_M6=1 is the M6 driver, one IOCTL each;
  *   - M7, CHARSIU_RKNPU_ASYNC=1: the same work through the SUBMIT threads,
  *     and a refused stream fails the next PREP and every later SUBMIT
- *     (the busy-core and refusal steps above need a synchronous SUBMIT
- *     and are skipped).
+ *     (the busy-core, refusal and shared-CBUF steps above need a
+ *     synchronous SUBMIT and are skipped).
  *
  * Nothing computes; see xport_fake.c.
  *
@@ -196,8 +196,9 @@ int main(void)
 	}
 
 	/* M6, the shared CBUF: device 0 on window 0 and device 1 on window 1
-	 * overlap without a wait; the same window waits */
-	{
+	 * overlap without a wait; the same window waits (counted at SUBMIT,
+	 * so not with CHARSIU_RKNPU_ASYNC) */
+	if (!async) {
 		struct mm w1;
 		unsigned long long ov0, wt0, ov1, wt1;
 
