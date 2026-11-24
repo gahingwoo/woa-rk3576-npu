@@ -1,3 +1,6 @@
+> Historical page, 2026-11-22: docs/FEASIBILITY.md, the feasibility study written before any of this ran, unchanged. Its status lines
+> may not match main; the current page is [dev/architecture.md](../dev/architecture.md).
+
 # RK3576 NPU on Windows on Arm: feasibility study
 
 Written 2026-11-22, desk only. No board was touched, nothing was built, and

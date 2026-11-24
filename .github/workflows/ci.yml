@@ -189,7 +189,7 @@ jobs:
           mkdir -p "$out"
           chmod +x "$out"/linux/*
           cp port/build/win/*.exe "$out/"
-          cp docs/M4.md docs/M6.md docs/M7.md tools/m4/*.ps1 tools/m4/*.sh tools/m6/*.ps1 external/charsiu/tests/corpus/long.txt "$out/"
+          cp docs/use.md docs/dev/testing.md docs/dev/performance.md tools/m4/*.ps1 tools/m4/*.sh tools/m6/*.ps1 external/charsiu/tests/corpus/long.txt "$out/"
           cp tools/m7/m7-bench.ps1 "$out/"
           cp LICENSE "$out/LICENSE.txt"
           cp port/libm/LICENSE.optimized-routines "$out/"
@@ -308,7 +308,7 @@ jobs:
             if ($sig.Status -eq 'NotSigned') { throw "$($sig.Path) came out unsigned" }
           }
           Export-Certificate -Cert $cert -FilePath (Join-Path $out 'signer.cer') | Out-Null
-          Copy-Item docs\M2.md, docs\M3.md, docs\M4.md, docs\M6.md, docs\M7.md, docs\PERFCOUNTERS.md, tools\rknpu-reinstall.ps1, tools\rknpu-perfcounters.ps1 $out -Force
+          Copy-Item docs\use.md, docs\dev\testing.md, docs\dev\perfcounters.md, tools\rknpu-reinstall.ps1, tools\rknpu-perfcounters.ps1 $out -Force
           # the counter names went into rknpu.sys, and the package's version
           $sys = [System.IO.File]::ReadAllBytes((Join-Path $drv 'rknpu.sys'))
           $txt = [System.Text.Encoding]::Unicode.GetString($sys)

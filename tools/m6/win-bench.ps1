@@ -3,7 +3,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File win-bench.ps1 -Model R:\npu\Llama-3.2-1B-Instruct-Q8_0.gguf [-Out R:\npu\m6-windows] [-Linux R:\npu\m4-linux] [-NoFault] [-Quick] [-IdleDisable]
 #
 # As administrator, from the unpacked charsiu-m6-arm64 artifact with
-# rknputest.exe from rknpu-m6-arm64 beside it (docs/M6.md). Each step writes
+# rknputest.exe from rknpu-m6-arm64 beside it (docs/history/2026-11-24-m6.md). Each step writes
 # its own files under -Out, so a run that dies part way still says how far
 # it got; at the end bench.txt holds the table and bench.csv the numbers.
 #
@@ -14,7 +14,7 @@
 #   2. charsiu arms, the M4 ones with the same arguments plus:
 #        short-npu1   CHARSIU_NPU_ONEDEV=1, one core: the both-cores control
 #        short-wc     needs Device Parameters\M6CachedBos = 0 and a reboot;
-#                     not run here, see docs/M6.md
+#                     not run here, see docs/history/2026-11-24-m6.md
 #        stages       CHARSIU_STAGES=1, 32 tokens: where a token goes
 #   3. bench.txt: per arm load, staging, prompt and decode tok/s, NPU busy
 #      (both devices' hw time), the NPU's share of the wall clock, submits,

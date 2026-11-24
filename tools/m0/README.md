@@ -12,7 +12,7 @@ depends on them:
    contiguous memory below 4 GiB and leave the NPU IOMMU with paging off.
    Mainline Linux always runs the NPU with paging on, so this has never been
    measured. If it does not work, M6 (the driver owns the IOMMU) has to come
-   before M3. See section 7, risk 1, of [the study](../../docs/FEASIBILITY.md).
+   before M3. See section 7, risk 1, of [the study](../../docs/history/2026-11-22-feasibility.md).
 
 Nothing here has run on a board yet.
 

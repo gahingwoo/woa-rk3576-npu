@@ -160,7 +160,7 @@ R:\npu\perf\rknputest.exe m6 --iters 200 --mb 0 --collide
 R:\npu\perf\rknputest.exe m6 --iters 20 --mb 0 --fault
 ```
 
-Instead of rknputest, a charsiu run (docs/M7.md, step 3) works as well; it
+Instead of rknputest, a charsiu run ([testing](testing.md), step 3) works as well; it
 drives both cores at once.
 
 **What confirms it:**

@@ -8,12 +8,12 @@
  *                               device and runs on any host (CI runs it on
  *                               Linux)
  *   rknputest m3 [options]      M3: int8 matmuls on the NPU, compared bit for
- *                               bit with the CPU (see cmd_m3 and docs/M3.md)
+ *                               bit with the CPU (see cmd_m3 and docs/history/2026-11-22-m3.md)
  *   rknputest m6 [options]      M6: the driver's IOMMU: scattered buffers far
  *                               past M4's contiguous limit, the M3 ladder
  *                               through the page table, per-job latency, both
  *                               cores at once, and optionally a deliberate
- *                               page fault (see cmd_m6 and docs/M6.md)
+ *                               page fault (see cmd_m6 and docs/history/2026-11-24-m6.md)
  *
  * Exit status: 0 ok, 1 usage or device error, 2 a check in `info` failed,
  * 3 an m3 result was wrong, 4 an m3 job did not complete, 5 an m6 check

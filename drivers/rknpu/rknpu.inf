@@ -13,7 +13,7 @@
 ; Memory"), is copied into the driver store beside rknpu.sys. An INF has no
 ; directive that registers a counter provider, so lodctr is run by
 ; tools\rknpu-perfcounters.ps1 after the driver is bound, and unlodctr by
-; the same script with -Uninstall (docs/PERFCOUNTERS.md). Without that step
+; the same script with -Uninstall (docs/dev/perfcounters.md). Without that step
 ; the driver runs the same; the counters are just not visible.
 ;
 ; Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>

@@ -13,7 +13,7 @@
   ctrpp turns this into rknpuCounters.h and rknpuCounters.rc (rknpu.vcxproj);
   the .rc holds the names below and is linked into rknpu.sys, which
   applicationIdentity names. Registering the provider (lodctr /m) is
-  tools/rknpu-perfcounters.ps1; docs/PERFCOUNTERS.md has the details.
+  tools/rknpu-perfcounters.ps1; docs/dev/perfcounters.md has the details.
   Counter ids and the GUIDs are an interface: never renumber, only add.
 
   Copyright (c) 2026 Ga Hing Woo <gahing@gahingwoo.com>
