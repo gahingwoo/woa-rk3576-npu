@@ -270,12 +270,15 @@ function Test-Admin {
 # "NPU (experimental)" is off in setup), present with a problem (no driver, or
 # the driver failed), or started.
 function Get-NpuDevice {
-    $r = [pscustomobject]@{ Present = $false; Started = $false; Problem = 0; Status = ''; Driver = ''; UserAccess = $false; Iommu = $true }
+    $r = [pscustomobject]@{ Present = $false; Started = $false; Problem = 0; Status = ''; Driver = ''; UserAccess = $false; Iommu = $true; Id = ''; Sddl = '' }
     try {
         $d = Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $_.DeviceID -like 'ACPI\RKCP3576\*' } -ErrorAction Stop | Select-Object -First 1
     } catch { return $r }
     if (-not $d) { return $r }
     $r.Present = $true
+    $r.Id = [string]$d.DeviceID
+    # the security PnP applies to the device stack (rknpu.inf's Security)
+    try { $r.Sddl = [string](Get-PnpDeviceProperty -InstanceId $r.Id -KeyName 'DEVPKEY_Device_SecuritySDS' -ErrorAction Stop).Data } catch { }
     $r.Problem = [int]$d.ConfigManagerErrorCode
     $r.Started = ($r.Problem -eq 0 -and $d.Status -eq 'OK')
     $r.Status = $d.Status
@@ -283,7 +286,7 @@ function Get-NpuDevice {
         $s = Get-CimInstance Win32_PnPSignedDriver -ErrorAction Stop | Where-Object { $_.DeviceID -like 'ACPI\RKCP3576\*' } -ErrorAction Stop | Select-Object -First 1
         if ($s) { $r.Driver = "$($s.DriverVersion)  $($s.InfName)" }
     } catch { }
-    $k = "HKLM:\SYSTEM\CurrentControlSet\Enum\$NpuInstance\Device Parameters"
+    $k = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($r.Id)\Device Parameters"
     try {
         $p = Get-ItemProperty -Path $k -ErrorAction Stop
         if ($p.PSObject.Properties['UserAccess'] -and $p.UserAccess -eq 1) { $r.UserAccess = $true }
@@ -787,6 +790,7 @@ function Invoke-Doctor {
         elseif ($d.UserAccess) { Row $true 'npu access' 'UserAccess = 1: this user may open the NPU' }
         else { Row $false 'npu access' 'administrators only: run charsiu-install.ps1 once from an administrator PowerShell and restart, or use an administrator terminal' }
         if (-not $d.Iommu) { Row $null 'npu iommu' 'M6Iommu = 0 (bypass): the NPU stays administrators only' }
+        if ($d.Sddl) { Row $null 'npu security' "$($d.Sddl)" } else { Row $null 'npu security' 'no device Security value (the class decides; an older rknpu.inf)' }
         if (Get-NpuCounters) { Row $true 'counters' '"RK3576 NPU" performance counters are registered' }
         else { Row $null 'counters' 'not registered; tools\rknpu-perfcounters.ps1 registers them (charsiu ps, the desktop app)' }
     }

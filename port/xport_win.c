@@ -56,11 +56,17 @@ struct rkx *rkx_open(const char *path, int *err)
 		*err = errno_of(e);
 		/* once: three devices are opened, and a run without the driver is normal */
 		if (!said++)
+			/* the two answers people need told apart: the
+			 * driver is there and said no, or nothing is there */
 			fprintf(stderr, "charsiu: cannot open %s (Windows error %lu)%s\n",
 				path && *path ? path : "\\\\.\\RKNPU", (unsigned long)e,
-				e == ERROR_ACCESS_DENIED ? ": run as administrator" :
-				e == ERROR_FILE_NOT_FOUND ? ": is rknpu.sys installed and the NPU "
-				"enabled in the firmware setup?" : "");
+				e == ERROR_ACCESS_DENIED ? ": ACCESS DENIED. rknpu.sys is running "
+				"and refused this user: run as administrator, or let ordinary "
+				"users in once with charsiu-install.ps1 from an administrator "
+				"PowerShell (then restart)" :
+				e == ERROR_FILE_NOT_FOUND ? ": NOT INSTALLED. No rknpu.sys device: "
+				"install the driver (charsiu-install.ps1 --driver) and enable "
+				"\"NPU (experimental)\" in the firmware setup" : "");
 		return NULL;
 	}
 	x = calloc(1, sizeof(*x));

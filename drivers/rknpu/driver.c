@@ -17,7 +17,8 @@
  *     what it finds, the DPC counts. No job is ever started in M2, so the
  *     counts are expected to stay 0;
  *   - creates \\.\RKNPU, administrators and SYSTEM only (interactive users
- *     too with Device Parameters\UserAccess = 1 and the IOMMU on), one handle at a
+ *     too with Device Parameters\UserAccess = 1 and the IOMMU on: see
+ *     NpuEvtFileCreate), one handle at a
  *     time, with GET_INFO and READ_REGS. Both only read.
  *
  * The only register writes this driver makes, all to the PC block of a
@@ -585,17 +586,20 @@ NpuCreateInterrupt(
 }
 
 /*
- * USER ACCESS (Device Parameters\UserAccess = 1, set by charsiu-install.ps1
- * -UserAccess and read when the device is added). The device then also
- * admits interactive users, so charsiu runs from an ordinary terminal and the
- * desktop app, as it does on Linux, where the accel node is the video
- * group's. It is only granted with the IOMMU on: every address a stream can
- * program is one of five registers, each checked against the caller's own
- * buffers (m3.c), and the IOMMU confines the NPU to the buffers that are
- * mapped. In bypass mode (M6Iommu = 0, or M4AllowUnlisted = 1) a stream's
- * unchecked sizes reach physical memory, so the device stays administrators
- * only, and if the IOMMU could not be set up at start this refuses every
- * caller that is not an administrator.
+ * WHO MAY OPEN \\.\RKNPU. The device's security descriptor (this SDDL, and
+ * the same string as the device's Security value in rknpu.inf, which PnP
+ * applies to the whole stack whatever the setup class) lets SYSTEM,
+ * administrators and interactive users ask; this callback decides.
+ *
+ * SYSTEM and administrators: always. An interactive user who is neither:
+ * only with Device Parameters\UserAccess = 1 (set by charsiu-install.ps1,
+ * read when the device is added, so it takes a restart) AND the IOMMU on.
+ * In IOMMU mode every address a stream can program is one of five
+ * registers, each checked against the caller's own buffers (m3.c), and the
+ * NPU reaches only mapped buffers; in bypass mode (M6Iommu = 0, or
+ * M4AllowUnlisted = 1, or an IOMMU that could not be set up at start) a
+ * stream's unchecked sizes reach physical memory, so it stays SYSTEM and
+ * administrators only. On Linux the accel node is the video group's.
  */
 static BOOLEAN
 NpuCallerIsAdmin(
@@ -608,6 +612,7 @@ NpuCallerIsAdmin(
 
     if (!sc || !sc->AccessState)
         return FALSE;
+    /* LocalSystem's token carries BUILTIN\Administrators, so SYSTEM passes */
     return SeTokenIsAdmin(SeQuerySubjectContextToken(&sc->AccessState->SubjectSecurityContext));
 }
 
@@ -621,9 +626,8 @@ NpuEvtFileCreate(
     PDEVICE_CONTEXT ctx = GetContext(Device);
 
     UNREFERENCED_PARAMETER(FileObject);
-    if (ctx->UserAccess && !ctx->Mmu.On && WdfRequestGetRequestorMode(Request) == UserMode &&
-        !NpuCallerIsAdmin(Request)) {
-        RKNPU_LOG("open refused: UserAccess needs the IOMMU, and it is off");
+    if (WdfRequestGetRequestorMode(Request) == UserMode && !NpuCallerIsAdmin(Request) &&
+        !(ctx->UserAccess && ctx->Mmu.On)) {
         WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
         return;
     }
@@ -664,10 +668,9 @@ NpuEvtDeviceAdd(
     ULONG n;
     DECLARE_CONST_UNICODE_STRING(name, RKNPU_NT_NAME);
     DECLARE_CONST_UNICODE_STRING(link, RKNPU_DOS_NAME);
-    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-    /* interactive users may read and write (open the device, issue its
-     * IOCTLs); see NpuEvtFileCreate for when */
-    DECLARE_CONST_UNICODE_STRING(sddlUsers, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
+    /* the same string as rknpu.inf's Security value; NpuEvtFileCreate decides
+     * which interactive users get in */
+    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
     BOOLEAN userAccess = FALSE;
     WDFKEY key;
 
@@ -698,7 +701,7 @@ NpuEvtDeviceAdd(
                      NpuInitQueryULong(key, L"M4AllowUnlisted", 0) != 1;
         WdfRegistryClose(key);
     }
-    status = WdfDeviceInitAssignSDDLString(DeviceInit, userAccess ? &sddlUsers : &sddl);
+    status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -712,7 +715,7 @@ NpuEvtDeviceAdd(
     ctx->Device = device;
     ctx->UserAccess = userAccess;
     if (userAccess)
-        RKNPU_LOG("UserAccess = 1: interactive users may open the device (IOMMU mode)");
+        RKNPU_LOG("UserAccess = 1: interactive users may open the device in IOMMU mode");
     status = NpuM3DeviceInit(ctx);
     if (!NT_SUCCESS(status))
         return status;

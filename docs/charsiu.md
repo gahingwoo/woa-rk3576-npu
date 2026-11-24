@@ -102,6 +102,14 @@ on the CPU.
 
 ## Who may use the NPU
 
+The device's security is stated in rknpu.inf (`Security` on the device,
+which PnP applies to the whole device stack, and the same SDDL in the
+driver): SYSTEM, administrators and interactive users may ask to open
+`\\.\RKNPU`, and the driver's create callback decides. Before this the
+INF set none, and when the device moved to the ComputeAccelerator class an
+elevated administrator got ERROR_ACCESS_DENIED while SYSTEM still opened
+it. `charsiu doctor` prints the security the device has.
+
 rknpu.sys creates `\\.\RKNPU` for administrators and SYSTEM only, so by
 default charsiu reaches the NPU only from an administrator terminal; from an
 ordinary one it says so and runs on the CPU. The installer, run from an
