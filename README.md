@@ -20,7 +20,7 @@ IOMMU the driver manages. Not tried on the ArmSoM CM5-IO, whose firmware does
 not offer the NPU option. No release yet: the driver and charsiu are CI
 artifacts.
 
-How to use it: [docs/use.md](docs/use.md).
+How to use it: [docs/use.md](docs/use.md). charsiu's commands and the installer: [docs/charsiu.md](docs/charsiu.md).
 
 ## Milestones
 
@@ -34,7 +34,7 @@ How to use it: [docs/use.md](docs/use.md).
 | M5 | Performance | done as M6 and M7 |
 | M6 | Driver-managed NPU IOMMU, cached buffers, both cores | passed, 2026-11-24: 12.12 tok/s |
 | M7 | Decode performance against Linux | merged 2026-11-24: 14.23 tok/s with the defaults |
-| M8 | Install script, `charsiu serve` | not started |
+| M8 | Install script, the `charsiu` commands, `charsiu serve` | code-complete on branch charsiu-windows, not run on a board ([docs/charsiu.md](docs/charsiu.md)) |
 
 The plan and board log of each milestone: [history](docs/history/README.md).
 

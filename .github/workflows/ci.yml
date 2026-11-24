@@ -90,7 +90,7 @@ jobs:
         run: |
           set -eux
           shellcheck tools/m4/*.sh
-          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/m7/m7-bench.ps1 tools/rknpu-reinstall.ps1 tools/rknpu-perfcounters.ps1; do
+          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/m7/m7-bench.ps1 tools/rknpu-reinstall.ps1 tools/rknpu-perfcounters.ps1 win/charsiu.ps1 win/charsiu-install.ps1; do
             F="$f" pwsh -NoProfile -Command '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:F, [ref]$null, [ref]$e); if ($e) { $e; exit 1 }'
           done
       - name: M4 device layer against the in-memory driver
@@ -203,6 +203,69 @@ jobs:
           name: charsiu-m7-arm64
           path: ${{ runner.temp }}/charsiu-m7
           if-no-files-found: error
+
+      - name: Package (charsiu-windows-arm64.zip, what charsiu-install.ps1 installs)
+        run: |
+          set -eux
+          sh win/mkpkg.sh port/build/win "$RUNNER_TEMP/pkg"
+          unzip -l "$RUNNER_TEMP/pkg/charsiu-windows-arm64.zip"
+          # the package must be what the installer looks for
+          for f in charsiu.ps1 charsiu-install.ps1 charsiu_run.exe charsiu_serve.exe charsiu_check.exe zoo.txt bin/charsiu.cmd config.ini VERSION; do
+            unzip -l "$RUNNER_TEMP/pkg/charsiu-windows-arm64.zip" | grep -q " $f\$" || { echo "no $f in the package"; exit 1; }
+          done
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: charsiu-windows-arm64
+          path: |
+            ${{ runner.temp }}/pkg/charsiu-windows-arm64.zip
+            ${{ runner.temp }}/pkg/charsiu-windows-arm64.zip.sha256
+          if-no-files-found: error
+
+  frontdoor:
+    name: charsiu's Windows front door and installer (pwsh on Linux)
+    # charsiu.ps1 runs charsiu's own Linux programs under their Windows names,
+    # so every path that is not Windows itself is exercised: pull with the
+    # sha256 check, the gate, list, rm, a question, the quoting, bench, serve
+    # on --port 0 with a client that leaves, and the installer's dry run.
+    runs-on: ubuntu-24.04-arm
+    env:
+      PWSH_VERSION: '7.4.6'
+      PWSH_SHA256: 'c0159b03e85f44ae1e7697818a011558da6c813d0aae848bf5ac13bf435d8624'
+      MODEL_SHA256: 'bcc3af2849ad6095af57e9b5cd43775256efdc66e306acb529172f92d0c04b03'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: charsiu for Linux (the stand-ins)
+        run: |
+          set -eux
+          make -C external/charsiu build/charsiu_run build/charsiu_check build/charsiu_serve
+      - name: pwsh
+        run: |
+          set -eux
+          f=powershell-${PWSH_VERSION}-linux-arm64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$f" "https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VERSION}/$f"
+          echo "${PWSH_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/pwsh"
+          tar -C "$RUNNER_TEMP/pwsh" -xzf "$RUNNER_TEMP/$f"
+          chmod +x "$RUNNER_TEMP/pwsh/pwsh"
+          echo "PWSH=$RUNNER_TEMP/pwsh/pwsh" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/model
+          key: smollm2-135m-q4-${{ env.MODEL_SHA256 }}
+      - name: The smallest model in the zoo
+        run: |
+          set -eux
+          m="$RUNNER_TEMP/model/SmolLM2-135M-Instruct-Q4_0.gguf"
+          if [ ! -f "$m" ]; then
+            mkdir -p "$RUNNER_TEMP/model"
+            curl -fsSL -o "$m" https://huggingface.co/bartowski/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_0.gguf
+          fi
+          echo "${MODEL_SHA256}  $m" | sha256sum -c -
+      - name: The front door
+        run: sh win/test/frontdoor.sh external/charsiu/build "$RUNNER_TEMP/model/SmolLM2-135M-Instruct-Q4_0.gguf"
 
   windows:
     name: WDK build, test-signed (ARM64)
@@ -320,9 +383,45 @@ jobs:
             Format-Table -AutoSize | Out-String | Write-Host
           "STAGE=$out" >> $env:GITHUB_ENV
 
+          # rknpu-windows-arm64.zip: what charsiu-install.ps1 --driver stages
+          $z = Join-Path $env:RUNNER_TEMP 'rknpu-windows-arm64.zip'
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath $z -Force
+          $h = (Get-FileHash $z -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$h  rknpu-windows-arm64.zip" | Out-File -FilePath "$z.sha256" -Encoding ascii
+          Write-Host "rknpu-windows-arm64.zip $h"
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: rknpu-m7-arm64
           path: ${{ env.STAGE }}
           if-no-files-found: error
+
+      - name: Upload the driver package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rknpu-windows-arm64
+          path: |
+            ${{ runner.temp }}/rknpu-windows-arm64.zip
+            ${{ runner.temp }}/rknpu-windows-arm64.zip.sha256
+          if-no-files-found: error
+
+  release:
+    name: Attach the packages to a release (tags only)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [charsiu, frontdoor, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: charsiu-windows-arm64
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: rknpu-windows-arm64
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
