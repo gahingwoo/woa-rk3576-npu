@@ -80,5 +80,6 @@ windows 0 and 1 and never wait.
 | environment | `CHARSIU_RKNPU_FUSE` | 1 | 0: one IOCTL per PREP and FINI, as M6 |
 | environment | `CHARSIU_WIN_SYSFS` | 1 | 0: do not pin the decode thread to the fast cluster |
 | environment | `CHARSIU_RKNPU_ASYNC` | 0 | 1: a call's two SUBMITs overlap |
-| environment | `CHARSIU_RKNPU_UCACHE` | 0 | 1: cache maintenance in the process, if user mode may |
+| environment | `CHARSIU_RKNPU_UCACHE` | 1 | cache maintenance in the process when the probe shows user mode may; 0: by the driver |
+| environment | `CHARSIU_WIN_SPIN_US` | 0 | a pool waiter spins this long before it sleeps |
 | environment | `CHARSIU_NPU_ONEDEV` | 0 | 1: one core only |

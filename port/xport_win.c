@@ -206,7 +206,10 @@ int rkx_dc_usable(void)
 	rkx_dc_probe_civac((void *)line);
 	RemoveVectoredExceptionHandler(h);
 	state = dc_faults ? 2 : 1;
-	fprintf(stderr, "charsiu rknpu: user-mode DC CVAC / DC CIVAC %s\n",
+	/* every run probes now (CHARSIU_RKNPU_UCACHE defaults to 1): say it
+	 * only with the statistics */
+	if (getenv("CHARSIU_RKNPU_STATS") && atoi(getenv("CHARSIU_RKNPU_STATS")))
+		fprintf(stderr, "charsiu rknpu: user-mode DC CVAC / DC CIVAC %s\n",
 		state == 1 ? "work (CHARSIU_RKNPU_UCACHE can do the cache maintenance here)"
 			   : "trap (SCTLR_EL1.UCI is 0); the driver keeps doing it");
 	return state == 1;

@@ -16,7 +16,9 @@ int pthread_getaffinity_np(pthread_t t, size_t size, cpu_set_t *set);
 /*
  * M7: the mutexes and condition variables charsiu uses (its thread pool's
  * barrier, the device locks) as Windows SRW locks and condition variables,
- * with a short spin before a waiter sleeps. winpthreads' own condition
+ * optionally with a short spin before a waiter sleeps (off by default: two
+ * TaishanPi 3M runs measured spin 0 6.3 and 3.5 ms a token faster than
+ * 50 us, about the size of the bench's A/A noise, and it spends no CPU). winpthreads' own condition
  * variable is built from semaphores, and the board's silu * up (16 pool
  * barriers a token over 131k elements, 1.4 ms of work on one thread at
  * charsiu's 10.4 ns an element) took 3.06 ms a token: about 170 us a
@@ -27,7 +29,8 @@ int pthread_getaffinity_np(pthread_t t, size_t size, cpu_set_t *set);
  * pointer to the Windows object once used.
  *
  *   CHARSIU_WIN_SYNC=pthread   winpthreads, as M6
- *   CHARSIU_WIN_SPIN_US        how long a waiter spins first (default 50, 0 none)
+ *   CHARSIU_WIN_SPIN_US        how long a waiter spins first (default 0, none;
+ *                              the M7 bench's short-spin arm uses 50)
  *
  * Every charsiu signal and broadcast is made with the mutex held, which is
  * what makes the spin safe: see compat_win.c.

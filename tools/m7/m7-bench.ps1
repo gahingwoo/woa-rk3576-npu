@@ -16,16 +16,20 @@
 #      table says whether it did. Each arm turns ONE change off against the
 #      M7 defaults, except short-m6, which turns all of them off:
 #
-#        short-m6      M6's port: CHARSIU_RKNPU_FUSE=0 CHARSIU_WIN_SYNC=pthread
-#                      CHARSIU_WIN_SYSFS=0 CHARSIU_RKNPU_QOS=0, no weight cache
+#        short-m6      M6's port: CHARSIU_RKNPU_FUSE=0 CHARSIU_RKNPU_UCACHE=0
+#                      CHARSIU_WIN_SYNC=pthread CHARSIU_WIN_SYSFS=0
+#                      CHARSIU_RKNPU_QOS=0, no weight cache
 #        short-npu     M7 defaults; writes the weight cache (--cache)
 #        short-npu2    M7 defaults; reads it (the staging fix)
-#        short-nofuse  CHARSIU_RKNPU_FUSE=0       one IOCTL per PREP / FINI
+#        short-noucache CHARSIU_RKNPU_UCACHE=0    PREP / FINI by the driver, fused
+#                      into SUBMIT and WAIT (the default before 2026-11-24)
+#        short-nofuse  CHARSIU_RKNPU_UCACHE=0 CHARSIU_RKNPU_FUSE=0
+#                      one IOCTL per PREP / FINI
 #        short-nopin   CHARSIU_WIN_SYSFS=0        decode thread not pinned
 #        short-pthread CHARSIU_WIN_SYNC=pthread   winpthreads' barrier
-#        short-nospin  CHARSIU_WIN_SPIN_US=0      SRW barrier, no spin
+#        short-spin    CHARSIU_WIN_SPIN_US=50     SRW barrier spins 50 us first
+#                      (the default before 2026-11-24)
 #        short-noqos   CHARSIU_NPU_IDLE=1         no CPU hold (charsiu's control)
-#        short-ucache  CHARSIU_RKNPU_UCACHE=1     cache maintenance in the process
 #        short-async   CHARSIU_RKNPU_ASYNC=1      a call's two SUBMITs overlap
 #        short-idle    the processor idle-disable power setting for this arm
 #                      only (restored after): the /dev/cpu_dma_latency control
@@ -70,18 +74,18 @@ function Die($m) { Write-Host "m7-bench: $m" -ForegroundColor Red; exit 1 }
 
 # ---- the arms ------------------------------------------------------------------
 
-$m6env = @{ CHARSIU_RKNPU_FUSE = '0'; CHARSIU_WIN_SYNC = 'pthread'; CHARSIU_WIN_SYSFS = '0'; CHARSIU_RKNPU_QOS = '0' }
+$m6env = @{ CHARSIU_RKNPU_FUSE = '0'; CHARSIU_RKNPU_UCACHE = '0'; CHARSIU_WIN_SYNC = 'pthread'; CHARSIU_WIN_SYSFS = '0'; CHARSIU_RKNPU_QOS = '0' }
 $short = "-p `"$prompt`" -n 128 -c 512"
 $armList = @(
     @{ Name = 'short-m6';      Args = $short; Env = $m6env; Cache = $false },
     @{ Name = 'short-npu';     Args = $short; Env = @{}; Cache = $true },
     @{ Name = 'short-npu2';    Args = $short; Env = @{}; Cache = $true },
-    @{ Name = 'short-nofuse';  Args = $short; Env = @{ CHARSIU_RKNPU_FUSE = '0' }; Cache = $true },
+    @{ Name = 'short-noucache'; Args = $short; Env = @{ CHARSIU_RKNPU_UCACHE = '0' }; Cache = $true },
+    @{ Name = 'short-nofuse';  Args = $short; Env = @{ CHARSIU_RKNPU_UCACHE = '0'; CHARSIU_RKNPU_FUSE = '0' }; Cache = $true },
     @{ Name = 'short-nopin';   Args = $short; Env = @{ CHARSIU_WIN_SYSFS = '0' }; Cache = $true },
     @{ Name = 'short-pthread'; Args = $short; Env = @{ CHARSIU_WIN_SYNC = 'pthread' }; Cache = $true },
-    @{ Name = 'short-nospin';  Args = $short; Env = @{ CHARSIU_WIN_SPIN_US = '0' }; Cache = $true },
+    @{ Name = 'short-spin';    Args = $short; Env = @{ CHARSIU_WIN_SPIN_US = '50' }; Cache = $true },
     @{ Name = 'short-noqos';   Args = $short; Env = @{ CHARSIU_NPU_IDLE = '1' }; Cache = $true },
-    @{ Name = 'short-ucache';  Args = $short; Env = @{ CHARSIU_RKNPU_UCACHE = '1' }; Cache = $true },
     @{ Name = 'short-async';   Args = $short; Env = @{ CHARSIU_RKNPU_ASYNC = '1' }; Cache = $true },
     @{ Name = 'short-idle';    Args = $short; Env = @{}; Cache = $true; Idle = $true },
     @{ Name = 'short-npu1';    Args = $short; Env = @{ CHARSIU_NPU_ONEDEV = '1' }; Cache = $true },
@@ -234,8 +238,8 @@ function Write-Tables($dir) {
         }
         [void]$L.Add('')
         [void]$L.Add('each arm against short-npu2 (the M7 defaults). For an arm that turns a default OFF, + is what')
-        [void]$L.Add('that default saves; for short-ucache, short-async and short-idle, which turn an option ON, - is a gain:')
-        foreach ($x in 'short-nofuse', 'short-nopin', 'short-pthread', 'short-nospin', 'short-noqos', 'short-ucache', 'short-async', 'short-idle', 'short-npu1') {
+        [void]$L.Add('that default saves; for short-spin, short-async and short-idle, which turn an option ON, - is a gain:')
+        foreach ($x in 'short-noucache', 'short-nofuse', 'short-nopin', 'short-pthread', 'short-spin', 'short-noqos', 'short-async', 'short-idle', 'short-npu1') {
             $r = $rows | Where-Object { $_.arm -eq $x } | Select-Object -First 1
             if ($r -and $r.ms_token) { [void]$L.Add(('  {0,-14} {1,6:N2} tok/s  {2,6:N1} ms a token  {3,7:+0.0;-0.0} ms' -f $x, $r.gen_tok_s, $r.ms_token, ($r.ms_token - $base.ms_token))) }
         }

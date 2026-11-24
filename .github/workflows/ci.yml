@@ -108,8 +108,10 @@ jobs:
           CHARSIU_RKNPU_FUSE=0 port/build/host/devtest
           CHARSIU_RKNPU_ASYNC=1 port/build/host/devtest
           CHARSIU_RKNPU_ASYNC=1 RKNPU_FAKE_M6=1 port/build/host/devtest
-          RKNPU_FAKE_UCACHE=1 CHARSIU_RKNPU_UCACHE=1 port/build/host/devtest
-          CHARSIU_RKNPU_ASYNC=1 RKNPU_FAKE_UCACHE=1 CHARSIU_RKNPU_UCACHE=1 port/build/host/devtest
+          # user-mode cache maintenance is the default where the probe allows it
+          RKNPU_FAKE_UCACHE=1 port/build/host/devtest
+          RKNPU_FAKE_UCACHE=1 CHARSIU_RKNPU_UCACHE=0 port/build/host/devtest
+          CHARSIU_RKNPU_ASYNC=1 RKNPU_FAKE_UCACHE=1 port/build/host/devtest
       - name: Wording
         run: |
           # No en or em dashes, and the project's wording rule for public files.

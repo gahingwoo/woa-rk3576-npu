@@ -456,7 +456,7 @@ static int sync_srw(void)
 		LARGE_INTEGER f;
 
 		m = e && !strcmp(e, "pthread") ? 2 : 1;
-		spin_us = env_num("CHARSIU_WIN_SPIN_US", 50);
+		spin_us = env_num("CHARSIU_WIN_SPIN_US", 0);   /* board-measured, docs/dev/performance.md */
 		QueryPerformanceFrequency(&f);
 		qpc_per_us = f.QuadPart / 1000000 ? f.QuadPart / 1000000 : 1;
 		InterlockedCompareExchange(&sync_mode, m, 0);

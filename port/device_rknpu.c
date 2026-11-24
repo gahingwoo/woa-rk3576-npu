@@ -60,10 +60,14 @@
  *   CHARSIU_RKNPU_ASYNC   M7, default 0: 1 makes each device's SUBMIT IOCTL on
  *                         a thread of its own, so a call's two SUBMITs
  *                         overlap (see async_main)
- *   CHARSIU_RKNPU_UCACHE  M7, default 0: 1 does PREP and FINI in this process
- *                         (DC CIVAC / DC CVAC on the buffer's own mapping,
- *                         no IOCTL at all) if the CPU lets user mode do it,
- *                         which is probed once; falls back to the above
+ *   CHARSIU_RKNPU_UCACHE  M7, default 1: PREP and FINI are done in this
+ *                         process (DC CIVAC / DC CVAC on the buffer's own
+ *                         mapping, no IOCTL at all) when the CPU lets user
+ *                         mode do it, which is probed once; otherwise, and
+ *                         with 0, the fused path above. On the TaishanPi 3M
+ *                         the probe traps (Windows leaves SCTLR_EL1.UCI 0),
+ *                         so there this is the fused path and the bench's
+ *                         short-noucache arm is an A/A control
  *
  * With CHARSIU_RKNPU_STATS=1 the close also prints an M7 timing line: the
  * SUBMIT and WAIT IOCTLs' wall time against the driver's own drv_us, and the
@@ -383,7 +387,7 @@ struct charsiu_device *charsiu_open(const char *path)
 	/* M7: an M6 driver leaves m7_version 0 and refuses the new flags */
 	dev->m7 = info.m6_version && info.m7_version >= RKNPU_M7_VERSION;
 	dev->fuse = dev->m7 && dev->cached && env_long("CHARSIU_RKNPU_FUSE", 1) != 0;
-	dev->ucache = dev->cached && env_long("CHARSIU_RKNPU_UCACHE", 0) != 0 && rkx_dc_usable();
+	dev->ucache = dev->cached && env_long("CHARSIU_RKNPU_UCACHE", 1) != 0 && rkx_dc_usable();
 	pthread_mutex_init(&dev->lock, NULL);
 	pthread_mutex_lock(&open_lock);
 	dev->index = dev_count++;

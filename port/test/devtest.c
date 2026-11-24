@@ -16,8 +16,9 @@
  *   - a buffer of another device is outside this one's buffers;
  *   - M7: FINI_BO rides on the next SUBMIT and PREP_BO on the WAIT (the
  *     model refuses a stream whose clean never arrived), or, with
- *     CHARSIU_RKNPU_UCACHE=1 and RKNPU_FAKE_UCACHE=1, both happen in the
- *     caller; RKNPU_FAKE_M6=1 is the M6 driver, one IOCTL each;
+ *     RKNPU_FAKE_UCACHE=1 (the probe allows it, and CHARSIU_RKNPU_UCACHE
+ *     defaults to 1), both happen in the caller; RKNPU_FAKE_M6=1 is the M6
+ *     driver, one IOCTL each;
  *   - M7, CHARSIU_RKNPU_ASYNC=1: the same work through the SUBMIT threads,
  *     and a refused stream fails the next PREP and every later SUBMIT
  *     (the busy-core, refusal and shared-CBUF steps above need a
@@ -259,8 +260,10 @@ int main(void)
 
 		unsigned long long cl, wp, uf, up;
 		int m6 = getenv("RKNPU_FAKE_M6") || getenv("RKNPU_FAKE_M4");
-		int uc = getenv("RKNPU_FAKE_UCACHE") && getenv("CHARSIU_RKNPU_UCACHE") &&
-			 atoi(getenv("CHARSIU_RKNPU_UCACHE"));
+		/* CHARSIU_RKNPU_UCACHE defaults to 1; RKNPU_FAKE_UCACHE=1 is the
+		 * probe saying user mode may */
+		int uc = getenv("RKNPU_FAKE_UCACHE") && !(getenv("CHARSIU_RKNPU_UCACHE") &&
+							  !atoi(getenv("CHARSIU_RKNPU_UCACHE")));
 		int fuse = !m6 && !uc && !(getenv("CHARSIU_RKNPU_FUSE") &&
 					   !atoi(getenv("CHARSIU_RKNPU_FUSE")));
 
