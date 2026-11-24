@@ -17,9 +17,12 @@ int pthread_getaffinity_np(pthread_t t, size_t size, cpu_set_t *set);
  * M7: the mutexes and condition variables charsiu uses (its thread pool's
  * barrier, the device locks) as Windows SRW locks and condition variables,
  * with a short spin before a waiter sleeps. winpthreads' own condition
- * variable is built from semaphores and took about 190 us a barrier on the
- * board (silu * up, 16 barriers, 3.06 ms a token, against 0.18 ms for the
- * same work without the pool on Linux). The storage is winpthreads' own
+ * variable is built from semaphores, and the board's silu * up (16 pool
+ * barriers a token over 131k elements, 1.4 ms of work on one thread at
+ * charsiu's 10.4 ns an element) took 3.06 ms a token: about 170 us a
+ * barrier against the 50 us charsiu's pool sizing assumes. That is a model
+ * from two numbers; the M7 bench's short-pthread arm is the measurement.
+ * The storage is winpthreads' own
  * (pthread_mutex_t, pthread_cond_t, their static initialisers), holding a
  * pointer to the Windows object once used.
  *

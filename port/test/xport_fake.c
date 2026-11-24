@@ -591,6 +591,11 @@ void rkx_pause(unsigned int us)
 		sched_yield();
 }
 
+void rkx_relax(void)
+{
+	sched_yield();
+}
+
 unsigned long long rkx_now_us(void)
 {
 	struct timespec ts;

@@ -57,6 +57,9 @@
  *                         and the PREP_BO after a job rides on its WAIT
  *                         (RKNPU_WAIT_PREP), so a decode call is four IOCTLs
  *                         instead of ten; 0 is M6's one IOCTL each
+ *   CHARSIU_RKNPU_ASYNC   M7, default 0: 1 makes each device's SUBMIT IOCTL on
+ *                         a thread of its own, so a call's two SUBMITs
+ *                         overlap (see async_main)
  *   CHARSIU_RKNPU_UCACHE  M7, default 0: 1 does PREP and FINI in this process
  *                         (DC CIVAC / DC CVAC on the buffer's own mapping,
  *                         no IOCTL at all) if the CPU lets user mode do it,
@@ -124,7 +127,20 @@ struct charsiu_device {
 	/* the IOCTLs' wall time and what the driver says of it */
 	unsigned long sub_n, wait_n, wait_slept, wait_timed;
 	unsigned long long sub_wall_us, sub_drv_us, wait_wall_us, irq_dpc_us, dpc_wake_us, late_us;
+	/* CHARSIU_RKNPU_ASYNC: the SUBMIT thread and its one request */
+	int async, a_stop, a_r, a_err;
+	int a_state;                    /* 0 none, 1 posted, 2 done (atomic) */
+	pthread_t a_th;
+	pthread_mutex_t a_mx;
+	pthread_cond_t a_cv;
+	rknpu_submit_m7_in a_req;
+	unsigned long async_n;
 };
+
+/* M7, CHARSIU_RKNPU_ASYNC (below, with the submission) */
+static void async_start(struct charsiu_device *dev);
+static void async_stop(struct charsiu_device *dev);
+static int async_join(struct charsiu_device *dev);
 
 static unsigned dev_count;              /* opened so far, under no lock: open is single-threaded */
 static pthread_mutex_t open_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -372,6 +388,8 @@ struct charsiu_device *charsiu_open(const char *path)
 	pthread_mutex_lock(&open_lock);
 	dev->index = dev_count++;
 	pthread_mutex_unlock(&open_lock);
+	if (env_long("CHARSIU_RKNPU_ASYNC", 0))
+		async_start(dev);
 	if (dev->index == 0 && env_long("CHARSIU_RKNPU_STATS", 0))
 		fprintf(stderr, "charsiu rknpu: %s driver; cache maintenance %s\n",
 			dev->m7 ? "M7" : info.m6_version ? "M6" : "M4",
@@ -379,6 +397,8 @@ struct charsiu_device *charsiu_open(const char *path)
 			dev->ucache ? "in this process (DC by VA, CHARSIU_RKNPU_UCACHE)" :
 			dev->fuse ? "fused into SUBMIT and WAIT (CHARSIU_RKNPU_FUSE)" :
 			"one IOCTL a buffer (M6)");
+	if (dev->index == 0 && dev->async && env_long("CHARSIU_RKNPU_STATS", 0))
+		fprintf(stderr, "charsiu rknpu: SUBMITs from a thread per device (CHARSIU_RKNPU_ASYNC)\n");
 	/*
 	 * device.c burns the first buffer so that no stream sits at IOVA 0.
 	 * Physical addresses here are never 0 (DRAM starts at 0x40000000), and
@@ -393,8 +413,10 @@ void charsiu_close(struct charsiu_device *dev)
 	if (!dev)
 		return;
 	pthread_mutex_lock(&dev->lock);
+	(void)async_join(dev);
 	(void)dev_wait(dev, DEV_WAIT_MS);
 	pthread_mutex_unlock(&dev->lock);
+	async_stop(dev);
 	if (env_long("CHARSIU_RKNPU_STATS", 0))
 		fprintf(stderr, "charsiu rknpu dev %u: %lu submits as %lu chunks of %lu tasks, "
 			"%lu waits (%lu polls, %lu won), %lu busy retries, %lu timeouts, "
@@ -411,7 +433,8 @@ void charsiu_close(struct charsiu_device *dev)
 		fprintf(stderr, "charsiu rknpu dev %u timing: %lu SUBMITs %.1f us avg (driver %.1f), "
 			"%lu WAITs %.1f us avg, irq to dpc %.1f us, dpc to waiter %.1f us over %lu "
 			"that slept, %lu came after the dpc by %.1f us avg; %lu FINIs deferred "
-			"(%lu by SUBMIT, %lu list full), %lu PREPs by WAIT, %lu done here in %.1f ms\n",
+			"(%lu by SUBMIT, %lu list full), %lu PREPs by WAIT, %lu done here in %.1f ms; "
+			"%lu asynchronous SUBMITs\n",
 			dev->index, dev->sub_n, dev->sub_n ? (double)dev->sub_wall_us / dev->sub_n : 0.0,
 			dev->sub_n ? (double)dev->sub_drv_us / dev->sub_n : 0.0,
 			dev->wait_n, dev->wait_n ? (double)dev->wait_wall_us / dev->wait_n : 0.0,
@@ -421,7 +444,7 @@ void charsiu_close(struct charsiu_device *dev)
 			dev->wait_timed > dev->wait_slept ?
 				(double)dev->late_us / (dev->wait_timed - dev->wait_slept) : 0.0,
 			dev->deferred, dev->cleaned_by_submit, dev->defer_full, dev->prepped_by_wait,
-			dev->uc_ops, dev->uc_us / 1e3);
+			dev->uc_ops, dev->uc_us / 1e3, dev->async_n);
 	/* closing the handle frees every buffer it still holds (NpuM3FileCleanup) */
 	rkx_close(dev->x);
 	pthread_mutex_destroy(&dev->lock);
@@ -502,6 +525,7 @@ void charsiu_bo_free(struct charsiu_device *dev, struct charsiu_bo *bo)
 			break;
 		}
 	/* the device's last job may still be reading it */
+	(void)async_join(dev);
 	(void)dev_wait(dev, DEV_WAIT_MS);
 	memset(&fh, 0, sizeof(fh));
 	fh.handle = bo->handle;
@@ -563,6 +587,11 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo, int64_t t
 	if (ms > RKNPU_WAIT_MAX_MS)
 		ms = RKNPU_WAIT_MAX_MS;
 	pthread_mutex_lock(&dev->lock);
+	r = async_join(dev);
+	if (r) {
+		pthread_mutex_unlock(&dev->lock);
+		return r;
+	}
 	/* M7: the job's WAIT does this buffer's PREP_BO in the same IOCTL */
 	r = dev_wait_prep(dev, (unsigned)ms, want && dev->fuse && !dev->ucache ? bo->handle : 0,
 			  &prepped);
@@ -612,20 +641,6 @@ int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo)
 	return bo_sync(dev, IOCTL_RKNPU_FINI_BO, bo);
 }
 
-/* M7: the deferred FINI_BOs one IOCTL each, when a SUBMIT could not carry
- * them. Lock held. */
-static void defer_flush(struct charsiu_device *dev)
-{
-	struct charsiu_bo b;
-	unsigned i;
-
-	memset(&b, 0, sizeof(b));
-	for (i = 0; i < dev->ndefer; i++) {
-		b.handle = dev->defer[i];
-		(void)bo_sync(dev, IOCTL_RKNPU_FINI_BO, &b);
-	}
-	dev->ndefer = 0;
-}
 
 /* -------------------------------------------------------- submission */
 
@@ -653,16 +668,14 @@ static int submit_chunk(struct charsiu_device *dev, rknpu_submit_m7_in *m7)
 {
 	rknpu_submit_in *in = &m7->base;
 	unsigned long long t0 = 0, ts;
-	unsigned try = 0, got = 0, inlen = sizeof(*in);
+	unsigned try = 0, got = 0, inlen = sizeof(*in), i;
 	rknpu_submit_out out;
 	int r;
 
+	/* M7: m7->clean_count FINI_BOs ride on this SUBMIT (take_defer) */
 	in->flags = RKNPU_SUBMIT_COPY | crumb_flags(dev);
-	/* M7: the FINI_BOs deferred to this SUBMIT */
-	if (dev->ndefer) {
+	if (m7->clean_count) {
 		in->flags |= RKNPU_SUBMIT_CLEAN;
-		m7->clean_count = dev->ndefer;
-		memcpy(m7->clean, dev->defer, dev->ndefer * sizeof(m7->clean[0]));
 		inlen = sizeof(*m7);
 	}
 	for (;;) {
@@ -687,14 +700,21 @@ static int submit_chunk(struct charsiu_device *dev, rknpu_submit_m7_in *m7)
 			break;
 		rkx_pause(try < 64 ? 0 : 50);
 	}
-	if (in->flags & RKNPU_SUBMIT_CLEAN) {
-		if (!r)
-			dev->cleaned_by_submit += dev->ndefer;
-		else
-			defer_flush(dev);       /* do not carry them into another failure */
-		dev->ndefer = 0;
-		in->flags &= ~RKNPU_SUBMIT_CLEAN;
+	if (m7->clean_count) {
+		if (!r) {
+			dev->cleaned_by_submit += m7->clean_count;
+		} else {
+			/* do not lose them with the failure: one IOCTL each */
+			struct charsiu_bo b;
+
+			memset(&b, 0, sizeof(b));
+			for (i = 0; i < m7->clean_count; i++) {
+				b.handle = m7->clean[i];
+				(void)bo_sync(dev, IOCTL_RKNPU_FINI_BO, &b);
+			}
+		}
 		m7->clean_count = 0;
+		in->flags &= ~RKNPU_SUBMIT_CLEAN;
 	}
 	if (r) {
 		if (r == -EACCES)
@@ -713,6 +733,136 @@ static int submit_chunk(struct charsiu_device *dev, rknpu_submit_m7_in *m7)
 	dev->chunks++;
 	dev->tasks += in->task_count;
 	return 0;
+}
+
+/* M7: the FINI_BOs deferred so far go with the SUBMIT being built. Lock held. */
+static void take_defer(struct charsiu_device *dev, rknpu_submit_m7_in *m7)
+{
+	m7->clean_count = dev->ndefer;
+	memcpy(m7->clean, dev->defer, dev->ndefer * sizeof(m7->clean[0]));
+	dev->ndefer = 0;
+}
+
+/* ------------------------------------------------- M7: asynchronous SUBMIT */
+
+/*
+ * CHARSIU_RKNPU_ASYNC=1. charsiu issues a call's two SUBMITs one after the
+ * other from the decode thread, so the second core starts one SUBMIT IOCTL
+ * (about 95 us on the M6 board run) after the first, every call, 65 calls a
+ * token. With this each device has a thread that makes its SUBMIT IOCTL:
+ * charsiu_submit_jobs hands it the request and returns, and the two IOCTLs
+ * overlap (the driver serialises only its own short section of them).
+ *
+ * Every other call on the device (PREP, free, the next SUBMIT, close) first
+ * joins the request, so the device's order is unchanged. A SUBMIT that fails
+ * on the thread cannot fail charsiu_submit_jobs any more; it fails the next
+ * call that joins it (charsiu_bo_prep, whose result charsiu's decode path
+ * does not check, so the text is wrong) and EVERY later SUBMIT, which puts
+ * charsiu on the CPU. Hence a switch: no failure has been seen on the board
+ * since M6, and the bench compares the text.
+ *
+ * The thread spins for CHARSIU_RKNPU_ASYNC_SPIN_US (default 2000) after each
+ * request before it sleeps, because waking a sleeping thread costs about
+ * what the overlap saves; during a decode the next request comes within a
+ * millisecond, so the thread keeps one CPU busy while the NPU is decoding.
+ */
+static void *async_main(void *arg)
+{
+	struct charsiu_device *dev = arg;
+	long spin = env_long("CHARSIU_RKNPU_ASYNC_SPIN_US", 2000);
+
+	for (;;) {
+		unsigned long long t0 = rkx_now_us();
+		int st;
+
+		while ((st = __atomic_load_n(&dev->a_state, __ATOMIC_ACQUIRE)) != 1 &&
+		       !__atomic_load_n(&dev->a_stop, __ATOMIC_ACQUIRE) &&
+		       rkx_now_us() - t0 < (unsigned long long)spin)
+			rkx_relax();
+		if (st != 1) {
+			pthread_mutex_lock(&dev->a_mx);
+			while (__atomic_load_n(&dev->a_state, __ATOMIC_ACQUIRE) != 1 &&
+			       !__atomic_load_n(&dev->a_stop, __ATOMIC_ACQUIRE))
+				pthread_cond_wait(&dev->a_cv, &dev->a_mx);
+			pthread_mutex_unlock(&dev->a_mx);
+		}
+		if (__atomic_load_n(&dev->a_stop, __ATOMIC_ACQUIRE) &&
+		    __atomic_load_n(&dev->a_state, __ATOMIC_ACQUIRE) != 1)
+			return NULL;
+		dev->a_r = submit_chunk(dev, &dev->a_req);
+		pthread_mutex_lock(&dev->a_mx);
+		__atomic_store_n(&dev->a_state, 2, __ATOMIC_RELEASE);
+		pthread_cond_broadcast(&dev->a_cv);
+		pthread_mutex_unlock(&dev->a_mx);
+	}
+}
+
+/* The device's outstanding asynchronous SUBMIT, finished: its result, or 0
+ * if there was none. A failure sticks (see above). Lock held. */
+static int async_join(struct charsiu_device *dev)
+{
+	unsigned long long t0;
+	int r;
+
+	if (!dev->async)
+		return 0;
+	if (dev->a_err)
+		return dev->a_err;
+	if (__atomic_load_n(&dev->a_state, __ATOMIC_ACQUIRE) == 0)
+		return 0;
+	t0 = rkx_now_us();
+	while (__atomic_load_n(&dev->a_state, __ATOMIC_ACQUIRE) != 2 && rkx_now_us() - t0 < 200)
+		rkx_relax();
+	if (__atomic_load_n(&dev->a_state, __ATOMIC_ACQUIRE) != 2) {
+		pthread_mutex_lock(&dev->a_mx);
+		while (__atomic_load_n(&dev->a_state, __ATOMIC_ACQUIRE) != 2)
+			pthread_cond_wait(&dev->a_cv, &dev->a_mx);
+		pthread_mutex_unlock(&dev->a_mx);
+	}
+	r = dev->a_r;
+	__atomic_store_n(&dev->a_state, 0, __ATOMIC_RELEASE);
+	dev->async_n++;
+	if (r) {
+		dev->a_err = r;
+		fprintf(stderr, "charsiu: rknpu asynchronous SUBMIT failed (%d); every later SUBMIT "
+			"on device %u fails with it (CHARSIU_RKNPU_ASYNC=0 to run without)\n", r, dev->index);
+	}
+	return r;
+}
+
+static void async_post(struct charsiu_device *dev, const rknpu_submit_m7_in *m7)
+{
+	dev->a_req = *m7;
+	pthread_mutex_lock(&dev->a_mx);
+	__atomic_store_n(&dev->a_state, 1, __ATOMIC_RELEASE);
+	pthread_cond_broadcast(&dev->a_cv);
+	pthread_mutex_unlock(&dev->a_mx);
+}
+
+static void async_start(struct charsiu_device *dev)
+{
+	pthread_mutex_init(&dev->a_mx, NULL);
+	pthread_cond_init(&dev->a_cv, NULL);
+	if (pthread_create(&dev->a_th, NULL, async_main, dev)) {
+		pthread_cond_destroy(&dev->a_cv);
+		pthread_mutex_destroy(&dev->a_mx);
+		return;
+	}
+	dev->async = 1;
+}
+
+static void async_stop(struct charsiu_device *dev)
+{
+	if (!dev->async)
+		return;
+	pthread_mutex_lock(&dev->a_mx);
+	__atomic_store_n(&dev->a_stop, 1, __ATOMIC_RELEASE);
+	pthread_cond_broadcast(&dev->a_cv);
+	pthread_mutex_unlock(&dev->a_mx);
+	pthread_join(dev->a_th, NULL);
+	pthread_cond_destroy(&dev->a_cv);
+	pthread_mutex_destroy(&dev->a_mx);
+	dev->async = 0;
 }
 
 /* The bytes the PC fetches for a stream, as the driver's arena counts them. */
@@ -737,12 +887,16 @@ int charsiu_submit_jobs(struct charsiu_device *dev,
 		return -EINVAL;
 
 	pthread_mutex_lock(&dev->lock);
+	r = async_join(dev);
+	if (r)
+		goto out;
 	dev->submits++;
 	/* rocket would queue behind the entity's last job; here it runs after it */
 	r = dev_wait(dev, DEV_WAIT_MS);
 	if (r)
 		goto out;
 	memset(&m7, 0, sizeof(m7));
+	take_defer(dev, &m7);
 	for (i = 0; i < job_count; i++) {
 		for (t = 0; t < jobs[i].task_count; t++) {
 			const struct charsiu_task *k = &jobs[i].tasks[t];
@@ -771,7 +925,10 @@ int charsiu_submit_jobs(struct charsiu_device *dev,
 			bytes += b;
 		}
 	}
-	r = submit_chunk(dev, &m7);
+	if (dev->async)
+		async_post(dev, &m7);
+	else
+		r = submit_chunk(dev, &m7);
 out:
 	pthread_mutex_unlock(&dev->lock);
 	return r;

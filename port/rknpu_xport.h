@@ -38,6 +38,9 @@ int rkx_ioctl(struct rkx *x, unsigned int code, const void *in, unsigned int inl
 /* Sleep about `us` microseconds, or just yield the CPU for 0. */
 void rkx_pause(unsigned int us);
 
+/* A spinning thread's pause: the CPU's YIELD hint (M7). */
+void rkx_relax(void);
+
 /* A monotonic clock in microseconds. */
 unsigned long long rkx_now_us(void);
 

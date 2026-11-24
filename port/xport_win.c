@@ -101,6 +101,11 @@ void rkx_pause(unsigned int us)
 		Sleep(us / 1000);
 }
 
+void rkx_relax(void)
+{
+	__asm__ __volatile__("yield" ::: "memory");
+}
+
 unsigned long long rkx_now_us(void)
 {
 	static LARGE_INTEGER f;
