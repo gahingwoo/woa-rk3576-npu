@@ -53,6 +53,16 @@ session cannot stop it, and writes a zip to collect afterwards.
    are in [performance](performance.md). `-IdleDisable` and `-Quick` are
    the optional controls.
 
+The SUBMIT split (M8) needs no extra step: `rknputest info` before and
+after the bench prints the driver's per-core phase sums, and every arm's
+`.err` has charsiu's per-device line. The one-arm before and after is the
+`-Quick` run, whose `short-m7submit` arm is M7's SUBMIT checks on the same
+driver; `bench.txt` prints its difference against the defaults and
+`decode.txt` the phases of both. A single arm moves by 3 to 6 ms a token
+for no reason ([performance](performance.md)), so read the phase rows (us a
+SUBMIT, which do not depend on the run's noise in the same way) first and
+the tok/s second; for a decision on tok/s, run `-Quick` twice.
+
 The performance counters have their own board check: register them, then
 watch them with `typeperf` while `rknputest m6` runs
 ([perfcounters](perfcounters.md), "Board test").

@@ -90,7 +90,8 @@
 #define RKNPU_FN_UNMAP_BO       0x818   /* undo MAP_BO */
 #define RKNPU_FN_WRITE_BO       0x819   /* copy into a buffer */
 #define RKNPU_FN_READ_BO        0x81A   /* copy out of a buffer */
-#define RKNPU_FN_RESERVED_LAST  0x81F   /* 0x81B..0x81F: RESERVED */
+#define RKNPU_FN_SUBMIT_STATS   0x81B   /* M8: where SUBMIT's time goes, per core */
+#define RKNPU_FN_RESERVED_LAST  0x81F   /* 0x81C..0x81F: RESERVED */
 
 /* ---- M4: what charsiu needs ---------------------------------------------- */
 /*
@@ -285,7 +286,9 @@ typedef struct rknpu_info {
     unsigned int pt_pages;              /* page-table pages the driver holds (directory included) */
     /* M7 (0 from an M6 driver) */
     unsigned int m7_version;            /* RKNPU_M7_VERSION */
-    unsigned int reserved[3];
+    /* M8 (0 from an M7 driver) */
+    unsigned int m8_version;            /* RKNPU_M8_VERSION */
+    unsigned int reserved[2];
 } rknpu_info;
 
 /* ---- READ_REGS ---------------------------------------------------------- */
@@ -550,6 +553,70 @@ typedef struct rknpu_wait_m7_in {
     unsigned int reserved;
 } rknpu_wait_m7_in;
 
+/* ---- M8: where SUBMIT's time goes ---------------------------------------- */
+/*
+ * The M7 board runs measured a SUBMIT at about 110 us, about 100 of it inside
+ * the driver's handler (drv_us). M8 splits that time into the phases below,
+ * two ways:
+ *
+ *   - SUBMIT returns the split of that one call when the output buffer is an
+ *     rknpu_submit_m8_out (the M7 output followed by phase_ns[]);
+ *   - IOCTL_RKNPU_SUBMIT_STATS returns the per-core sums since the driver
+ *     started, or since the last call that asked for a reset.
+ *
+ * And M8 makes two phases cheaper: the power and clock check reads only the
+ * registers the answer depends on (not the PLL), and the streams are checked
+ * in a cached copy that only the driver can see, which is then written to the
+ * copy arena in one go; M7 checked them in the arena itself, which is
+ * write-combined, so every entry was read from DRAM, twice (the rules, then
+ * the CBUF key). What runs is still exactly what was checked.
+ * RKNPU_SUBMIT_M7_PATH asks for M7's way of both, for a measurement.
+ */
+#define RKNPU_M8_VERSION        1       /* rknpu_info.m8_version */
+
+#define RKNPU_SUBMIT_M7_PATH    0x00000008u /* M8: M7's clock check and in-arena stream check */
+
+/* SUBMIT phases, in the order they run (phase_ns[] and the stats) */
+#define RKNPU_SP_ENTRY          0   /* the handler's entry to holding JobLock: input checks, the lock wait */
+#define RKNPU_SP_SAFE           1   /* the power and clock check (PMU and CRU reads) */
+#define RKNPU_SP_IDLE           2   /* OPERATION_ENABLE, and in bypass mode the IOMMU status reads */
+#define RKNPU_SP_ARENA          3   /* the copy arena (allocated once) and the wait for BoLock */
+#define RKNPU_SP_MMU            4   /* the IOMMU check (turned on again after a reset) */
+#define RKNPU_SP_CLEAN          5   /* M7's FINI_BOs riding on the SUBMIT (cache maintenance) */
+#define RKNPU_SP_COPY           6   /* the streams copied out of the caller's buffers */
+#define RKNPU_SP_CHECK          7   /* the stream rules and the CBUF key */
+#define RKNPU_SP_CBUF           8   /* the wait for the other core's job on the same CBUF window */
+#define RKNPU_SP_BOOK           9   /* job bookkeeping, breadcrumbs, the barrier */
+#define RKNPU_SP_START          10  /* the interrupt lock and the start registers */
+#define RKNPU_SP_TOTAL          11  /* the whole handler (= drv_us, in ns) */
+#define RKNPU_SUBMIT_PHASES     12
+
+typedef struct rknpu_submit_m8_out {
+    rknpu_submit_out base;
+    unsigned int phase_ns[RKNPU_SUBMIT_PHASES];
+} rknpu_submit_m8_out;
+
+/* SUBMIT_STATS, in (optional): flags. Out: rknpu_submit_stats. */
+#define RKNPU_STATS_RESET       0x00000001u /* zero the sums after reading them */
+
+typedef struct rknpu_submit_stats_in {
+    unsigned int flags;
+    unsigned int reserved;
+} rknpu_submit_stats_in;
+
+typedef struct rknpu_submit_core_stats {
+    unsigned long long submits;         /* SUBMITs that started a job */
+    unsigned long long phase_ns[RKNPU_SUBMIT_PHASES];
+} rknpu_submit_core_stats;
+
+typedef struct rknpu_submit_stats {
+    unsigned int version;               /* RKNPU_M8_VERSION */
+    unsigned int phases;                /* RKNPU_SUBMIT_PHASES */
+    rknpu_submit_core_stats core[RKNPU_NUM_CORES];
+} rknpu_submit_stats;
+
+#define IOCTL_RKNPU_SUBMIT_STATS CTL_CODE(RKNPU_DEVICE_TYPE, RKNPU_FN_SUBMIT_STATS, METHOD_BUFFERED, FILE_READ_ACCESS)
+
 #pragma pack(pop)
 
 /*
@@ -597,5 +664,8 @@ RKNPU_ASSERT_SIZE(rknpu_reset_in, 8);
 RKNPU_ASSERT_SIZE(rknpu_reset_out, 32);
 RKNPU_ASSERT_SIZE(rknpu_submit_m7_in, 664);
 RKNPU_ASSERT_SIZE(rknpu_wait_m7_in, 24);
+RKNPU_ASSERT_SIZE(rknpu_submit_m8_out, 64);
+RKNPU_ASSERT_SIZE(rknpu_submit_stats_in, 8);
+RKNPU_ASSERT_SIZE(rknpu_submit_stats, 216);
 
 #endif /* RKNPU_IOCTL_H */

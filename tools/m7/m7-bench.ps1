@@ -34,6 +34,9 @@
 #        short-idle    the processor idle-disable power setting for this arm
 #                      only (restored after): the /dev/cpu_dma_latency control
 #        short-npu1    CHARSIU_NPU_ONEDEV=1       one core
+#        short-m7submit CHARSIU_RKNPU_M7SUBMIT=1  M8 driver, M7's SUBMIT checks (the
+#                      full clock read, streams checked in the arena): the
+#                      control for what M8 changed inside SUBMIT
 #        stages        CHARSIU_STAGES=1, 32 tokens, M7 defaults
 #        stages-m6     CHARSIU_STAGES=1, 32 tokens, as short-m6 (with the cache)
 #        long-npu / long-m6   the 515-token prompt, 64 tokens (long-m6 with the cache)
@@ -89,12 +92,13 @@ $armList = @(
     @{ Name = 'short-async';   Args = $short; Env = @{ CHARSIU_RKNPU_ASYNC = '1' }; Cache = $true },
     @{ Name = 'short-idle';    Args = $short; Env = @{}; Cache = $true; Idle = $true },
     @{ Name = 'short-npu1';    Args = $short; Env = @{ CHARSIU_NPU_ONEDEV = '1' }; Cache = $true },
+    @{ Name = 'short-m7submit'; Args = $short; Env = @{ CHARSIU_RKNPU_M7SUBMIT = '1' }; Cache = $true },
     @{ Name = 'stages';        Args = "-p `"$prompt`" -n 32 -c 512"; Env = @{ CHARSIU_STAGES = '1' }; Cache = $true },
     @{ Name = 'stages-m6';     Args = "-p `"$prompt`" -n 32 -c 512"; Env = ($m6env + @{ CHARSIU_STAGES = '1' }); Cache = $true },
     @{ Name = 'long-npu';      Args = 'LONG'; Env = @{}; Cache = $true },
     @{ Name = 'long-m6';       Args = 'LONG'; Env = $m6env; Cache = $true }
 )
-$quickArms = 'short-m6', 'short-npu', 'short-npu2', 'stages', 'stages-m6'
+$quickArms = 'short-m6', 'short-npu', 'short-npu2', 'short-m7submit', 'stages', 'stages-m6'
 
 # ---- the tables ------------------------------------------------------------------
 
@@ -141,6 +145,21 @@ function Read-Arm($dir, $name) {
             $slept += [double]$t.Groups[8].Value; $wakeUs += [double]$t.Groups[8].Value * [double]$t.Groups[7].Value
             $bySub += [double]$t.Groups[10].Value; $byWait += [double]$t.Groups[11].Value
         }
+    }
+    # M8: the driver's split of a SUBMIT, us, the mean of the devices
+    $phN = 0; $ph = @{}
+    foreach ($l in $err) {
+        $q = [regex]::Match($l, '^charsiu rknpu dev \d+ submit phases: us a SUBMIT, (.*?)( \(|$)')
+        if ($q.Success) {
+            $phN++
+            foreach ($kv in ($q.Groups[1].Value -split ', ')) {
+                $kp = $kv -split ' '
+                if ($kp.Count -eq 2) { $ph[$kp[0]] = [double]$ph[$kp[0]] + [double]$kp[1] }
+            }
+        }
+    }
+    foreach ($k in 'entry', 'safe', 'idle', 'arena', 'mmu', 'clean', 'copy', 'check', 'cbuf', 'book', 'start', 'total') {
+        $a["sp_$k"] = if ($phN) { [double]$ph[$k] / $phN } else { $null }
     }
     $a.devices = $devs
     $a.errors = $bad
@@ -239,7 +258,7 @@ function Write-Tables($dir) {
         [void]$L.Add('')
         [void]$L.Add('each arm against short-npu2 (the M7 defaults). For an arm that turns a default OFF, + is what')
         [void]$L.Add('that default saves; for short-spin, short-async and short-idle, which turn an option ON, - is a gain:')
-        foreach ($x in 'short-noucache', 'short-nofuse', 'short-nopin', 'short-pthread', 'short-spin', 'short-noqos', 'short-async', 'short-idle', 'short-npu1') {
+        foreach ($x in 'short-m7submit', 'short-noucache', 'short-nofuse', 'short-nopin', 'short-pthread', 'short-spin', 'short-noqos', 'short-async', 'short-idle', 'short-npu1') {
             $r = $rows | Where-Object { $_.arm -eq $x } | Select-Object -First 1
             if ($r -and $r.ms_token) { [void]$L.Add(('  {0,-14} {1,6:N2} tok/s  {2,6:N1} ms a token  {3,7:+0.0;-0.0} ms' -f $x, $r.gen_tok_s, $r.ms_token, ($r.ms_token - $base.ms_token))) }
         }
@@ -259,7 +278,7 @@ function Write-Tables($dir) {
     [void]$D.Add("Linux reference: $linuxTokS tok/s = $('{0:N1}' -f (1000 / $linuxTokS)) ms a token.")
     [void]$D.Add('')
     $cols = @($rows | Where-Object { $_.devices -gt 0 -and $_.gen_tok })
-    $fmt = '{0,-34}' + (($cols | ForEach-Object { '{' + ([array]::IndexOf($cols, $_) + 1) + ',13}' }) -join '')
+    $fmt = '{0,-34}' + (($cols | ForEach-Object { '{' + ([array]::IndexOf($cols, $_) + 1) + ',16}' }) -join '')
     function Row($label, $sel) {
         $vals = @($label) + @($cols | ForEach-Object { & $sel $_ })
         [void]$D.Add(($fmt -f $vals))
@@ -282,6 +301,11 @@ function Write-Tables($dir) {
     Row 'interrupt to DPC, us' { param($r) R1 $r.irq_dpc_us }
     Row 'DPC to the waiter running, us' { param($r) R1 $r.dpc_wake_us }
     Row 'decode thread pinned' { param($r) $r.pinned }
+    Row 'inside SUBMIT (M8 driver), us:' { param($r) '' }
+    foreach ($k in 'entry', 'safe', 'idle', 'arena', 'mmu', 'clean', 'copy', 'check', 'cbuf', 'book', 'start', 'total') {
+        $kk = "sp_$k"
+        Row "  $k" ([scriptblock]::Create("param(`$r) R2 `$r.$kk"))
+    }
     [void]$D.Add('')
     foreach ($r in $cols) { if ($r.fit) { [void]$D.Add(('{0,-14} {1}' -f $r.arm, $r.fit)) } }
     foreach ($r in $cols) { if ($r.hold) { [void]$D.Add(('{0,-14} {1}' -f $r.arm, $r.hold)); break } }
