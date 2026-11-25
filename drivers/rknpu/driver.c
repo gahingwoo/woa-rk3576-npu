@@ -16,7 +16,9 @@
  *     IOMMU; interrupt 1 = GSIV 280, core 1 and its IOMMU). The ISR acks
  *     what it finds, the DPC counts. No job is ever started in M2, so the
  *     counts are expected to stay 0;
- *   - creates \\.\RKNPU, administrators and SYSTEM only, one handle at a
+ *   - creates \\.\RKNPU, administrators and SYSTEM only (interactive users
+ *     too with Device Parameters\UserAccess = 1 and the IOMMU on: see
+ *     NpuEvtFileCreate), one handle at a
  *     time, with GET_INFO and READ_REGS. Both only read.
  *
  * The only register writes this driver makes, all to the PC block of a
@@ -60,6 +62,7 @@ EVT_WDF_INTERRUPT_DPC NpuEvtDpc;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL NpuEvtIoDeviceControl;
 EVT_WDF_IO_IN_CALLER_CONTEXT NpuEvtIoInCallerContext;
 EVT_WDF_FILE_CLEANUP NpuEvtFileCleanup;
+EVT_WDF_DEVICE_FILE_CREATE NpuEvtFileCreate;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP NpuEvtDeviceCleanup;
 
 #define REGS_MIN_LEN    RKNPU_REGS_WINDOW
@@ -609,6 +612,73 @@ NpuCreateInterrupt(
     return status;
 }
 
+/*
+ * WHO MAY OPEN \\.\RKNPU. The device's security descriptor (this SDDL, and
+ * the same string as the device's Security value in rknpu.inf, which PnP
+ * applies to the whole stack whatever the setup class) lets SYSTEM,
+ * administrators and interactive users ask; this callback decides.
+ *
+ * SYSTEM and administrators: always. An interactive user who is neither:
+ * only with Device Parameters\UserAccess = 1 (set by charsiu-install.ps1,
+ * read when the device is added, so it takes a restart) AND the IOMMU on.
+ * In IOMMU mode every address a stream can program is one of five
+ * registers, each checked against the caller's own buffers (m3.c), and the
+ * NPU reaches only mapped buffers; in bypass mode (M6Iommu = 0, or
+ * M4AllowUnlisted = 1, or an IOMMU that could not be set up at start) a
+ * stream's unchecked sizes reach physical memory, so it stays SYSTEM and
+ * administrators only. On Linux the accel node is the video group's.
+ */
+static BOOLEAN
+NpuCallerIsAdmin(
+    _In_ WDFREQUEST Request
+    )
+{
+    PIRP irp = WdfRequestWdmGetIrp(Request);
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
+    PIO_SECURITY_CONTEXT sc = sp->Parameters.Create.SecurityContext;
+
+    if (!sc || !sc->AccessState)
+        return FALSE;
+    /* LocalSystem's token carries BUILTIN\Administrators, so SYSTEM passes */
+    return SeTokenIsAdmin(SeQuerySubjectContextToken(&sc->AccessState->SubjectSecurityContext));
+}
+
+VOID
+NpuEvtFileCreate(
+    _In_ WDFDEVICE Device,
+    _In_ WDFREQUEST Request,
+    _In_ WDFFILEOBJECT FileObject
+    )
+{
+    PDEVICE_CONTEXT ctx = GetContext(Device);
+
+    UNREFERENCED_PARAMETER(FileObject);
+    if (WdfRequestGetRequestorMode(Request) == UserMode && !NpuCallerIsAdmin(Request) &&
+        !(ctx->UserAccess && ctx->Mmu.On)) {
+        WdfRequestComplete(Request, STATUS_ACCESS_DENIED);
+        return;
+    }
+    WdfRequestComplete(Request, STATUS_SUCCESS);
+}
+
+/* Device Parameters values that decide the device's security, read before
+ * the device object exists (m3.c reads the rest at start). */
+static ULONG
+NpuInitQueryULong(
+    _In_ WDFKEY Key,
+    _In_ PCWSTR Name,
+    _In_ ULONG Default
+    )
+{
+    UNICODE_STRING n;
+    ULONG v;
+
+    RtlInitUnicodeString(&n, Name);
+    if (NT_SUCCESS(WdfRegistryQueryULong(Key, &n, &v)))
+        return v;
+    return Default;
+}
+
 NTSTATUS
 NpuEvtDeviceAdd(
     _In_ WDFDRIVER Driver,
@@ -625,7 +695,11 @@ NpuEvtDeviceAdd(
     ULONG n;
     DECLARE_CONST_UNICODE_STRING(name, RKNPU_NT_NAME);
     DECLARE_CONST_UNICODE_STRING(link, RKNPU_DOS_NAME);
-    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    /* the same string as rknpu.inf's Security value; NpuEvtFileCreate decides
+     * which interactive users get in */
+    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
+    BOOLEAN userAccess = FALSE;
+    WDFKEY key;
 
     UNREFERENCED_PARAMETER(Driver);
 
@@ -637,7 +711,7 @@ NpuEvtDeviceAdd(
     pnp.EvtDeviceD0ExitPreInterruptsDisabled = NpuEvtD0ExitPreInterrupts;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnp);
 
-    WDF_FILEOBJECT_CONFIG_INIT(&fcfg, WDF_NO_EVENT_CALLBACK, WDF_NO_EVENT_CALLBACK, NpuEvtFileCleanup);
+    WDF_FILEOBJECT_CONFIG_INIT(&fcfg, NpuEvtFileCreate, WDF_NO_EVENT_CALLBACK, NpuEvtFileCleanup);
     WdfDeviceInitSetFileObjectConfig(DeviceInit, &fcfg, WDF_NO_OBJECT_ATTRIBUTES);
     WdfDeviceInitSetIoInCallerContextCallback(DeviceInit, NpuEvtIoInCallerContext);
 
@@ -647,6 +721,13 @@ NpuEvtDeviceAdd(
     status = WdfDeviceInitAssignName(DeviceInit, &name);
     if (!NT_SUCCESS(status))
         return status;
+    if (NT_SUCCESS(WdfFdoInitOpenRegistryKey(DeviceInit, PLUGPLAY_REGKEY_DEVICE, KEY_READ,
+                                             WDF_NO_OBJECT_ATTRIBUTES, &key))) {
+        userAccess = NpuInitQueryULong(key, L"UserAccess", 0) == 1 &&
+                     NpuInitQueryULong(key, L"M6Iommu", 1) != 0 &&
+                     NpuInitQueryULong(key, L"M4AllowUnlisted", 0) != 1;
+        WdfRegistryClose(key);
+    }
     status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
     if (!NT_SUCCESS(status))
         return status;
@@ -659,6 +740,9 @@ NpuEvtDeviceAdd(
 
     ctx = GetContext(device);
     ctx->Device = device;
+    ctx->UserAccess = userAccess;
+    if (userAccess)
+        RKNPU_LOG("UserAccess = 1: interactive users may open the device in IOMMU mode");
     status = NpuM3DeviceInit(ctx);
     if (!NT_SUCCESS(status))
         return status;

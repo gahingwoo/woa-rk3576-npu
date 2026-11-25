@@ -45,6 +45,9 @@ __attribute__((constructor)) static void compat_binary_stdio(void)
 	_setmode(_fileno(stderr), _O_BINARY);
 	/* the console shows charsiu's UTF-8 as UTF-8 (a file gets the bytes anyway) */
 	SetConsoleOutputCP(CP_UTF8);
+	/* and a conversation typed into it reaches the model as UTF-8, not in
+	 * the console's own code page (936 on a Chinese Windows) */
+	SetConsoleCP(CP_UTF8);
 }
 
 /* -------------------------------------------------------------- mmap */

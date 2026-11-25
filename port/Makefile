@@ -49,7 +49,8 @@ LLM := $(CHARSIU)/src/gguf.c $(CHARSIU)/src/tokenizer.c $(CHARSIU)/src/llama.c \
 DEV_WIN  := device_rknpu.c xport_win.c compat/compat_win.c
 DEV_FAKE := device_rknpu.c test/xport_fake.c
 
-WIN_EXE := $(B)/win/charsiu_run.exe $(B)/win/charsiu_matmul.exe $(B)/win/npu_gemm_test.exe
+WIN_EXE := $(B)/win/charsiu_run.exe $(B)/win/charsiu_matmul.exe $(B)/win/npu_gemm_test.exe \
+           $(B)/win/charsiu_serve.exe $(B)/win/charsiu_check.exe
 
 all: win
 
@@ -64,16 +65,32 @@ $(B)/win/libm/%.o: libm/%.c | $(B)/win
 # 16 MiB of stack for every thread, as near Linux's 8 MiB default as matters
 WLDFLAGS := -static -Wl,--stack,16777216 -lpthread -lpowrprof
 WDEFS    = -Icompat $(CPPFLAGS_C) -DCHARSIU_BUILD=\"$(COMMIT)-win-$(PORTREV)\"
+WRC      := $(if $(LLVM_MINGW),$(LLVM_MINGW)/bin/)aarch64-w64-mingw32-windres
+
+# Every exe carries win/utf8.manifest: the process code page is UTF-8, so a
+# model path under a user name such as C:\Users\<Chinese name> reaches fopen
+# and argv intact instead of through the ANSI code page.
+$(B)/win/utf8.o: win/utf8.rc win/utf8.manifest | $(B)/win
+	$(WRC) -I win -O coff -o $@ win/utf8.rc
 
 $(B)/win/charsiu_run.exe: $(CHARSIU)/tools/charsiu_run.c $(CHARSIU)/src/vision.c $(CHARSIU)/src/image.c \
-                          $(LLM) $(DEV_WIN) $(LIBM_WOBJ) | $(B)/win
+                          $(LLM) $(DEV_WIN) $(LIBM_WOBJ) $(B)/win/utf8.o | $(B)/win
 	$(WCC) $(CFLAGS_C) $(WDEFS) -o $@ $^ $(WLDFLAGS)
 
 $(B)/win/charsiu_matmul.exe: $(CHARSIU)/tools/charsiu_matmul.c $(CHARSIU)/src/job.c $(CHARSIU)/src/regcmd.c \
-                             $(DEV_WIN) $(LIBM_WOBJ) | $(B)/win
+                             $(DEV_WIN) $(LIBM_WOBJ) $(B)/win/utf8.o | $(B)/win
 	$(WCC) $(CFLAGS_C) $(WDEFS) -o $@ $^ $(WLDFLAGS)
 
-$(B)/win/npu_gemm_test.exe: $(CHARSIU)/tools/npu_gemm_test.c $(LLM) $(DEV_WIN) $(LIBM_WOBJ) | $(B)/win
+$(B)/win/npu_gemm_test.exe: $(CHARSIU)/tools/npu_gemm_test.c $(LLM) $(DEV_WIN) $(LIBM_WOBJ) $(B)/win/utf8.o | $(B)/win
+	$(WCC) $(CFLAGS_C) $(WDEFS) -o $@ $^ $(WLDFLAGS)
+
+# charsiu serve: the same OpenAI endpoint as on Linux, over Winsock
+$(B)/win/charsiu_serve.exe: $(CHARSIU)/tools/charsiu_serve.c $(LLM) $(DEV_WIN) $(LIBM_WOBJ) $(B)/win/utf8.o | $(B)/win
+	$(WCC) $(CFLAGS_C) $(WDEFS) -o $@ $^ $(WLDFLAGS) -lws2_32
+
+# the gate charsiu pull runs on every download: the gguf parser (the device
+# layer only because compat_win.c reports through it)
+$(B)/win/charsiu_check.exe: $(CHARSIU)/tools/charsiu_check.c $(CHARSIU)/src/gguf.c $(CHARSIU)/src/job.c $(CHARSIU)/src/regcmd.c $(DEV_WIN) $(LIBM_WOBJ) $(B)/win/utf8.o | $(B)/win
 	$(WCC) $(CFLAGS_C) $(WDEFS) -o $@ $^ $(WLDFLAGS)
 
 # The math must come from libm.o, not from UCRT: no exe may import these.

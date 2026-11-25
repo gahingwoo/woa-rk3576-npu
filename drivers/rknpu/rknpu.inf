@@ -66,6 +66,22 @@ CopyFiles = RKNPU_CopyFiles
 rknpu.sys
 rknpu.man
 
+; WHO MAY OPEN THE DEVICE, set on the device itself. PnP applies a device's
+; Security value to every device object in its stack, and without one the
+; class decides: moving from System to ComputeAccelerator left an elevated
+; administrator with ERROR_ACCESS_DENIED (only SYSTEM could open it) on the
+; board. So it is stated here, and it is the same SDDL rknpu.sys assigns.
+; Interactive users are in it, but the driver's file create callback admits
+; one only with Device Parameters\UserAccess = 1 in IOMMU mode (driver.c);
+; everyone else who is not SYSTEM or an administrator is refused there.
+; FILE_DEVICE_SECURE_OPEN (0x100): the same check for \\.\RKNPU\anything.
+[RKNPU_Inst.NT.HW]
+AddReg = RKNPU_HwReg
+
+[RKNPU_HwReg]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)"
+HKR,,DeviceCharacteristics,0x10001,0x100
+
 [RKNPU_Inst.NT.Services]
 AddService = rknpu,0x00000002,RKNPU_Service
 

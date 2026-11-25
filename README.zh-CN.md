@@ -28,7 +28,7 @@
 | M5 | 性能 | 由 M6 和 M7 完成 |
 | M6 | 驱动管理 NPU 的 IOMMU、可缓存缓冲区、双核 | 通过，2026-11-24：12.12 tok/s |
 | M7 | 和 Linux 对比的解码性能 | 2026-11-24 合并：默认设置 14.23 tok/s |
-| M8 | 安装脚本、`charsiu serve` | 未开始 |
+| M8 | 安装脚本、`charsiu` 命令、`charsiu serve` | charsiu-windows 分支代码完成，未板测（[docs/zh-CN/charsiu.md](docs/zh-CN/charsiu.md)） |
 
 每个里程碑的计划和板上记录见[历史记录](docs/history/README.md)（英文）。
 

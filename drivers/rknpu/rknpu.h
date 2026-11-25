@@ -288,6 +288,8 @@ typedef struct _DEVICE_CONTEXT {
     JOB_RECORD      History[RKNPU_JOB_HISTORY];     /* JobLock */
     ULONG           HistoryAt;
     BOOLEAN         AllowUnlisted;  /* Device Parameters\M4AllowUnlisted, read at start */
+    BOOLEAN         UserAccess;     /* Device Parameters\UserAccess = 1 and the IOMMU asked for:
+                                     * interactive users may open \\.\RKNPU (driver.c) */
     volatile LONG   UnlistedLogged;
 
     /* M6 */
