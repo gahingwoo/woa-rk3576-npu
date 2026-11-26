@@ -1,8 +1,8 @@
 # 在 Windows 下使用 NPU
 
-在立创泰山派 3M 的 Windows 11 23H2 上打开 NPU、安装驱动，并用 charsiu 跑模型。[English](../use.md)
+在 Windows 11 23H2 上打开 NPU、安装驱动，并用 charsiu 跑模型。这些步骤是在立创泰山派 3M 上跑的；在 Radxa ROCK 4D 上驱动也能同样绑定（下面的速度是泰山派的）。[English](../use.md)
 
-Windows 本身用 [woa-rk3576](https://github.com/gahingwoo/woa-rk3576/blob/main/docs/zh-CN/install.md) 安装。`charsiu` 安装脚本（[charsiu.md](charsiu.md)）可以代做第 3 到 6 步，但只在 CI 里跑过；下面的步骤是在板子上实际跑过的。
+Windows 本身用 [woa-rk3576](https://github.com/gahingwoo/woa-rk3576/blob/main/docs/INSTALL.zh-CN.md) 安装。`charsiu` 安装脚本（[charsiu.md](charsiu.md)）可以代做第 3 到 6 步，但只在 CI 里跑过；下面的步骤是在板子上实际跑过的。
 
 ## 需要准备
 
@@ -76,7 +76,7 @@ woa-rk3576 的 `rk3576-tools-arm64` 工具包会自动注册，其中的 rk-moni
 | 12.91 tok/s 而不是 16 | 没装风扇，SoC 降频（2026-11-25 那次没开风扇） |
 | 普通命令提示符打不开 `\\.\RKNPU` | 默认只有管理员能用，除非设了 `UserAccess = 1`（[charsiu.md](charsiu.md#谁能用-npu)） |
 | 没有 `ACPI\RKCP3576` 设备 | 设置里的 "NPU (experimental)" 没打开，它默认关闭 |
-| ArmSoM CM5-IO | 它的固件没有 NPU 选项 |
+| ArmSoM CM5-IO | 它的固件没有 NPU 选项（ROCK 4D 的固件有，在 edk2-rk3576 `main` 上） |
 
 ## 撤销
 
