@@ -1,186 +1,89 @@
 # Performance counters
 
-rknpu.sys publishes its job statistics as Windows performance counters, so
-perfmon, `typeperf`, `Get-Counter` and any PDH program (the rk-monitor tray
-app in woa-rk3576, for one) can show what the NPU is doing. Windows 11 23H2,
-the newest release this board runs, has no NPU page in Task Manager; these
-counters are the way to watch it.
+rknpu.sys publishes its job statistics as Windows performance counters, for
+perfmon, `typeperf`, `Get-Counter` and any PDH program (rk-monitor in
+woa-rk3576, for one). Task Manager on 23H2 has no NPU page; these counters
+are the way to watch the NPU.
 
-## What there is
+## Counters
 
 **`RK3576 NPU`**, one instance per core, `core0` and `core1`:
 
-| counter | type | meaning |
-|---|---|---|
-| `% Busy Time` | 100 ns timer | share of the interval in which a job held the core, from its first task's `OPERATION_ENABLE` to its last interrupt. A running job counts up to the moment of the query |
-| `Jobs/sec` | rate | jobs completed per second (one job is one SUBMIT, possibly several tasks) |
-| `Tasks/sec` | rate | tasks finished per second |
-| `Avg. Job Time (us)` | average | job time on the core over the jobs that ended in the interval |
-| `Avg. Submit to Complete (us)` | average | SUBMIT entering the driver to the driver completing the job in its DPC. Includes a wait for the other core on the same CBUF window |
-| `Jobs Submitted`, `Jobs Completed` | totals | since the driver started |
-| `Job Timeouts`, `Core Resets`, `IOMMU Faults`, `CBUF Waits` | totals | the same numbers `rknputest info` prints |
-| `Job Running` | 0 or 1 | a job is on the core now |
+| counter | meaning |
+|---|---|
+| `% Busy Time` | share of the interval a job held the core, first task's `OPERATION_ENABLE` to last interrupt |
+| `Jobs/sec`, `Tasks/sec` | jobs (one SUBMIT) and tasks completed per second |
+| `Avg. Job Time (us)` | job time on the core, over the jobs that ended in the interval |
+| `Avg. Submit to Complete (us)` | SUBMIT entering the driver to completion in the DPC, including any wait for the other core's CBUF window |
+| `Jobs Submitted`, `Jobs Completed` | totals since the driver started |
+| `Job Timeouts`, `Core Resets`, `IOMMU Faults`, `CBUF Waits` | totals, the numbers `rknputest info` prints |
+| `Job Running` | 0 or 1 |
 
-**`RK3576 NPU Memory`**, one instance: `Buffer Bytes` and `Buffers` (every
-NPU buffer that exists, all handles together), `NPU Address Space Bytes`
-(mapped through the IOMMU; 0 in bypass mode) and `Page Table Pages`.
+**`RK3576 NPU Memory`**: `Buffer Bytes`, `Buffers` (all handles together),
+`NPU Address Space Bytes` (0 in bypass mode), `Page Table Pages`.
 
-The averages and rates are computed by the consumer from two samples, so the
-first sample after starting perfmon or `typeperf` shows 0.
+Rates and averages need two samples, so the first sample shows 0.
 
 ## How it works
 
-The driver is a kernel-mode PCW provider (`drivers/rknpu/perf.c`), built as
-the WDK's kcs sample is: `drivers/rknpu/rknpu.man` is the counter manifest,
-ctrpp turns it into `rknpuCounters.h` (the `RknpuRegisterNpuCore`,
-`RknpuAddNpuCore`, ... helpers) and `rknpuCounters.rc` (the names, linked
-into rknpu.sys). Both counter sets use a callback: nothing is computed until
-a consumer asks.
-
-The job path adds a few 64-bit sums under the interrupt lock it already
-holds, from the timestamps M3 and M7 already take (T0, T1, T2 and the
-SUBMIT's entry time); `CORE_PERF` in `rknpu.h` has them. The callback reads
-a consistent copy through a sequence count, without taking any lock, and
-converts QPC ticks to 100 ns and microseconds only then.
-
-If registration fails, the driver logs `performance counters: ... not
-registered` and runs as before. If the provider was never installed with
-lodctr, the driver also runs as before; the counter sets are just not
-visible.
+The driver is a kernel-mode PCW provider (`drivers/rknpu/perf.c`).
+`rknpu.man` is the manifest; ctrpp turns it into `rknpuCounters.h` and
+`rknpuCounters.rc`. The job path adds a few 64-bit sums under the interrupt
+lock it already holds (`CORE_PERF` in `rknpu.h`); the callback reads a
+consistent copy through a sequence count, without a lock, only when a
+consumer asks. If registration fails, or the provider was never installed,
+the driver runs as before and the sets are just not visible.
 
 ## Installing
 
-An INF has no directive that registers a counter provider. The INF copies
-`rknpu.man` into the driver store beside `rknpu.sys`, and
-`tools\rknpu-perfcounters.ps1`, as administrator, runs
+An INF cannot register a counter provider. The INF copies `rknpu.man` beside
+`rknpu.sys` in the driver store, and `tools\rknpu-perfcounters.ps1`, as
+administrator, runs `unlodctr` and `lodctr /m:` against the folder the
+running rknpu.sys was loaded from. A new driver package is a new folder, so
+run the script again after each driver install. `-Uninstall` only
+unregisters. Log: `%SystemRoot%\Temp\rknpu-perfcounters.log`.
 
-```
-unlodctr /g:{6f33a325-aa80-4286-b76c-0b11e14f9f2b}
-lodctr /m:<driver store folder>\rknpu.man <driver store folder>
-```
-
-with the folder the running rknpu.sys was loaded from. lodctr records that
-rknpu.sys as the file the names come from, so after reinstalling a new
-package (a new driver store folder) run the script again. `-Uninstall` only
-runs the unlodctr. Its log is `%SystemRoot%\Temp\rknpu-perfcounters.log`.
-
-### With the RK3576 tools bundle
-
-woa-rk3576 builds a bundle, the CI artifact `rk3576-tools-arm64`, with
-rk-monitor, this repository's `rknputest.exe`, `charsiu_run.exe` and
-`rknpu-perfcounters.ps1` (woa-rk3576 `tools/rk3576-tools/README.md`). Its
-`install.cmd` puts them into `%ProgramFiles%\RK3576` and registers these
-counters and maliwddm's on its own, from the manifests in the driver store,
-with a SYSTEM task at every start that registers them again when a driver
-update moved them. With the bundle installed, the manual step above is not
-needed. The bundle is built from the commit of this repository that
-woa-rk3576's `NPU_REF` names.
+The woa-rk3576 `rk3576-tools-arm64` bundle (its `install.cmd`) registers
+these counters and maliwddm's itself, and again at every start when a driver
+update moved them.
 
 ## Viewing
 
-**perfmon**: `perfmon /sys`, the green plus, then `RK3576 NPU`, all
-instances, `% Busy Time` and `Jobs/sec`. The report view (Ctrl+G twice)
-shows every counter as a number.
-
-**PowerShell**:
-
 ```
 Get-Counter -ListSet "RK3576 NPU" | Select-Object -ExpandProperty Counter
-Get-Counter "\RK3576 NPU(*)\*" -SampleInterval 1 -MaxSamples 5
 Get-Counter "\RK3576 NPU(*)\% Busy Time", "\RK3576 NPU(*)\Jobs/sec" -Continuous
 Get-Counter "\RK3576 NPU Memory\*"
-```
-
-**typeperf** (CSV, good for a log file):
-
-```
-typeperf -q "RK3576 NPU"
-typeperf "\RK3576 NPU(*)\% Busy Time" "\RK3576 NPU(*)\Jobs/sec" "\RK3576 NPU(*)\Avg. Submit to Complete (us)" -si 1
 typeperf "\RK3576 NPU(*)\*" "\RK3576 NPU Memory\*" -si 1 -sc 120 -o R:\npu\perf\counters.csv -y
 ```
 
-## Board test
+perfmon: `perfmon /sys`, the green plus, `RK3576 NPU`, all instances; Ctrl+G
+twice for the report view.
 
-You need the `rknpu-m7-arm64` artifact of the CI run on branch
-`npu-perfcounters` (driver, `rknputest.exe`, `signer.cer`,
-`rknpu-reinstall.ps1`, `rknpu-perfcounters.ps1`, `DriverVer.txt`). Unpack it
-into `R:\npu\perf`. Delete the previous unbound rknpu packages from the
-driver store first (`pnputil /enum-drivers`, then `pnputil /delete-driver
-oemNN.inf` for each rknpu one that is not bound), as with every test.
+## Board check
 
-**1. Stage the driver**, as administrator, after `w32tm /resync /force`:
+With the driver installed ([use](../use.md)):
 
-```
-certutil -addstore -f Root R:\npu\perf\signer.cer
-certutil -addstore -f TrustedPublisher R:\npu\perf\signer.cer
-pnputil /add-driver R:\npu\perf\rknpu\rknpu.inf
-```
+1. `rknpu-perfcounters.ps1` ends with `RK3576 NPU: 12 counters, instances
+   core0, core1` and `RK3576 NPU Memory: 4 counters`.
+2. Idle: `typeperf "\RK3576 NPU(*)\*" "\RK3576 NPU Memory\*" -si 1 -sc 10`
+   shows 0 busy, 0 jobs/s, 0 buffers.
+3. Load, with the `typeperf ... -o m6-counters.csv` log running:
+   `rknputest m6 --iters 2000`, then `m6 --iters 200 --mb 0 --collide`,
+   then `m6 --iters 20 --mb 0 --fault`.
 
-**2. Mark the device for reinstall, as SYSTEM, then reboot:**
+What confirms it:
 
-```
-schtasks /create /tn rknpu-reinstall /sc once /st 23:59 /ru SYSTEM /f /tr "powershell -NoProfile -ExecutionPolicy Bypass -File R:\npu\perf\rknpu-reinstall.ps1"
-schtasks /run /tn rknpu-reinstall
-schtasks /delete /tn rknpu-reinstall /f
-shutdown /r /t 0
-```
-
-**3. Check the binding** after the reboot:
-
-```
-pnputil /enum-devices /instanceid "ACPI\RKCP3576\0" /drivers
-R:\npu\perf\rknputest.exe info
-```
-
-The bound driver's version is the one in `DriverVer.txt`.
-
-**4. Register the counters**, as administrator:
-
-```
-powershell -NoProfile -ExecutionPolicy Bypass -File R:\npu\perf\rknpu-perfcounters.ps1
-```
-
-It ends with `RK3576 NPU: 12 counters, instances core0, core1` and
-`RK3576 NPU Memory: 4 counters`.
-
-**5. Idle check**, in a second administrator window:
-
-```
-typeperf "\RK3576 NPU(*)\*" "\RK3576 NPU Memory\*" -si 1 -sc 10
-```
-
-Every `% Busy Time`, `Jobs/sec` and `Job Running` is 0; `Buffers` is 0.
-
-**6. Load**, with the counter log running in the second window:
-
-```
-typeperf "\RK3576 NPU(*)\*" "\RK3576 NPU Memory\*" -si 1 -sc 180 -o R:\npu\perf\m6-counters.csv -y
-R:\npu\perf\rknputest.exe m6 --iters 2000
-R:\npu\perf\rknputest.exe m6 --iters 200 --mb 0 --collide
-R:\npu\perf\rknputest.exe m6 --iters 20 --mb 0 --fault
-```
-
-Instead of rknputest, a charsiu run ([testing](testing.md), step 3) works as well; it
-drives both cores at once.
-
-**What confirms it:**
-
-| question | where | answer |
-|---|---|---|
-| the counters exist | step 4 | both sets, 12 and 4 counters, instances `core0` and `core1` |
-| idle is idle | step 5 | 0 busy, 0 jobs/s |
-| busy and rates move | `m6-counters.csv` during `m6 --iters 2000` | `% Busy Time` above 0 on the cores m6 is using, never above 100; `Jobs/sec` above 0; `Avg. Job Time (us)` near the `hw ... us` figures m6 prints; `Avg. Submit to Complete (us)` at or below m6's `LATENCY: SUBMIT to WAIT return` line (that one also has the WAIT's return to the program) |
-| totals agree with the driver | m6's `core N totals` lines, and `rknputest info` after the runs | `Jobs Submitted`, `Jobs Completed`, `Job Timeouts`, `Core Resets`, `IOMMU Faults` and `CBUF Waits` in the last CSV row equal the driver's per-core totals |
-| the collide case | the `--collide` run | `CBUF Waits` grows |
-| the fault case | the `--fault` run | `IOMMU Faults` and `Core Resets` grow on the core that ran it |
-| memory | during the m6 scatter step | `Buffer Bytes` climbs to about 768 MiB and drops back to 0 after the run |
-| no cost | the m6 latency lines | the same as the M7 board run, within noise |
-
-Send `m6-counters.csv`, the rknputest output and
-`%SystemRoot%\Temp\rknpu-perfcounters.log`.
+- `% Busy Time` above 0 and never above 100, `Jobs/sec` above 0;
+  `Avg. Job Time (us)` near m6's `hw ... us`; `Avg. Submit to Complete (us)`
+  at or below m6's `LATENCY: SUBMIT to WAIT return`.
+- The totals in the last CSV row equal `rknputest info`'s per-core totals.
+- `--collide` grows `CBUF Waits`; `--fault` grows `IOMMU Faults` and
+  `Core Resets` on its core.
+- `Buffer Bytes` climbs to about 768 MiB during the scatter step and returns
+  to 0.
+- m6's latency lines are unchanged within noise.
 
 ## Backing out
 
-`rknpu-perfcounters.ps1 -Uninstall` removes the counter sets; the driver
-does not depend on them. To go back to the M7 driver, stage that package and
-repeat steps 1 to 3.
+`rknpu-perfcounters.ps1 -Uninstall` removes the sets; the driver does not
+depend on them.

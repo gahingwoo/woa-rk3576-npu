@@ -1,40 +1,36 @@
 # Using the NPU under Windows
 
-How to turn the NPU on, install the driver and run a model with charsiu on
-an LCKFB TaishanPi 3M under Windows 11 23H2. [简体中文](zh-CN/use.md)
+Turn the NPU on, install the driver and run a model with charsiu on an LCKFB
+TaishanPi 3M under Windows 11 23H2. [简体中文](zh-CN/use.md)
 
-New to these boards? Start at
-[edk2-rk3576](https://github.com/gahingwoo/edk2-rk3576#from-a-new-board-to-windows-or-linux).
 Windows itself is installed with
 [woa-rk3576](https://github.com/gahingwoo/woa-rk3576/blob/main/docs/INSTALL.md).
-
-Run on one TaishanPi 3M, 2026-11-22 to 2026-11-24. The CM5-IO firmware does
-not offer the NPU option. There is no release: the driver and the tools are
-CI artifacts.
+The `charsiu` installer ([charsiu.md](charsiu.md)) does steps 3 to 6 for you,
+but has only run in CI; the steps below are the ones run on the board.
 
 ## What you need
 
 - edk2-rk3576 firmware newer than 0.4.1 (its
   [`ci` build](https://edk2.gahingwoo.com/flash.html#the-rolling-ci-build)
   until the next release).
-- From one run of this repository's CI: the `rknpu-m7-arm64` artifact (the
-  driver, `rknputest.exe`, `signer.cer`, `rknpu-reinstall.ps1`) and the
-  `charsiu-m7-arm64` artifact (`charsiu_run.exe` and the benchmark).
-- A model. The one that has been run is Llama-3.2-1B-Instruct Q8_0 from
-  unsloth (`Llama-3.2-1B-Instruct-Q8_0.gguf`, sha256 `3f87a880...`, about
-  1.3 GB). The TaishanPi's C: has little room; a USB stick or a second
-  partition works.
+- From one CI run of this repository: the `rknpu-m7-arm64` artifact (driver,
+  `rknputest.exe`, `signer.cer`, `rknpu-reinstall.ps1`,
+  `rknpu-perfcounters.ps1`) and `charsiu-m7-arm64` (`charsiu_run.exe` and
+  the benchmark).
+- A model. The one that has been run is unsloth's
+  `Llama-3.2-1B-Instruct-Q8_0.gguf` (sha256 `3f87a880...`, about 1.3 GB).
+  C: has little room; a USB stick or a second partition works.
+- A fan on the SoC (see Known issues).
 
 ## Steps
 
-1. Turn on "NPU (experimental)" in the firmware setup (ACPI / Device Tree
-   page), save and restart. From the UEFI Shell the same is
-   `setvar AcpiNpu -guid 8b4f2e3d-ac5e-4f9b-c2d6-3e7e9f1b4d8c -bs -rt -nv =01`
-   followed by `reset`. The firmware then powers the NPU (rail 800 mV, clock
-   594 MHz) and declares it as `ACPI\RKCP3576`.
-2. In Windows, sync the clock: `w32tm /resync /force`.
+1. In firmware setup, ACPI / Device Tree page, turn on "NPU (experimental)",
+   save and restart. From the UEFI Shell:
+   `setvar AcpiNpu -guid 8b4f2e3d-ac5e-4f9b-c2d6-3e7e9f1b4d8c -bs -rt -nv =01`,
+   then `reset`.
+2. In Windows: `w32tm /resync /force`.
 3. Unpack both artifacts into one folder, for example `C:\rknpu`.
-4. Trust the signer and stage the driver, from an administrator prompt:
+4. As administrator, trust the signer and stage the driver:
 
    ```
    certutil -addstore -f Root C:\rknpu\signer.cer
@@ -42,8 +38,7 @@ CI artifacts.
    pnputil /add-driver C:\rknpu\rknpu\rknpu.inf
    ```
 
-5. Mark the device for reinstall as SYSTEM, then restart (the general rule is
-   in woa-rk3576's [drivers](https://github.com/gahingwoo/woa-rk3576/blob/main/docs/drivers.md)):
+5. Mark the device for reinstall as SYSTEM, then restart:
 
    ```
    schtasks /create /tn rknpu-reinstall /sc once /st 23:59 /ru SYSTEM /f /tr "powershell -NoProfile -ExecutionPolicy Bypass -File C:\rknpu\rknpu-reinstall.ps1"
@@ -52,18 +47,9 @@ CI artifacts.
    shutdown /r /t 0
    ```
 
-6. Check it:
-
-   ```
-   C:\rknpu\rknputest.exe info
-   ```
-
-   It ends with `RKNPU INFO: OK`. Device Manager lists the device as
-   "Rockchip RK3576 NPU" under *Neural processors* (packages built from
-   2026-11-24 on; older ones put "Rockchip RK3576 NPU (RKNN, bring-up)" under
-   *System devices*).
-
-7. Run a prompt on the NPU:
+6. Check: `C:\rknpu\rknputest.exe info` ends with `RKNPU INFO: OK`, and
+   Device Manager lists "Rockchip RK3576 NPU" under *Neural processors*.
+7. Run a prompt on the NPU, from an administrator prompt:
 
    ```
    set CHARSIU_NPU=1
@@ -76,48 +62,50 @@ CI artifacts.
    C:\rknpu\charsiu_run.exe R:\npu\Llama-3.2-1B-Instruct-Q8_0.gguf -p "Hello" -n 128 -c 512 -t 4 --cache
    ```
 
-   These are the settings the benchmark uses. `--cache` keeps the quantised
-   weights in a file beside the model: the first run writes it (about 90 s
-   of staging), later runs read it (about 10 s).
+   `--cache` keeps the quantised weights in a file beside the model: the
+   first run writes it (about 100 s of staging), later runs read it (13 to
+   21 s).
 
-## See what the NPU is doing
+## Watch the NPU
 
-Windows 11 23H2 has no NPU page in Task Manager. The driver publishes
-Windows performance counters instead: `RK3576 NPU`, per core (`core0`,
-`core1`), with `% Busy Time`, `Jobs/sec` and the average job time, and
-`RK3576 NPU Memory` with the bytes in NPU buffers. Make them visible once
-after each driver install, from an administrator prompt:
+Task Manager on 23H2 has no NPU page. The driver publishes performance
+counters instead. Register them once after each driver install, as
+administrator:
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\rknpu\rknpu-perfcounters.ps1
-```
-
-Then watch them in perfmon, or:
-
-```
 Get-Counter "\RK3576 NPU(*)\% Busy Time", "\RK3576 NPU(*)\Jobs/sec" -Continuous
 ```
 
-The RK3576 tools from woa-rk3576 (the `rk3576-tools-arm64` artifact) do
-this step for you after every driver update, and their rk-monitor shows the
-NPU, GPU and CPU load and the temperatures in the tray and on the desktop.
-All counters, and how they are measured: [performance counters](dev/perfcounters.md).
+The `rk3576-tools-arm64` bundle from woa-rk3576 registers them for you, and
+its rk-monitor shows NPU, GPU and CPU load in the tray. Details:
+[perfcounters](dev/perfcounters.md).
 
 ## What to expect
 
-Llama-3.2-1B decodes at about 14 tokens a second on the NPU with the M7
-defaults (14.23 tok/s in the 2026-11-24 benchmark; 15.5 to 16.6 in its best
-arms), against 18.15 on Linux on the same board. The text is the same as on
-the CPU arm and as on Linux. Numbers are from single runs.
+With the defaults, 2026-11-26, fan on: 16.12 tok/s decode, 89% of Linux's
+18.15 tok/s on the same board. The text is the same as on the CPU and on
+Linux. More: [performance](dev/performance.md).
+
+## Settings
+
+Driver values live under
+`HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\RKCP3576\0\Device Parameters`
+(writable by SYSTEM only; restart the device after a change). charsiu's are
+environment variables. The table is in
+[architecture](dev/architecture.md#settings).
+
+## Known issues
+
+| Symptom | Cause, and what to do |
+|---|---|
+| about 3 tok/s | `charsiu_run.exe` runs on the CPU unless the seven `CHARSIU_*` variables in step 7 are set. The `charsiu` command sets them for you |
+| 12.91 tok/s, not 16 | no fan: the SoC throttles (2026-11-25 run, fan off) |
+| `\\.\RKNPU` refused from an ordinary prompt | the device is administrators only unless `UserAccess = 1` is set ([charsiu.md](charsiu.md#who-may-use-the-npu)) |
+| no `ACPI\RKCP3576` device | "NPU (experimental)" is off in setup; it is off by default |
+| ArmSoM CM5-IO | its firmware has no NPU option |
 
 ## Back out
 
 Turn "NPU (experimental)" off in setup and restart: the NPU stays powered
 off and Windows no longer sees the device.
-
-## More
-
-- How it works: [architecture](dev/architecture.md)
-- The benchmark and the host checks: [testing](dev/testing.md)
-- Where the time goes against Linux: [performance](dev/performance.md)
-- The NPU's performance counters: [perfcounters](dev/perfcounters.md)

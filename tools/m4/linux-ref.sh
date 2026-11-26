@@ -3,7 +3,7 @@
 #
 #   ./linux-ref.sh MODEL.gguf [OUTDIR]
 #
-# Run as root on the board under Armbian with rocket (docs/dev/testing.md; first written for docs/history/2026-11-22-m4.md, part A),
+# Run as root on the board under Armbian with rocket (docs/dev/testing.md; first written for 3686706:docs/history/2026-11-22-m4.md, part A),
 # from the unpacked charsiu-m4-arm64 artifact: it uses linux/charsiu_run and
 # linux/charsiu_matmul beside it (the same charsiu commit as the Windows
 # exes, static) and long.txt. Writes OUTDIR (default ./m4-linux) and

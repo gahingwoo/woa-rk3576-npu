@@ -1,28 +1,26 @@
 # Testing
 
-What CI checks, and how the board runs are done. Current on `main` on
-2026-11-24. The milestone board tests as they were run are in
-[history](../history/README.md).
+What CI checks, and how a board run is done.
 
 ## In CI, on every push
 
 - `rknputest selftest`: the IOCTL header and the tool, plain C on Linux.
-- `rknputest-fake m3` and `m6`: the tool against an in-memory stand-in for
-  the driver (`tools/rknputest/fakedev.c`), including two threads with
-  overlapping jobs, the CBUF collision case, and a run under the old M3 busy
-  rule that must fail.
-- `tools/m3gen`: the GEMM register streams and the register allow list,
-  regenerated and compared byte for byte with what is checked in.
+- `rknputest-fake m3`, `m6` and `submit-stats`: the tool against an
+  in-memory stand-in for the driver (`tools/rknputest/fakedev.c`), including
+  two threads with overlapping jobs, the CBUF collision case, and a run
+  under the old M3 busy rule that must fail.
+- `tools/m3gen`: the GEMM register streams and the allow list, regenerated
+  and compared byte for byte with what is checked in.
 - The board scripts (`tools/m4`, `m6`, `m7`) must parse.
 - Float math against glibc on all 2^32 inputs, and the Linux reference
   build of charsiu (aarch64).
-- charsiu for Windows on Arm (llvm-mingw), and `rknpu.sys` with
-  `rknputest.exe` (WDK, test-signed). These are the `charsiu-m7-arm64` and
-  `rknpu-m7-arm64` artifacts.
+- charsiu for Windows on Arm (llvm-mingw), `rknpu.sys` and `rknputest.exe`
+  (WDK, test-signed): the `charsiu-m7-arm64`, `rknpu-m7-arm64`,
+  `charsiu-windows-arm64` and `rknpu-windows-arm64` artifacts.
+- The `charsiu` front door and installer under pwsh on Linux.
 - Performance counters: `tools/perfcheck` checks `rknpu.man` against the
-  structures the driver fills and the tick conversion; the Windows job
-  checks that the counter names are linked into `rknpu.sys`
-  ([perfcounters](perfcounters.md)).
+  driver's structures; the Windows job checks the names are linked into
+  `rknpu.sys`.
 - Wording: no en or em dashes, and the project's wording rule for public
   files.
 
@@ -30,16 +28,17 @@ None of that is a hardware result.
 
 ## On the board
 
-Board: the TaishanPi 3M under Windows 11 23H2 with test signing, firmware
-with the NPU option on, the driver installed as in [use](../use.md),
-minidumps on. Each step runs as a SYSTEM scheduled task, so a dropped ssh
-session cannot stop it, and writes a zip to collect afterwards.
+TaishanPi 3M, Windows 11 23H2 with test signing, the NPU option on, the
+driver installed as in [use](../use.md), minidumps on, a fan on the SoC. Run
+each step as a SYSTEM scheduled task, so a dropped ssh session cannot stop
+it; each writes a zip.
 
-1. `rknputest info`: binding, version registers, IOMMU and cache mode. Must
-   end with `RKNPU INFO: OK`.
-2. `rknputest m3` and `rknputest m6`: GEMMs from 1x64x64 to 16x1024x1024 on
-   both cores, exact against the CPU, through the IOMMU, both cores at once.
-   `m6 --fault` checks that an IOMMU fault stops the job.
+1. `rknputest info`: binding, version registers, IOMMU and cache mode. Ends
+   with `RKNPU INFO: OK`.
+2. `rknputest m3` and `rknputest m6`: GEMMs from 1x64x64 to 16x1024x1024,
+   exact against the CPU, through the IOMMU, both cores at once.
+   `m6 --collide` must stay exact; `m6 --fault` checks that an IOMMU fault
+   stops the job.
 3. The benchmark, about 20 minutes:
 
    ```
@@ -47,34 +46,29 @@ session cannot stop it, and writes a zip to collect afterwards.
    schtasks /run /tn rknpu-m7
    ```
 
-   `bench.txt` and `decode.txt` in the zip are the summary. Every NPU arm
-   must print the same text (`TEXT: all N short-npu arms print the same
-   text`); anything else is a failure. The arms and what each switch costs
-   are in [performance](performance.md). `-IdleDisable` and `-Quick` are
-   the optional controls.
+   `bench.txt` and `decode.txt` are the summary. Every NPU arm must print
+   the same text (`TEXT: all N short-npu arms print the same text`);
+   anything else is a failure. Options: `-Quick` (short-m6, short-npu,
+   short-npu2, short-m7submit and the stages arms), `-IdleDisable`,
+   `-KeepCache`, `-SkipDriverTests`.
 
-The SUBMIT split (M8) needs no extra step: `rknputest info` before and
-after the bench prints the driver's per-core phase sums, and every arm's
-`.err` has charsiu's per-device line. The one-arm before and after is the
-`-Quick` run, whose `short-m7submit` arm is M7's SUBMIT checks on the same
-driver; `bench.txt` prints its difference against the defaults and
-`decode.txt` the phases of both. A single arm moves by 3 to 6 ms a token
-for no reason ([performance](performance.md)), so read the phase rows (us a
-SUBMIT, which do not depend on the run's noise in the same way) first and
-the tok/s second; for a decision on tok/s, run `-Quick` twice.
+A single arm moves 3 to 6 ms a token for no reason. Read the SUBMIT phase
+rows (us a SUBMIT) first and tok/s second; for a decision on tok/s, run
+`-Quick` twice.
 
-The performance counters have their own board check: register them, then
-watch them with `typeperf` while `rknputest m6` runs
-([perfcounters](perfcounters.md), "Board test").
+Performance counters: register them, then watch them with `typeperf` while
+`rknputest m6` runs ([perfcounters](perfcounters.md#board-check)).
 
-The Linux reference (text and tokens a second under rocket, the same
-board): `tools/m4/linux-ref.sh` as root under Armbian edge with rocket,
-booted through the firmware with Armbian's own DTB (the firmware's DTB has
-the NPU disabled). Its output is what `-Linux` compares against.
-`tools/m0` is the earlier Linux measurement kit ([its README](../../tools/m0/README.md)).
+The Linux reference (text and tok/s under rocket, same board):
+`tools/m4/linux-ref.sh` as root under Armbian edge with rocket, booted
+through the firmware with Armbian's own DTB (the firmware's DTB has the NPU
+disabled). `tools/m4/win-run.ps1 -Linux` on the board, or `compare.sh` on
+the desk, compares a Windows run's text with it. m7-bench's Linux figure
+(18.15 tok/s) is a constant in the script. `tools/m0` is the
+earlier Linux measurement kit ([README](../../tools/m0/README.md)).
 
 ## Backing out
 
-Every port change has an environment switch, and the `short-m6` arm runs
-them all off at once. To go back to an earlier driver, stage that package
-and repeat the reinstall in [use](../use.md).
+Every port change has an environment switch, and the `short-m6` arm turns
+them all off at once. To go back to an earlier driver, stage that package and
+repeat the reinstall in [use](../use.md).
