@@ -1,7 +1,7 @@
 @echo off
 rem Build rknpu.sys for Windows on ARM64. Run from an EWDK build environment
 rem (LaunchBuildEnv.cmd) or a WDK Developer Command Prompt; builds natively on
-rem ARM64 Windows. See ..\..\docs\M2.md.   Usage: build.cmd [Debug|Release]
+rem ARM64 Windows. See ..\..\docs\dev\testing.md.   Usage: build.cmd [Debug|Release]
 setlocal
 set CONFIG=%1
 if "%CONFIG%"=="" set CONFIG=Release

@@ -9,12 +9,12 @@
 #   make linux-ref   build/linux/: charsiu_run and charsiu_matmul for the
 #                    board's Linux, static, from the same charsiu commit and
 #                    with charsiu's own device.c (rocket): the reference side
-#                    of docs/history/2026-11-22-m4.md; aarch64 Linux only (CI)
+#                    of 3686706:docs/history/2026-11-22-m4.md; aarch64 Linux only (CI)
 #   make clean
 #
 # charsiu itself (external/charsiu) is compiled unchanged. src/device.c is
 # replaced by device_rknpu.c, and compat/ supplies the POSIX pieces mingw
-# lacks. See docs/history/2026-11-22-m4.md.
+# lacks. See 3686706:docs/history/2026-11-22-m4.md.
 #
 # SPDX-License-Identifier: GPL-2.0-only
 

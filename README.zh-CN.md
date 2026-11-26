@@ -1,40 +1,38 @@
 # woa-rk3576-npu
 
-[English](README.md)（本页对应 2026-11-24 的英文版）
+[English](README.md)
 
-在 Windows on Arm 上使用 Rockchip RK3576 的 NPU：一个 KMDF 驱动，加上 [charsiu](https://github.com/gahingwoo/charsiu) 大模型运行时的移植，让在 Linux 上能用 NPU 跑的模型，在 Windows 上也能跑。
+在 Windows on Arm 上使用 Rockchip RK3576 的 NPU：一个 KMDF 驱动（`rknpu.sys`），加上 [charsiu](https://github.com/gahingwoo/charsiu) 大模型运行时的移植，让在 Linux 上能用 NPU 跑的模型，在 Windows 上也能跑。
 
 第一次接触这些板子？请从 [edk2-rk3576](https://github.com/gahingwoo/edk2-rk3576/blob/main/README.zh-CN.md) 开始：先装好固件和 Windows。
 
-## 状态（2026-11-24）
+## 状态
 
-在立创泰山派 3M 的 Windows 11 23H2 上可用：Llama-3.2-1B 在 NPU 上的解码速度约每秒 14 个 token（默认设置 14.23，基准测试中最好的几组 15.5 到 16.6），同一块板子在 Linux 下是 18.15，输出文字和 CPU 上的完全一样。两个 NPU 核心同时工作，经过驱动自己管理的 IOMMU。没有在 ArmSoM CM5-IO 上试过，它的固件不提供 NPU 选项。还没有正式版：驱动和 charsiu 都是 CI 产物。
+| 功能 | 状态 |
+|---|---|
+| 驱动、两个 NPU 核心、驱动管理的 IOMMU | 板测通过（泰山派 3M） |
+| charsiu 在 NPU 上运行，`charsiu_run` | 板测通过（泰山派 3M） |
+| 性能计数器（`RK3576 NPU`） | 板测通过（泰山派 3M） |
+| SUBMIT 分阶段计时（`rknputest submit-stats`） | 仅 CI |
+| `charsiu` 命令、`charsiu serve`、安装脚本 | 仅 CI |
+| ArmSoM CM5-IO | 没试过：它的固件没有 NPU 选项 |
 
-使用方法：[docs/zh-CN/use.md](docs/zh-CN/use.md)。
+还没有正式版：驱动和 charsiu 都是 CI 产物。
+
+## 结果
+
+立创泰山派 3M，Windows 11 23H2，2026-11-26，风扇开启：Llama-3.2-1B-Instruct Q8_0 默认设置下解码 **16.12 tok/s**（每个 token 62.0 ms），是同一块板子在 Linux 下 18.15 tok/s 的 89%。基准测试的每一组输出文字都相同。更多数据见[性能](docs/dev/performance.md)（英文）。
 
 ![设备管理器的"Neural processors"下 Rockchip RK3576 NPU 工作正常；NPU Chat 控制台在 NPU 上运行 Llama-3.2-1B；监视小组件](docs/imgs/tspi3m-2026-11-24-npu-chat.webp)
 
-*泰山派 3M，Windows 11 23H2，2026-11-24。设备管理器在"Neural processors"下列出 NPU 并显示工作正常；控制台在 NPU 上用 Llama-3.2-1B 对话；右上角的小组件显示 CPU、GPU、NPU 的负载和温度。*
+*泰山派 3M，2026-11-24："Neural processors"下的 NPU、在 NPU 上用 Llama-3.2-1B 对话，以及显示 CPU、GPU、NPU 负载的 rk-monitor。*
 
-## 里程碑
+## 文档
 
-| # | 内容 | 结果 |
-|---|---|---|
-| M0 | Linux 下的测量：关闭 IOMMU 分页跑一个 NPU 任务 | 通过，2026-11-22 |
-| M1 | 固件：供电、时钟、ACPI | 通过，2026-11-22 |
-| M2 | 驱动框架和测试工具 | 通过，2026-11-22 |
-| M3 | 缓冲区、提交、中断：GEMM 和 CPU 结果完全一致 | 通过，2026-11-22 |
-| M4 | 移植 charsiu：Llama-3.2-1B 输出和 Linux 一样 | 2026-11-24 运行；NPU 部分需要 M6 的内存管理 |
-| M5 | 性能 | 由 M6 和 M7 完成 |
-| M6 | 驱动管理 NPU 的 IOMMU、可缓存缓冲区、双核 | 通过，2026-11-24：12.12 tok/s |
-| M7 | 和 Linux 对比的解码性能 | 2026-11-24 合并：默认设置 14.23 tok/s |
-| M8 | 安装脚本、`charsiu` 命令、`charsiu serve` | charsiu-windows 分支代码完成，未板测（[docs/zh-CN/charsiu.md](docs/zh-CN/charsiu.md)） |
-
-每个里程碑的计划和板上记录见[历史记录](docs/history/README.md)（英文）。
-
-## 开发文档（英文）
-
-[架构](docs/dev/architecture.md)、[测试](docs/dev/testing.md)、[性能](docs/dev/performance.md)、[性能计数器](docs/dev/perfcounters.md)、[tools/m0](tools/m0/README.md)。
+- [使用](docs/zh-CN/use.md)：打开 NPU、安装驱动、跑模型
+- [Windows 上的 charsiu](docs/zh-CN/charsiu.md)：命令、安装脚本、谁能用 NPU
+- 开发文档（英文）：[架构和设置](docs/dev/architecture.md)、[测试](docs/dev/testing.md)、[性能](docs/dev/performance.md)、[性能计数器](docs/dev/perfcounters.md)、[tools/m0](tools/m0/README.md)
+- [历史](docs/history.md)（英文）：里程碑 M0 到 M8
 
 ## 许可证
 

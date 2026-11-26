@@ -3,7 +3,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File win-run.ps1 -Model D:\Llama-3.2-1B-Instruct-Q8_0.gguf [-Linux .\m4-linux] [-Out .\m4-windows] [-SkipM3] [-NpuOnly]
 #
 # As administrator, from the unpacked charsiu-m4-arm64 artifact, with
-# rknputest.exe from rknpu-m4-arm64 beside it or on PATH (docs/history/2026-11-22-m4.md, part
+# rknputest.exe from rknpu-m4-arm64 beside it or on PATH (3686706:docs/history/2026-11-22-m4.md, part
 # B). The same arms as linux-ref.sh, with the same arguments, and the same
 # .text files (stdout without the lines that start with '['). With -Linux
 # (the unpacked m4-linux directory) it compares the two at the end.
