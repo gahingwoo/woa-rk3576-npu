@@ -11,6 +11,7 @@
 | 功能 | 状态 |
 |---|---|
 | 驱动、两个 NPU 核心、驱动管理的 IOMMU | 板测通过（泰山派 3M） |
+| Radxa ROCK 4D | 板测通过：驱动能绑定（edk2-rk3576 `main`）；没在上面测过速度 |
 | charsiu 在 NPU 上运行，`charsiu_run` | 板测通过（泰山派 3M） |
 | 性能计数器（`RK3576 NPU`） | 板测通过（泰山派 3M） |
 | SUBMIT 分阶段计时（`rknputest submit-stats`） | 仅 CI |

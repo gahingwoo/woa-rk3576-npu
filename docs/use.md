@@ -1,7 +1,9 @@
 # Using the NPU under Windows
 
-Turn the NPU on, install the driver and run a model with charsiu on an LCKFB
-TaishanPi 3M under Windows 11 23H2. [简体中文](zh-CN/use.md)
+Turn the NPU on, install the driver and run a model with charsiu under
+Windows 11 23H2. The steps were run on an LCKFB TaishanPi 3M; on a Radxa
+ROCK 4D the driver binds the same way (the speeds below are the
+TaishanPi's). [简体中文](zh-CN/use.md)
 
 Windows itself is installed with
 [woa-rk3576](https://github.com/gahingwoo/woa-rk3576/blob/main/docs/INSTALL.md).
@@ -103,7 +105,7 @@ environment variables. The table is in
 | 12.91 tok/s, not 16 | no fan: the SoC throttles (2026-11-25 run, fan off) |
 | `\\.\RKNPU` refused from an ordinary prompt | the device is administrators only unless `UserAccess = 1` is set ([charsiu.md](charsiu.md#who-may-use-the-npu)) |
 | no `ACPI\RKCP3576` device | "NPU (experimental)" is off in setup; it is off by default |
-| ArmSoM CM5-IO | its firmware has no NPU option |
+| ArmSoM CM5-IO | its firmware has no NPU option (the ROCK 4D's has, on edk2-rk3576 `main`) |
 
 ## Back out
 

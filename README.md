@@ -15,6 +15,7 @@ the firmware and Windows come first.
 | Feature | Status |
 |---|---|
 | Driver, both NPU cores, driver-managed IOMMU | board-tested (TaishanPi 3M) |
+| Radxa ROCK 4D | board-tested: the driver binds (edk2-rk3576 `main`); no speed measured there |
 | charsiu on the NPU, `charsiu_run` | board-tested (TaishanPi 3M) |
 | Performance counters (`RK3576 NPU`) | board-tested (TaishanPi 3M) |
 | SUBMIT phase timing (`rknputest submit-stats`) | CI only |
