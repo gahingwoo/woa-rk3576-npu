@@ -1,6 +1,6 @@
 # cp-bench.ps1 - charsiu 0.2 on the board against the build it replaces
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File cp-bench.ps1 -Model R:\npu\Llama-3.2-1B-Instruct-Q8_0.gguf -Old C:\path\to\old\charsiu_run.exe [-Out R:\npu\cp-bench] [-Reps 3]
+#   powershell -NoProfile -ExecutionPolicy Bypass -File cp-bench.ps1 -Model R:\npu\Llama-3.2-1B-Instruct-Q8_0.gguf -Old C:\path\to\old\charsiu_run.exe [-Out R:\npu\cp-bench] [-Reps 3] [-NoSettle]
 #
 # From the unpacked charsiu-m7-arm64 artifact (this script beside its
 # charsiu_run.exe). -Old is the charsiu_run.exe in use now (charsiu doctor
@@ -17,7 +17,8 @@
 #                    CHARSIU_NPU_COPY_POOL=0 (what the direct pack buys)
 #   dec-new / dec-old  64 tokens of "The capital of France is", the
 #                    bench prompt with --ignore-eos, -Reps each, interleaved
-#   dec-nospec       the new build, CHARSIU_SPEC=0
+#   dec-spec         the new build, CHARSIU_SPEC=auto (speculation is
+#                    off by default on Windows; this is the control)
 #
 # summary.txt has one line an arm (staging, the staging split, prompt and
 # decode rates, buffer allocation, free memory before the arm) and whether
@@ -30,7 +31,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Model,
     [Parameter(Mandatory = $true)][string]$Old,
     [string]$Out = '.\cp-bench',
-    [int]$Reps = 3
+    [int]$Reps = 3,
+    [switch]$NoSettle
 )
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -60,6 +62,20 @@ function Run-Arm([string]$Name, [string]$Exe, [string]$ArgLine, [hashtable]$Extr
     return [pscustomobject]@{ Name = $Name; Code = $LASTEXITCODE; FreeMB = $free }
 }
 
+# A server or the desktop app that just exited gives its memory back over
+# some seconds; an arm started inside that window measures the board, not
+# charsiu (2026-11-28: 128 MB free, 41.9 s staging). So wait, up to two
+# minutes, for 1200 MB free first. -NoSettle starts at once, which is the
+# way to test a start under memory pressure on purpose.
+if (-not $NoSettle) {
+    for ($w = 0; $w -lt 120; $w += 5) {
+        $f = [int]((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024)
+        if ($f -ge 1200) { break }
+        Write-Host "cp-bench: $f MB free, waiting"
+        Start-Sleep -Seconds 5
+    }
+}
+
 $chat = '-p "Name three colors." --chat -n 64'
 $dec = '-p "The capital of France is" -n 64 --ignore-eos'
 $arms = @()
@@ -71,7 +87,7 @@ for ($i = 1; $i -le $Reps; $i++) {
     $arms += Run-Arm "dec-new-$i" $new $dec @{}
     $arms += Run-Arm "dec-old-$i" $Old $dec @{}
 }
-$arms += Run-Arm 'dec-nospec' $new $dec @{ CHARSIU_SPEC = '0' }
+$arms += Run-Arm 'dec-spec' $new $dec @{ CHARSIU_SPEC = 'auto' }
 
 function Num($m, $i) { if ($m.Success) { $m.Groups[$i].Value } else { '' } }
 $rows = foreach ($a in $arms) {
