@@ -90,6 +90,21 @@ __attribute__((constructor)) static void compat_timer(void)
 		_putenv_s("CHARSIU_POOL_FAST", "0");
 }
 
+/*
+ * SPECULATION OFF BY DEFAULT HERE. charsiu 0.2 turns it on (auto) on the
+ * strength of the CM5 under Linux, where a verify pass is cheap. On the
+ * TaishanPi under Windows, 2026-11-28, Llama-3.2-1B, 64 tokens: 18.43 /
+ * 18.85 / 18.86 tok/s with it against 19.92 without, same text. A verify
+ * pass is a batched call, and each batched call here pays the Windows
+ * SUBMIT and WAIT, so the draft rarely earns its verify. CHARSIU_SPEC set
+ * in the environment (or [extra] in config.ini) still wins.
+ */
+__attribute__((constructor)) static void compat_spec(void)
+{
+	if (!getenv("CHARSIU_SPEC"))
+		_putenv_s("CHARSIU_SPEC", "0");
+}
+
 /* ------------------------------------------------------ binary stdio */
 
 __attribute__((constructor)) static void compat_binary_stdio(void)
