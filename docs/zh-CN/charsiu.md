@@ -39,6 +39,7 @@ irm https://raw.githubusercontent.com/gahingwoo/woa-rk3576-npu/main/win/charsiu-
 | 程序 | `%LOCALAPPDATA%\Programs\charsiu` | `/usr/bin`、`/opt/charsiu` |
 | 配置 | `%LOCALAPPDATA%\charsiu\config.ini` | `~/.charsiu/config.ini` |
 | 模型 | `%LOCALAPPDATA%\charsiu\models` | `~/.charsiu/models` |
+| 权重缓存 | 模型旁边；模型所在文件夹不可写时放在 `%LOCALAPPDATA%\charsiu\cache` | 模型旁边 |
 
 `CHARSIU_HOME`、`CHARSIU_CONFIG`、`CHARSIU_MODELS` 可以改位置。配置项和 Linux 相同，两个默认值不同：`[run] cache = yes`（权重缓存；第一次写入约 130 秒，2026-11-24 实测，之后几秒）；`[run] cpus` 不设（移植层自己把解码线程绑到大核）。
 

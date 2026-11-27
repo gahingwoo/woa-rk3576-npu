@@ -49,6 +49,7 @@ asks it one sentence. `charsiu update` reruns it for the programs only.
 | programs | `%LOCALAPPDATA%\Programs\charsiu` | `/usr/bin`, `/opt/charsiu` |
 | config | `%LOCALAPPDATA%\charsiu\config.ini` | `~/.charsiu/config.ini` |
 | models | `%LOCALAPPDATA%\charsiu\models` | `~/.charsiu/models` |
+| weight cache | beside the model, or `%LOCALAPPDATA%\charsiu\cache` when its folder is read only | beside the model |
 
 `CHARSIU_HOME`, `CHARSIU_CONFIG` and `CHARSIU_MODELS` move them. The config
 keys are the same as on Linux. Two defaults differ: `[run] cache = yes` (the
