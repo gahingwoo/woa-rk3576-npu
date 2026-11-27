@@ -62,6 +62,14 @@ against the defaults of that time:
 read, 12.8 to 14.2 s after. 2026-11-24 (run 1): 77.2 s without, 20.5 s first
 read, 4 to 5 s after.
 
+Of a 13 s cached start, about 12 s was reading the cache (about 50 MB/s: the
+eMMC, not memory) and 2.8 s "adding". charsiu 0.2 on this port (branch
+charsiu-perf, not on a board yet) maps the cache instead of reading it into
+a private copy (`CHARSIU_WCACHE_MAP`, default on), packs int4 slices straight
+from the packed codes (`CHARSIU_NPU_PACK_DIRECT`) and copies them into the
+buffers on the pool (`CHARSIU_NPU_COPY_POOL`); `=0` is each one's control.
+`tools/charsiu-perf/cp-bench.ps1` measures them.
+
 ## Where the time goes
 
 The NPU is busy about 34 ms a token per core on both Windows and Linux. The
