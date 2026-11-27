@@ -632,3 +632,52 @@ int charsiu_cv_broadcast(pthread_cond_t *c)
 	WakeAllConditionVariable(&v->cv);
 	return 0;
 }
+
+/* ------------------------------------------------------------- futex */
+
+/*
+ * charsiu 0.2's fast pool (llama.c, CHARSIU_POOL_FAST) parks its workers
+ * with futex(FUTEX_WAIT_PRIVATE) on the dispatch generation and wakes them
+ * with FUTEX_WAKE_PRIVATE; the caller parks on the fan-in count the same
+ * way. WaitOnAddress is that call: it returns at once if the word no longer
+ * holds the value, and a wake of the address releases it. Spurious returns
+ * are allowed by both, and the pool re-reads the word after each. Only the
+ * futex number and these two operations; anything else is ENOSYS.
+ */
+#include <sys/syscall.h>
+#include <linux/futex.h>
+
+long syscall(long number, ...)
+{
+	va_list ap;
+	unsigned *addr;
+	int op;
+	unsigned val;
+
+	if (number != SYS_futex) {
+		errno = ENOSYS;
+		return -1;
+	}
+	va_start(ap, number);
+	addr = va_arg(ap, unsigned *);
+	op = va_arg(ap, int);
+	val = va_arg(ap, unsigned);
+	va_end(ap);
+	switch (op & ~FUTEX_PRIVATE_FLAG) {
+	case FUTEX_WAIT:
+		if (!WaitOnAddress((volatile VOID *)addr, &val, sizeof(val), INFINITE)) {
+			errno = EAGAIN;
+			return -1;
+		}
+		return 0;
+	case FUTEX_WAKE:
+		if (val == 1)
+			WakeByAddressSingle((PVOID)addr);
+		else if (val)
+			WakeByAddressAll((PVOID)addr);
+		return 0;
+	default:
+		errno = ENOSYS;
+		return -1;
+	}
+}
