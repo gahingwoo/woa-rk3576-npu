@@ -105,6 +105,10 @@ $rows = foreach ($a in $arms) {
         staging_ms = Num ([regex]::Match($all, 'staging (\d+) ms')) 1
         adding_ms = if ($last) { $last.Groups[2].Value } else { '' }
         cache_read_ms = if ($last) { $last.Groups[3].Value } else { '' }
+        # staging outside the heartbeat: the first tensor's cache open, the
+        # output head (tensor 113) and the batch buffers allocated ahead
+        rest_ms = if ($last -and $st.Count) { [int](Num ([regex]::Match($all, 'staging (\d+) ms')) 1) - [int]$last.Groups[1].Value } else { '' }
+        readahead_ms = Num ([regex]::Match($all, 'read ahead \([0-9]+ MB\): [a-z ]+?([0-9]+) ms')) 1
         alloc_ms = '{0:N0}' -f $alloc
         prompt_tok_s = Num ([regex]::Match($all, 'prompt \d+ tok in \d+ ms, ([0-9.]+) tok/s')) 1
         gen_tok_s = Num ([regex]::Match($all, 'gen \d+ tok in \d+ ms, ([0-9.]+) tok/s')) 1
