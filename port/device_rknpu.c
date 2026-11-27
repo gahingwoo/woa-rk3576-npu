@@ -120,6 +120,9 @@ struct charsiu_device {
 	unsigned long submits, chunks, tasks, waits, polls, poll_won, busy;
 	unsigned long timeouts, dma_errors, refused;
 	unsigned long bos, bo_bytes, bo_peak, bo_bytes_peak;
+	/* what allocating them cost: CREATE_BO and MAP_BO's wall time (staging) */
+	unsigned long allocs;
+	unsigned long long create_us, map_us;
 	unsigned long long hw_us, wait_us;
 
 	/* M6 */
@@ -498,6 +501,11 @@ void charsiu_close(struct charsiu_device *dev)
 				(double)dev->late_us / (dev->wait_timed - dev->wait_slept) : 0.0,
 			dev->deferred, dev->cleaned_by_submit, dev->defer_full, dev->prepped_by_wait,
 			dev->uc_ops, dev->uc_us / 1e3, dev->async_n);
+	if (env_long("CHARSIU_RKNPU_STATS", 0))
+		fprintf(stderr, "charsiu rknpu dev %u buffers: %lu allocated, CREATE_BO %.1f ms "
+			"(%.0f us each), MAP_BO %.1f ms (%.0f us each)\n", dev->index, dev->allocs,
+			dev->create_us / 1e3, dev->allocs ? (double)dev->create_us / dev->allocs : 0.0,
+			dev->map_us / 1e3, dev->allocs ? (double)dev->map_us / dev->allocs : 0.0);
 	if (env_long("CHARSIU_RKNPU_STATS", 0) && dev->m8 && dev->sub_n) {
 		static const char *const nm[RKNPU_SUBMIT_PHASES] = {
 			"entry", "safe", "idle", "arena", "mmu", "clean", "copy", "check",
@@ -525,6 +533,7 @@ int charsiu_bo_alloc(struct charsiu_device *dev, size_t size, struct charsiu_bo 
 	rknpu_map_bo mb;
 	rknpu_bo_handle fh;
 	unsigned got = 0;
+	unsigned long long t0, t1;
 	int r;
 
 	if (!dev || !bo || !size)
@@ -537,12 +546,17 @@ int charsiu_bo_alloc(struct charsiu_device *dev, size_t size, struct charsiu_bo 
 	memset(&cb, 0, sizeof(cb));
 	cb.size = (unsigned)size;
 	pthread_mutex_lock(&dev->lock);
+	t0 = rkx_now_us();
 	r = rkx_ioctl(dev->x, IOCTL_RKNPU_CREATE_BO, &cb, sizeof(cb), &cb, sizeof(cb), &got);
+	t1 = rkx_now_us();
+	dev->create_us += t1 - t0;
 	if (r)
 		goto out;
 	memset(&mb, 0, sizeof(mb));
 	mb.handle = cb.handle;
 	r = rkx_ioctl(dev->x, IOCTL_RKNPU_MAP_BO, &mb, sizeof(mb), &mb, sizeof(mb), &got);
+	dev->map_us += rkx_now_us() - t1;
+	dev->allocs++;
 	if (r || !mb.user_va) {
 		memset(&fh, 0, sizeof(fh));
 		fh.handle = cb.handle;
