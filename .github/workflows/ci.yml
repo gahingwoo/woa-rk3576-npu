@@ -92,7 +92,7 @@ jobs:
         run: |
           set -eux
           shellcheck tools/m4/*.sh
-          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/m7/m7-bench.ps1 tools/rknpu-reinstall.ps1 tools/rknpu-perfcounters.ps1 win/charsiu.ps1 win/charsiu-install.ps1; do
+          for f in tools/m4/win-run.ps1 tools/m6/win-bench.ps1 tools/m7/m7-bench.ps1 tools/charsiu-perf/cp-bench.ps1 tools/rknpu-reinstall.ps1 tools/rknpu-perfcounters.ps1 win/charsiu.ps1 win/charsiu-install.ps1; do
             F="$f" pwsh -NoProfile -Command '$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:F, [ref]$null, [ref]$e); if ($e) { $e; exit 1 }'
           done
       - name: M4 device layer against the in-memory driver
@@ -199,7 +199,7 @@ jobs:
           chmod +x "$out"/linux/*
           cp port/build/win/*.exe "$out/"
           cp docs/use.md docs/dev/testing.md docs/dev/performance.md tools/m4/*.ps1 tools/m4/*.sh tools/m6/*.ps1 external/charsiu/tests/corpus/long.txt "$out/"
-          cp tools/m7/m7-bench.ps1 "$out/"
+          cp tools/m7/m7-bench.ps1 tools/charsiu-perf/cp-bench.ps1 "$out/"
           cp LICENSE "$out/LICENSE.txt"
           cp port/libm/LICENSE.optimized-routines "$out/"
           git -C external/charsiu rev-parse HEAD > "$out/charsiu-commit.txt"
