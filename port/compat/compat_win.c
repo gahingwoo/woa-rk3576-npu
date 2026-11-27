@@ -35,6 +35,61 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* --------------------------------------------- the generic timer, EL0 */
+
+/*
+ * charsiu 0.2's pool reads the ARM generic timer straight from user mode
+ * (llama.c pool_ticks: MRS CNTVCT_EL0, and CNTFRQ_EL0 for its rate).
+ * Windows on Arm normally lets user mode do that (CNTKCTL_EL1.EL0VCTEN).
+ * Where a kernel did not, either MRS would be an illegal instruction at the
+ * pool's first dispatch. So a handler stands by, last in the chain and
+ * free unless it fires: it answers the two reads from QueryPerformance-
+ * Counter and its frequency, which are the same clock's ticks, and steps
+ * over the instruction. The constructor tries one read; if that needed the
+ * handler, CHARSIU_POOL_FAST defaults to 0 (its spin reads the timer in a
+ * loop, and an exception a read would make it slower than the old pool).
+ */
+#define MRS_CNTVCT 0xd53be040u          /* mrs xN, cntvct_el0 */
+#define MRS_CNTFRQ 0xd53be000u          /* mrs xN, cntfrq_el0 */
+
+static volatile LONG timer_emulated;
+
+static LONG CALLBACK timer_emulate(EXCEPTION_POINTERS *ep)
+{
+	DWORD code = ep->ExceptionRecord->ExceptionCode;
+	CONTEXT *c = ep->ContextRecord;
+	unsigned insn, rt;
+	LARGE_INTEGER v;
+
+	if (code != STATUS_ILLEGAL_INSTRUCTION && code != STATUS_PRIVILEGED_INSTRUCTION)
+		return EXCEPTION_CONTINUE_SEARCH;
+	insn = *(const volatile unsigned *)(uintptr_t)c->Pc;
+	if ((insn & ~0x1fu) == MRS_CNTVCT)
+		QueryPerformanceCounter(&v);
+	else if ((insn & ~0x1fu) == MRS_CNTFRQ)
+		QueryPerformanceFrequency(&v);
+	else
+		return EXCEPTION_CONTINUE_SEARCH;
+	rt = insn & 0x1fu;
+	if (rt < 31)
+		c->X[rt] = (DWORD64)v.QuadPart;
+	c->Pc += 4;
+	InterlockedIncrement(&timer_emulated);
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+__attribute__((constructor)) static void compat_timer(void)
+{
+	unsigned long long t;
+
+	if (!AddVectoredExceptionHandler(0, timer_emulate))
+		return;
+	__asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
+	(void)t;
+	if (timer_emulated && !getenv("CHARSIU_POOL_FAST"))
+		_putenv_s("CHARSIU_POOL_FAST", "0");
+}
+
 /* ------------------------------------------------------ binary stdio */
 
 __attribute__((constructor)) static void compat_binary_stdio(void)
