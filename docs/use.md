@@ -65,8 +65,8 @@ but has only run in CI; the steps below are the ones run on the board.
    ```
 
    `--cache` keeps the quantised weights in a file beside the model: the
-   first run writes it (about 100 s of staging), later runs read it (13 to
-   21 s).
+   first run writes it (about 100 s of staging), later runs read it (about
+   2 s, or about 14 s right after a reboot).
 
 ## Watch the NPU
 

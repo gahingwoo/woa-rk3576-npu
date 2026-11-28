@@ -47,7 +47,7 @@ Windows 本身用 [woa-rk3576](https://github.com/gahingwoo/woa-rk3576/blob/main
    C:\rknpu\charsiu_run.exe R:\npu\Llama-3.2-1B-Instruct-Q8_0.gguf -p "Hello" -n 128 -c 512 -t 4 --cache
    ```
 
-   `--cache` 把量化后的权重存在模型旁边的一个文件里：第一次运行时写入（准备约 100 秒），之后读取（13 到 21 秒）。
+   `--cache` 把量化后的权重存在模型旁边的一个文件里：第一次运行时写入（准备约 100 秒），之后读取（约 2 秒，刚重启后约 14 秒）。
 
 ## 查看 NPU 负载
 
