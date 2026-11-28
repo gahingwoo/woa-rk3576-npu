@@ -132,7 +132,7 @@ TablePageAlloc(
                                        PAGE_READWRITE | PAGE_WRITECOMBINE, MM_ANY_NODE_OK);
     if (!p)
         return NULL;
-    RtlZeroMemory(p, PAGE_SIZE);
+    NpuDevZero(p, PAGE_SIZE);   /* write-combined, so not RtlZeroMemory (rknpu.h) */
     *Pa = MmGetPhysicalAddress(p);
     return p;
 }

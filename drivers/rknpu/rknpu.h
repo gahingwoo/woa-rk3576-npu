@@ -320,6 +320,57 @@ static __forceinline VOID NpuWr(PDEVICE_CONTEXT c, ULONG off, ULONG v)
     WRITE_REGISTER_ULONG((volatile ULONG *)(c->Regs + off), v);
 }
 
+/*
+ * Memory the NPU reads or writes and the CPU maps uncached: the copy arena,
+ * the IOMMU tables, and buffers made with M6CachedBos = 0 or in bypass mode.
+ * Windows 10 (19041) raises STATUS_DATATYPE_MISALIGNMENT for a misaligned
+ * access to non-coherent DMA memory where Windows 11 lets it through, and
+ * RtlCopyMemory and RtlZeroMemory are free to make one: memcpy covers a
+ * head and a tail with overlapping, unaligned LDP/STP, and memset clears
+ * with DC ZVA, which faults on Device memory at any alignment. So the
+ * driver touches such memory only through these two. The device side gets
+ * naturally aligned 8-byte accesses and single bytes at the ends; volatile
+ * keeps the compiler from merging them into pairs or vectors, or from
+ * turning the loop back into a memset or memcpy call. The other side may be
+ * misaligned only when it is ordinary cached memory (pool, an IOCTL buffer),
+ * where any access is fine. A cached buffer still uses RtlCopyMemory.
+ */
+static __forceinline VOID
+NpuDevZero(
+    _Out_writes_bytes_all_(Len) PVOID Dst,
+    _In_ SIZE_T Len
+    )
+{
+    volatile UCHAR *d = (volatile UCHAR *)Dst;
+
+    for (; Len && ((ULONG_PTR)d & 7); Len--)
+        *d++ = 0;
+    for (; Len >= 8; Len -= 8, d += 8)
+        *(volatile ULONG64 *)d = 0;
+    for (; Len; Len--)
+        *d++ = 0;
+}
+
+/* DevIsSrc: which side is device memory, so which one the loop aligns. */
+static __forceinline VOID
+NpuDevCopy(
+    _Out_writes_bytes_all_(Len) PVOID Dst,
+    _In_reads_bytes_(Len) const VOID *Src,
+    _In_ SIZE_T Len,
+    _In_ BOOLEAN DevIsSrc
+    )
+{
+    volatile UCHAR *d = (volatile UCHAR *)Dst;
+    const volatile UCHAR *s = (const volatile UCHAR *)Src;
+
+    for (; Len && ((ULONG_PTR)(DevIsSrc ? (const volatile void *)s : (const volatile void *)d) & 7); Len--)
+        *d++ = *s++;
+    for (; Len >= 8; Len -= 8, d += 8, s += 8)
+        *(volatile ULONG64 UNALIGNED *)d = *(const volatile ULONG64 UNALIGNED *)s;
+    for (; Len; Len--)
+        *d++ = *s++;
+}
+
 static __forceinline ULONG NpuCoreBase(ULONG core)
 {
     return core * NPU_CORE_STRIDE;

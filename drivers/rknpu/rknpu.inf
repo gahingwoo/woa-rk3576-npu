@@ -96,7 +96,7 @@ ServiceBinary = %13%\rknpu.sys
 KmdfService = rknpu, RKNPU_wdfsect
 
 [RKNPU_wdfsect]
-KmdfLibraryVersion = 1.33
+KmdfLibraryVersion = 1.31
 
 [Strings]
 ProviderName     = "woa-rk3576-npu"

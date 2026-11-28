@@ -8,8 +8,10 @@
  *
  * MEMORY. Every buffer is MmAllocateContiguousNodeMemory below 4 GiB,
  * PAGE_WRITECOMBINE: Normal non-cacheable on ARM64, so the CPU never holds a
- * line the NPU (not coherent, _CCA 0) would miss, and unaligned CPU access
- * still works. The one optional user mapping (MAP_BO) uses MmWriteCombined
+ * line the NPU (not coherent, _CCA 0) would miss. The driver reaches such
+ * memory only with aligned accesses (NpuDevCopy, NpuDevZero in rknpu.h):
+ * Windows 10 faults a misaligned access to DMA memory that Windows 11
+ * tolerates. The one optional user mapping (MAP_BO) uses MmWriteCombined
  * too, so no page is ever mapped with two different attributes. This is the
  * vdpu383 driver's model (woa-rk3576 drivers/video/vdpu383). Without MAP_BO a
  * test moves data with WRITE_BO and READ_BO and no NPU page is ever mapped
@@ -889,7 +891,7 @@ NpuArenaEnsure(
         }
         core->ArenaDma = (ULONG)core->ArenaPa.QuadPart;
     }
-    RtlZeroMemory(core->Arena, RKNPU_COPY_ARENA_BYTES);
+    NpuDevZero(core->Arena, RKNPU_COPY_ARENA_BYTES);   /* write-combined (rknpu.h) */
     RKNPU_LOG("core %u copy arena: %u bytes at NPU address 0x%08x", N, RKNPU_COPY_ARENA_BYTES, core->ArenaDma);
     NpuCrumb(Ctx, RKNPU_CRUMB_ARENA, 0, N, RKNPU_COPY_ARENA_BYTES, core->ArenaDma);
     return STATUS_SUCCESS;
@@ -973,7 +975,10 @@ NpuCopyStreamsLocked(
             return STATUS_INVALID_BUFFER_SIZE;
         t0 = KeQueryPerformanceCounter(NULL);
         /* at stays a multiple of 16 (fetched is even), as the PC wants */
-        RtlCopyMemory(work + at, (PUCHAR)bo->Kva + (t->regcmd - bo->Dma), bytes);
+        if (work == core->Arena || !bo->Cached)
+            NpuDevCopy(work + at, (PUCHAR)bo->Kva + (t->regcmd - bo->Dma), bytes, work != core->Arena);
+        else
+            RtlCopyMemory(work + at, (PUCHAR)bo->Kva + (t->regcmd - bo->Dma), bytes);
         t1 = KeQueryPerformanceCounter(NULL);
         status = NpuCheckEntriesLocked(Ctx, &l, (const ULONGLONG *)(work + at), fetched,
                                        t->regcmd, N);
@@ -990,7 +995,7 @@ NpuCopyStreamsLocked(
     }
     if (work != core->Arena) {
         t0 = KeQueryPerformanceCounter(NULL);
-        RtlCopyMemory(core->Arena, work, at);
+        NpuDevCopy(core->Arena, work, at, FALSE);
         t1 = KeQueryPerformanceCounter(NULL);
         *CopyTicks += (ULONGLONG)(t1.QuadPart - t0.QuadPart);
     }
@@ -1157,7 +1162,10 @@ NpuBoCreate(
             RKNPU_LOG("CREATE_BO: no contiguous %Iu bytes below 4 GiB", size);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        RtlZeroMemory(bo->Kva, size);
+        if (bo->Cached)
+            RtlZeroMemory(bo->Kva, size);
+        else
+            NpuDevZero(bo->Kva, size);
         bo->Pa = MmGetPhysicalAddress(bo->Kva);
         if (bo->Pa.QuadPart == 0 || (ULONGLONG)bo->Pa.QuadPart + size > FOURGIB) {
             /* cannot happen with high = 4 GiB - 1; a stream address is 32 bits */
@@ -1375,11 +1383,18 @@ NpuBoCopy(
     } else {
         /* M6: a cached buffer is made right for the other side here */
         if (Write) {
-            RtlCopyMemory((PUCHAR)bo->Kva + req.offset, data, req.length);
+            if (bo->Cached)
+                RtlCopyMemory((PUCHAR)bo->Kva + req.offset, data, req.length);
+            else
+                NpuDevCopy((PUCHAR)bo->Kva + req.offset, data, req.length, FALSE);
             BoClean(bo, req.offset, req.length);
         } else {
             BoCleanInvalidate(bo, req.offset, req.length);
-            RtlCopyMemory(data, (PUCHAR)bo->Kva + req.offset, req.length);
+            /* offset and length are the caller's: any alignment */
+            if (bo->Cached)
+                RtlCopyMemory(data, (PUCHAR)bo->Kva + req.offset, req.length);
+            else
+                NpuDevCopy(data, (PUCHAR)bo->Kva + req.offset, req.length, TRUE);
         }
         *Info = Write ? 0 : req.length;
     }

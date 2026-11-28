@@ -301,7 +301,7 @@ jobs:
           Get-ChildItem "$kits\Include" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
           $need = @(
             "$kits\Include\$ver\km\wdm.h",
-            "$kits\Include\wdf\kmdf\1.33\wdf.h",
+            "$kits\Include\wdf\kmdf\1.31\wdf.h",
             "$kits\Lib\$ver\km\arm64\ntoskrnl.lib",
             "$kits\bin\$ver\x86\inf2cat.exe",
             "$kits\bin\$ver\x86\signtool.exe",
