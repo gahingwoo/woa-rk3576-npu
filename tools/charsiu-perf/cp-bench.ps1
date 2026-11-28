@@ -25,7 +25,8 @@
 #
 # summary.txt (and summary.csv, every column) has one line an arm: staging
 # (charsiu's own clock, the only whole number), the time inside
-# charsiu_npu_add, the cache's read-ahead, the driver's CREATE_BO and
+# charsiu_npu_add, what the new build read of the cache from disk (MB, ms, records already
+# in memory), the driver's CREATE_BO and
 # MAP_BO, prompt and decode rates, free memory before the arm; then whether
 # the arms of one build printed the same text. The heartbeat's "quantising"
 # is not a column: staging is lazy, so that wall clock also holds the
@@ -115,7 +116,9 @@ $rows = foreach ($a in $arms) {
         arm = $a.Name; rc = $a.Code; free_mb = $a.FreeMB
         staging_ms = Num ([regex]::Match($all, 'staging (\d+) ms')) 1
         adding_ms = if ($last) { $last.Groups[2].Value } else { '' }
-        readahead_ms = Num ([regex]::Match($all, 'map and read ahead (\d+) ms')) 1
+        readin_mb = Num ([regex]::Match($all, 'weight cache read in: (\d+) MB from disk')) 1
+        readin_ms = Num ([regex]::Match($all, 'weight cache read in: \d+ MB from disk in (\d+) ms')) 1
+        resident = Num ([regex]::Match($all, '(\d+ of \d+) records already in memory')) 1
         create_bo_ms = [int]$create
         map_bo_ms = [int]$mapbo
         prompt_tok_s = Num ([regex]::Match($all, 'prompt \d+ tok in \d+ ms, ([0-9.]+) tok/s')) 1
