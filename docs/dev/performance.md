@@ -62,6 +62,24 @@ against the defaults of that time:
 read, 12.8 to 14.2 s after. 2026-11-24 (run 1): 77.2 s without, 20.5 s first
 read, 4 to 5 s after.
 
+charsiu 0.2 (branch charsiu-perf), TaishanPi 3M, 2026-11-28:
+
+| start | old (6e38a09) | charsiu-perf |
+|---|---|---|
+| cache in memory | 7 to 13 s | 1.5 to 2.4 s |
+| first after a reboot | 16.3 s | 13.6 s |
+| decode | 18.3 to 18.9 tok/s | 18.5 to 20.1 tok/s (both noisy) |
+
+What changed: the cache is mapped, not copied into private memory
+(`CHARSIU_WCACHE_MAP`); each record is read in sequentially just before it
+is used, and skipped when it is already in memory; int4 slices are packed
+straight from the packed codes (`CHARSIU_NPU_PACK_DIRECT`) and copied into
+the buffers on the pool (`CHARSIU_NPU_COPY_POOL`); speculative decoding is
+off by default on Windows (`CHARSIU_SPEC=auto` turns it on; it was slower
+here). `=0` turns each switch off. A cold start is now mostly the eMMC
+(about 60 MB/s) and the driver's CREATE_BO (about 2.3 s).
+`tools/charsiu-perf/cp-bench.ps1` reruns the comparison.
+
 ## Where the time goes
 
 The NPU is busy about 34 ms a token per core on both Windows and Linux. The

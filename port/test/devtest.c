@@ -169,6 +169,20 @@ int main(void)
 	rkx_fake_counts(&s1, &busy1, &ref1, &maxt);
 	CHECK(s1 - s0 == 2 && maxt == RKNPU_MAX_TASKS, "100 tasks went as %llu SUBMITs, max %llu tasks", s1 - s0, maxt);
 
+	/* charsiu 0.2's charsiu_bo_poll: -EBUSY while the job runs (the fake
+	 * says RUNNING to the first POLL of a job), then 0 with the buffer
+	 * prepared; with nothing pending, 0 at once */
+	{
+		int busy = 0, n = 0;
+
+		CHECK(submit_n(d0, &a, 1, 4096, 0) == 0, "a job to poll");
+		while ((r = charsiu_bo_poll(d0, &a.out)) == -EBUSY && n++ < 1000)
+			busy++;
+		CHECK(r == 0 && busy == (async ? busy : 1),
+		      "bo_poll: %d after %d busy answers (want 0 after 1)", r, busy);
+		CHECK(charsiu_bo_poll(d0, &a.out) == 0, "bo_poll with nothing pending");
+	}
+
 	/* streams of 4096 entries (32 KiB): eight fill an arena, so 20 go as 3 */
 	/* 64 copies of one stream, 4 KiB apart: a 4096-entry task is eight of
 	 * them and their zero padding, which passes the check */

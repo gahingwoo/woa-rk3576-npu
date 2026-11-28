@@ -83,6 +83,9 @@
  * SPDX-License-Identifier: GPL-2.0-only
  */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L        /* setenv, on the Linux host build */
+#endif
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -117,6 +120,9 @@ struct charsiu_device {
 	unsigned long submits, chunks, tasks, waits, polls, poll_won, busy;
 	unsigned long timeouts, dma_errors, refused;
 	unsigned long bos, bo_bytes, bo_peak, bo_bytes_peak;
+	/* what allocating them cost: CREATE_BO and MAP_BO's wall time (staging) */
+	unsigned long allocs;
+	unsigned long long create_us, map_us;
 	unsigned long long hw_us, wait_us;
 
 	/* M6 */
@@ -345,6 +351,40 @@ static int dev_wait(struct charsiu_device *dev, unsigned ms)
 
 /* ------------------------------------------------------- open, close */
 
+/*
+ * charsiu 0.2 does two things from user mode with DC CVAC and DC CIVAC that
+ * it reaches without asking this layer: CHARSIU_NPU_EARLY_DONE (a decode
+ * call ends when its output words are seen in memory) and
+ * CHARSIU_NPU_USER_CLEAN (the packed input slices cleaned by VA instead of
+ * a FINI_BO). Both default on, because Linux sets SCTLR_EL1.UCI. Windows
+ * leaves it 0 on the TaishanPi 3M, where either instruction would be an
+ * illegal instruction exception in the middle of a decode. So where the
+ * probe says they trap, both are off before npudev reads them (it reads
+ * each once, at its first decode call, after the devices are open), and a
+ * user's =1 is overridden with one line saying so. Where they work, the
+ * defaults stand.
+ */
+static void user_dc_defaults(void)
+{
+	static const char *const nm[] = { "CHARSIU_NPU_EARLY_DONE", "CHARSIU_NPU_USER_CLEAN" };
+	static int done;
+	unsigned i;
+
+	if (done)
+		return;
+	done = 1;
+	if (rkx_dc_usable())
+		return;
+	for (i = 0; i < sizeof(nm) / sizeof(nm[0]); i++) {
+		const char *e = getenv(nm[i]);
+
+		if (e && *e && strcmp(e, "0"))
+			fprintf(stderr, "charsiu (Windows): %s=%s needs user-mode DC CIVAC, "
+				"which traps here (SCTLR_EL1.UCI 0); off\n", nm[i], e);
+		setenv(nm[i], "0", 1);
+	}
+}
+
 struct charsiu_device *charsiu_open(const char *path)
 {
 	struct charsiu_device *dev;
@@ -383,6 +423,7 @@ struct charsiu_device *charsiu_open(const char *path)
 		return NULL;
 	}
 
+	user_dc_defaults();
 	dev = calloc(1, sizeof(*dev));
 	if (!dev) {
 		rkx_close(x);
@@ -460,6 +501,11 @@ void charsiu_close(struct charsiu_device *dev)
 				(double)dev->late_us / (dev->wait_timed - dev->wait_slept) : 0.0,
 			dev->deferred, dev->cleaned_by_submit, dev->defer_full, dev->prepped_by_wait,
 			dev->uc_ops, dev->uc_us / 1e3, dev->async_n);
+	if (env_long("CHARSIU_RKNPU_STATS", 0))
+		fprintf(stderr, "charsiu rknpu dev %u buffers: %lu allocated, CREATE_BO %.1f ms "
+			"(%.0f us each), MAP_BO %.1f ms (%.0f us each)\n", dev->index, dev->allocs,
+			dev->create_us / 1e3, dev->allocs ? (double)dev->create_us / dev->allocs : 0.0,
+			dev->map_us / 1e3, dev->allocs ? (double)dev->map_us / dev->allocs : 0.0);
 	if (env_long("CHARSIU_RKNPU_STATS", 0) && dev->m8 && dev->sub_n) {
 		static const char *const nm[RKNPU_SUBMIT_PHASES] = {
 			"entry", "safe", "idle", "arena", "mmu", "clean", "copy", "check",
@@ -487,6 +533,7 @@ int charsiu_bo_alloc(struct charsiu_device *dev, size_t size, struct charsiu_bo 
 	rknpu_map_bo mb;
 	rknpu_bo_handle fh;
 	unsigned got = 0;
+	unsigned long long t0, t1;
 	int r;
 
 	if (!dev || !bo || !size)
@@ -499,12 +546,17 @@ int charsiu_bo_alloc(struct charsiu_device *dev, size_t size, struct charsiu_bo 
 	memset(&cb, 0, sizeof(cb));
 	cb.size = (unsigned)size;
 	pthread_mutex_lock(&dev->lock);
+	t0 = rkx_now_us();
 	r = rkx_ioctl(dev->x, IOCTL_RKNPU_CREATE_BO, &cb, sizeof(cb), &cb, sizeof(cb), &got);
+	t1 = rkx_now_us();
+	dev->create_us += t1 - t0;
 	if (r)
 		goto out;
 	memset(&mb, 0, sizeof(mb));
 	mb.handle = cb.handle;
 	r = rkx_ioctl(dev->x, IOCTL_RKNPU_MAP_BO, &mb, sizeof(mb), &mb, sizeof(mb), &got);
+	dev->map_us += rkx_now_us() - t1;
+	dev->allocs++;
 	if (r || !mb.user_va) {
 		memset(&fh, 0, sizeof(fh));
 		fh.handle = cb.handle;
@@ -632,6 +684,37 @@ int charsiu_bo_prep(struct charsiu_device *dev, struct charsiu_bo *bo, int64_t t
 		return 0;
 	}
 	return bo_sync(dev, IOCTL_RKNPU_PREP_BO, bo);
+}
+
+/*
+ * charsiu 0.2: rocket's PREP_BO with a deadline already past. 0 once the
+ * device's last job has finished, with the buffer then prepared exactly as
+ * charsiu_bo_prep would leave it; -EBUSY while the job runs. One POLL WAIT
+ * (no sleep) when it is still running, so a caller that polls two devices
+ * in turn never blocks on either.
+ */
+int charsiu_bo_poll(struct charsiu_device *dev, struct charsiu_bo *bo)
+{
+	rknpu_wait_out o;
+	int r;
+
+	if (!dev)
+		return -EINVAL;
+	pthread_mutex_lock(&dev->lock);
+	r = async_join(dev);
+	if (!r && dev->pending) {
+		dev->polls++;
+		r = wait_once(dev, 0, RKNPU_WAIT_POLL, 0, &o);
+		if (!r && o.result == RKNPU_JOB_RUNNING) {
+			pthread_mutex_unlock(&dev->lock);
+			return -EBUSY;
+		}
+	}
+	pthread_mutex_unlock(&dev->lock);
+	if (r)
+		return r;
+	/* finished: the WAIT returns at once, and does the PREP where it can */
+	return charsiu_bo_prep(dev, bo, (int64_t)DEV_WAIT_MS * 1000000);
 }
 
 int charsiu_bo_fini(struct charsiu_device *dev, struct charsiu_bo *bo)

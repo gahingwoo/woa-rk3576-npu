@@ -360,6 +360,47 @@ function Use-Cache {
     return (Test-Yes $c)
 }
 
+# WHERE THE WEIGHT CACHE GOES. Beside the model (MODEL.gguf.wcache, what
+# charsiu_run --cache writes) when one is already there or the model's folder
+# takes a new file, so an existing cache keeps working. Otherwise, a model in a
+# folder this user cannot write (an administrator's R:\npu, a read-only
+# share, Program Files), %LOCALAPPDATA%\charsiu\cache\NAME-HASH.wcache: always
+# this user's to write, and HASH (of the model's full path) keeps two models
+# with one file name apart. Without this such a model was quantised again on
+# every start, about 100 s on the TaishanPi.
+function Test-DirWritable([string]$Dir) {
+    $probe = Join-Path $Dir (".charsiu-write-test-$PID")
+    try {
+        [IO.File]::WriteAllText($probe, '')
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        return $true
+    } catch { return $false }
+}
+
+function Get-CacheHome {
+    if ($env:CHARSIU_CACHE_HOME) { return $env:CHARSIU_CACHE_HOME }
+    return (Join-Path $CharsiuHome 'cache')
+}
+
+function Get-UserCachePath([string]$Model) {
+    $full = [IO.Path]::GetFullPath($Model).ToLowerInvariant()
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $h = ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($full)) | Select-Object -First 4 | ForEach-Object { $_.ToString('x2') }) -join ''
+    return (Join-Path (Get-CacheHome) ("{0}-{1}.wcache" -f [IO.Path]::GetFileName($Model), $h))
+}
+
+# The runner arguments for the cache: --cache (beside the model) or
+# --cache-at FILE.
+function Get-CacheArgs([string]$Model) {
+    $beside = "$Model.wcache"
+    if (Test-Path -LiteralPath $beside) { return @('--cache') }
+    $dir = Split-Path -Parent ([IO.Path]::GetFullPath($Model))
+    if ($dir -and (Test-DirWritable $dir)) { return @('--cache') }
+    $at = Get-UserCachePath $Model
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $at) | Out-Null
+    return @('--cache-at', $at)
+}
+
 # ---- first run ---------------------------------------------------------------
 
 function Initialize-Config {
@@ -620,7 +661,7 @@ function Invoke-Run([string]$Named, [string[]]$A, [switch]$Bench) {
     $argv.Add($model)
     $argv.Add('-c'); $argv.Add($ctx)
     $argv.Add('-t'); $argv.Add($threads)
-    if ((Use-Cache) -and -not ($A -contains '--cache' -or $A -contains '--cache-at')) { $argv.Add('--cache') }
+    if ((Use-Cache) -and -not ($A -contains '--cache' -or $A -contains '--cache-at')) { $argv.AddRange([string[]](Get-CacheArgs $model)) }
 
     if ($Bench) {
         Write-Output ''
@@ -668,7 +709,7 @@ function Invoke-Serve([string[]]$A) {
     Set-RunEnvironment
     $argv = New-Object System.Collections.Generic.List[string]
     $argv.AddRange([string[]]@($model, '-c', $ctx, '-t', $threads))
-    if ((Use-Cache) -and -not ($A -contains '--cache' -or $A -contains '--cache-at')) { $argv.Add('--cache') }
+    if ((Use-Cache) -and -not ($A -contains '--cache' -or $A -contains '--cache-at')) { $argv.AddRange([string[]](Get-CacheArgs $model)) }
     if ($A.Count) { $argv.AddRange([string[]]$A) }
 
     $port = '11434'; $hostA = ''
@@ -722,6 +763,8 @@ function Invoke-Rm([string[]]$A) {
         Remove-Item -LiteralPath $t -Force
         Write-Output "removed $t"
         if (Test-Path -LiteralPath "$t.wcache") { Remove-Item -LiteralPath "$t.wcache" -Force; Write-Output "removed $t.wcache" }
+        $uc = Get-UserCachePath $t
+        if (Test-Path -LiteralPath $uc) { Remove-Item -LiteralPath $uc -Force; Write-Output "removed $uc" }
     }
     exit $rc
 }

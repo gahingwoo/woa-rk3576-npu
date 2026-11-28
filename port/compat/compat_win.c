@@ -35,6 +35,76 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/* --------------------------------------------- the generic timer, EL0 */
+
+/*
+ * charsiu 0.2's pool reads the ARM generic timer straight from user mode
+ * (llama.c pool_ticks: MRS CNTVCT_EL0, and CNTFRQ_EL0 for its rate).
+ * Windows on Arm normally lets user mode do that (CNTKCTL_EL1.EL0VCTEN).
+ * Where a kernel did not, either MRS would be an illegal instruction at the
+ * pool's first dispatch. So a handler stands by, last in the chain and
+ * free unless it fires: it answers the two reads from QueryPerformance-
+ * Counter and its frequency, which are the same clock's ticks, and steps
+ * over the instruction. The constructor tries one read; if that needed the
+ * handler, CHARSIU_POOL_FAST defaults to 0 (its spin reads the timer in a
+ * loop, and an exception a read would make it slower than the old pool).
+ */
+#define MRS_CNTVCT 0xd53be040u          /* mrs xN, cntvct_el0 */
+#define MRS_CNTFRQ 0xd53be000u          /* mrs xN, cntfrq_el0 */
+
+static volatile LONG timer_emulated;
+
+static LONG CALLBACK timer_emulate(EXCEPTION_POINTERS *ep)
+{
+	DWORD code = ep->ExceptionRecord->ExceptionCode;
+	CONTEXT *c = ep->ContextRecord;
+	unsigned insn, rt;
+	LARGE_INTEGER v;
+
+	if (code != STATUS_ILLEGAL_INSTRUCTION && code != STATUS_PRIVILEGED_INSTRUCTION)
+		return EXCEPTION_CONTINUE_SEARCH;
+	insn = *(const volatile unsigned *)(uintptr_t)c->Pc;
+	if ((insn & ~0x1fu) == MRS_CNTVCT)
+		QueryPerformanceCounter(&v);
+	else if ((insn & ~0x1fu) == MRS_CNTFRQ)
+		QueryPerformanceFrequency(&v);
+	else
+		return EXCEPTION_CONTINUE_SEARCH;
+	rt = insn & 0x1fu;
+	if (rt < 31)
+		c->X[rt] = (DWORD64)v.QuadPart;
+	c->Pc += 4;
+	InterlockedIncrement(&timer_emulated);
+	return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+__attribute__((constructor)) static void compat_timer(void)
+{
+	unsigned long long t;
+
+	if (!AddVectoredExceptionHandler(0, timer_emulate))
+		return;
+	__asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
+	(void)t;
+	if (timer_emulated && !getenv("CHARSIU_POOL_FAST"))
+		_putenv_s("CHARSIU_POOL_FAST", "0");
+}
+
+/*
+ * SPECULATION OFF BY DEFAULT HERE. charsiu 0.2 turns it on (auto) on the
+ * strength of the CM5 under Linux, where a verify pass is cheap. On the
+ * TaishanPi under Windows, 2026-11-28, Llama-3.2-1B, 64 tokens: 18.43 /
+ * 18.85 / 18.86 tok/s with it against 19.92 without, same text. A verify
+ * pass is a batched call, and each batched call here pays the Windows
+ * SUBMIT and WAIT, so the draft rarely earns its verify. CHARSIU_SPEC set
+ * in the environment (or [extra] in config.ini) still wins.
+ */
+__attribute__((constructor)) static void compat_spec(void)
+{
+	if (!getenv("CHARSIU_SPEC"))
+		_putenv_s("CHARSIU_SPEC", "0");
+}
+
 /* ------------------------------------------------------ binary stdio */
 
 __attribute__((constructor)) static void compat_binary_stdio(void)
@@ -631,4 +701,53 @@ int charsiu_cv_broadcast(pthread_cond_t *c)
 	InterlockedIncrement(&v->seq);
 	WakeAllConditionVariable(&v->cv);
 	return 0;
+}
+
+/* ------------------------------------------------------------- futex */
+
+/*
+ * charsiu 0.2's fast pool (llama.c, CHARSIU_POOL_FAST) parks its workers
+ * with futex(FUTEX_WAIT_PRIVATE) on the dispatch generation and wakes them
+ * with FUTEX_WAKE_PRIVATE; the caller parks on the fan-in count the same
+ * way. WaitOnAddress is that call: it returns at once if the word no longer
+ * holds the value, and a wake of the address releases it. Spurious returns
+ * are allowed by both, and the pool re-reads the word after each. Only the
+ * futex number and these two operations; anything else is ENOSYS.
+ */
+#include <sys/syscall.h>
+#include <linux/futex.h>
+
+long syscall(long number, ...)
+{
+	va_list ap;
+	unsigned *addr;
+	int op;
+	unsigned val;
+
+	if (number != SYS_futex) {
+		errno = ENOSYS;
+		return -1;
+	}
+	va_start(ap, number);
+	addr = va_arg(ap, unsigned *);
+	op = va_arg(ap, int);
+	val = va_arg(ap, unsigned);
+	va_end(ap);
+	switch (op & ~FUTEX_PRIVATE_FLAG) {
+	case FUTEX_WAIT:
+		if (!WaitOnAddress((volatile VOID *)addr, &val, sizeof(val), INFINITE)) {
+			errno = EAGAIN;
+			return -1;
+		}
+		return 0;
+	case FUTEX_WAKE:
+		if (val == 1)
+			WakeByAddressSingle((PVOID)addr);
+		else if (val)
+			WakeByAddressAll((PVOID)addr);
+		return 0;
+	default:
+		errno = ENOSYS;
+		return -1;
+	}
 }
