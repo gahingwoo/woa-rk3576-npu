@@ -823,6 +823,9 @@ function Invoke-Doctor {
     Write-Output ''
     $os = [Environment]::OSVersion.Version
     $arch = $env:PROCESSOR_ARCHITECTURE
+    # Windows 10 on Arm runs this in the x86 powershell.exe: the machine is
+    # PROCESSOR_ARCHITEW6432 there (charsiu-install.ps1 does the same)
+    if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
     Row ($arch -eq 'ARM64') 'machine' "$arch, Windows $($os.Major).$($os.Minor).$($os.Build)"
     $d = Get-NpuDevice
     if (-not $d.Present) { Row $false 'npu device' 'ACPI\RKCP3576 is not there: enable "NPU (experimental)" in the firmware setup' }
